@@ -295,7 +295,10 @@ export function audioCodecToDemuxer(codec: string): string | undefined {
 }
 
 /** Segment requests that the sniffing path drops before classification (D9 step 3, D5). */
-export const SEGMENT_PATH_PATTERN = /\.ts$|\.m4s$|\.m2ts$/i;
+/** HLS fragment/init files that must never become standalone media items. */
+export const HLS_FRAGMENT_PATH_PATTERN = /(?:_part\d+|_init_[A-Za-z0-9_-]+)\.(?:mp4|m4s|ts)$/i;
+
+export const SEGMENT_PATH_PATTERN = /\.ts$|\.m4s$|\.m2ts$|(?:_part\d+|_init_[A-Za-z0-9_-]+)\.(?:mp4|m4s|ts)$/i;
 
 /**
  * Initiator hosts handled by site adapters; `webRequest` sniffing is suppressed for them

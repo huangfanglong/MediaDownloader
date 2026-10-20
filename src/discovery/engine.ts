@@ -35,6 +35,7 @@ import type {
 // (If the file is not yet present the import is still correct; it resolves as soon as it lands.)
 import type { BehaviourFlag } from "../settings/flags.js";
 import { cyrb53 } from "../protocol/channels.js";
+import { canonicalHlsManifestUrl } from "../manifests/hls.js";
 import {
   isBlockedInitiatorHost,
   mimeToDemuxer,
@@ -84,7 +85,8 @@ export const FIFO_DISCOVERED_ITEM_CAP = 30;
 
 /** HLS signal patterns (D10; pretty 11616-11618). */
 export const HLS_CONTENT_TYPE_PATTERN = /mpegurl/i;
-export const HLS_URL_PATTERN = /hls|m3u8/i;
+/** A manifest URL ends in .m3u8; plain `/hls/` paths are usually segments. */
+export const HLS_URL_PATTERN = /\.m3u8(?:$|[?#])/i;
 export const HLS_MASTER_API_PATTERN = /\/api\/playlist\/master\//;
 
 /** DASH signal patterns (D10; pretty 11624-11625). */
@@ -354,13 +356,14 @@ export class DiscoveryEngine {
     const audioOnly =
       initiator !== undefined &&
       this.flag("AUDIO_ONLY_WEBSITES", initiator.hostname);
+    const canonicalUrl = canonicalHlsManifestUrl(mediaUrl);
     const item: MediaItem = {
       type: "m3u8",
-      hash: directMediaHash(mediaUrl), // provisional; replaced when manifestText is attached (D27)
+      hash: directMediaHash(canonicalUrl), // provisional; replaced when manifestText is attached (D27)
       is_youtube: false,
       sent_headers: this.replayHeaders(event.requestId),
       initiator,
-      url: mediaUrl,
+      url: canonicalUrl,
       demuxer: audioOnly ? "mp3" : "mp4",
       duration: "unknown",
       has_drm: false,
@@ -589,9 +592,11 @@ export class DiscoveryEngine {
   refreshExternal(item: MediaItem, tabId: number): boolean {
     const existing = this.tabs.get(tabId)?.media.get(item.hash);
     if (!existing) return false;
-    existing.url = item.url;
-    existing.master_url = item.master_url;
-    existing.playlist = item.playlist;
+    if (item.url !== undefined) existing.url = item.url;
+    if (item.master_url !== undefined) existing.master_url = item.master_url;
+    // An adapter refresh often carries only a fresh URL; never erase a playlist that the
+    // manifest layer already enriched, or every refresh triggers another enrichment/probe.
+    if (item.playlist !== undefined) existing.playlist = item.playlist;
     existing.sent_headers = item.sent_headers;
     if (item.thumbnail_url !== undefined) existing.thumbnail_url = item.thumbnail_url;
     if (item.preview_url !== undefined) existing.preview_url = item.preview_url;

@@ -10,6 +10,7 @@ import {
   instagramShortcode,
 } from "../src/extension/page-hook.js";
 import { installContentBridge, itemFromHint } from "../src/extension/content-script.js";
+import { classifyHintUrl } from "../src/extension/media-hint.js";
 import {
   buildPanelSnapshot,
   formatLabel,
@@ -465,6 +466,16 @@ describe("adapter item mapping", () => {
     );
     expect(item?.type).toBe("http_playlist");
     expect(item?.hls_url?.href).toBe("https://manifest.googlevideo.com/api/manifest/hls_variant/abc/index.m3u8");
+  });
+
+  it("ignores HLS fragments and canonicalises low-latency playlist refreshes", () => {
+    expect(classifyHintUrl("https://cdn.test/b-hls-08/73697527_693_x_1792462825_part0.mp4", "https://site.test/watch")).toBeUndefined();
+    expect(classifyHintUrl("https://cdn.test/b-hls-08/73697527_init_jk9NeJb8Tz5Z882F.mp4", "https://site.test/watch")).toBeUndefined();
+    const playlist = classifyHintUrl(
+      "https://cdn.test/master.m3u8?_HLS_msn=5&_HLS_part=2&pkey=abc",
+      "https://site.test/watch",
+    );
+    expect(playlist).toEqual({ url: "https://cdn.test/master.m3u8?pkey=abc", kind: "hls" });
   });
 
   it("maps an HLS hint to the m3u8 candidate type the sniffer emits", () => {

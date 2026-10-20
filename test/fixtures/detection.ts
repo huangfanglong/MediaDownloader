@@ -180,9 +180,9 @@ export const FIXTURE_FIFO_DISCOVERED_ITEM_CAP = 30;
 
 /** Regexes that drive dispatch/rejection, as [source, flags] pairs (D9/D10). */
 export const FIXTURE_REGEXES = {
-  segmentPath: ["\\.ts$|\\.m4s$|\\.m2ts$", "i"],
+  segmentPath: ["\\.ts$|\\.m4s$|\\.m2ts$|(?:_part\\d+|_init_[A-Za-z0-9_-]+)\\.(?:mp4|m4s|ts)$", "i"],
   hlsContentType: ["mpegurl", "i"],
-  hlsUrl: ["hls|m3u8", "i"],
+  hlsUrl: ["\\.m3u8(?:$|[?#])", "i"],
   hlsMasterApi: ["\\/api\\/playlist\\/master\\/", ""],
   dashContentType: ["dash", "i"],
   dashUrl: ["\\.mpd", "i"],

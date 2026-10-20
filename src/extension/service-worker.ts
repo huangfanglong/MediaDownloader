@@ -27,6 +27,7 @@ import { Channel } from "../protocol/channels.js";
 import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
 import { buildPanelSnapshot, type PanelSnapshot } from "./panel-snapshot.js";
+import { debugInfo } from "./log.js";
 import { filterFocusedMedia, type MediaFocusState } from "./focus.js";
 import { REBUILD_MESSAGES, RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
 import type { Result } from "../core/option.js";
@@ -190,6 +191,10 @@ export class MediaDownloaderService {
   >();
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
   private readonly observedRequests = new Map<number, Set<string>>();
+  private readonly hlsQualityCache = new Map<
+    string,
+    { at: number; quality: { size?: { width: number; height: number }; bitrate?: number } }
+  >();
   private lastSnapshotSignature = "";
   private markReady!: () => void;
 
@@ -745,6 +750,16 @@ export class MediaDownloaderService {
   // Discovery
   // -------------------------------------------------------------------------
 
+  /** Enriched HLS rows are re-keyed by manifest body; match refreshes by manifest URL too. */
+  private findByManifestUrl(tabId: number, media: MediaItem): MediaItem | undefined {
+    const key = (media.master_url ?? media.url)?.href;
+    if (key === undefined) return undefined;
+    for (const candidate of this.engine.mediaForTab(tabId).values()) {
+      if ((candidate.master_url ?? candidate.url)?.href === key) return candidate;
+    }
+    return undefined;
+  }
+
   private async handleResponse(details: {
     requestId: string;
     url: string;
@@ -773,8 +788,15 @@ export class MediaDownloaderService {
     });
     if (!item) return;
     this.rememberPreview(details.tabId, item);
-    console.info("[media-downloader] detected", item.type, mediaUrl(item), "tab", details.tabId);
+    debugInfo("detected", item.type, mediaUrl(item), "tab", details.tabId);
 
+    const existing =
+      this.findByManifestUrl(details.tabId, item) ?? this.engine.mediaForTab(details.tabId).get(item.hash);
+    if (item.type === "m3u8" && existing?.playlist !== undefined) {
+      // Refresh the signed URL but do not re-fetch/re-probe the already-parsed manifest.
+      this.engine.refreshExternal({ ...item, hash: existing.hash }, details.tabId);
+      return;
+    }
     await this.enrichIfNeeded(item, details.tabId);
     this.normaliseDetectedUrls(item);
 
@@ -798,12 +820,12 @@ export class MediaDownloaderService {
     const manifestUrl = item.master_url ?? item.url;
     if (manifestUrl === undefined) return;
     if (!isSafeManifestUrl(manifestUrl)) {
-      console.info("[media-downloader] skipping manifest enrichment for a private/unsafe host", manifestUrl.hostname);
+      debugInfo("skipping manifest enrichment for a private/unsafe host", manifestUrl.hostname);
       return;
     }
     const observed = this.observedRequests.get(tabId)?.has(observedRequestKey(manifestUrl)) ?? false;
     if (!manifestEnrichmentAllowed(manifestUrl, item.initiator, observed)) {
-      console.info("[media-downloader] skipping unobserved cross-origin manifest enrichment", manifestUrl.hostname);
+      debugInfo("skipping unobserved cross-origin manifest enrichment", manifestUrl.hostname);
       return;
     }
     const key = `${tabId}:${item.hash}:${item.type}`;
@@ -827,6 +849,9 @@ export class MediaDownloaderService {
     if (segment === undefined) return {};
     if (segment.uri.protocol !== "https:" && segment.uri.protocol !== "http:") return {};
     if (!isSafeManifestUrl(segment.uri)) return {};
+    const cacheKey = item.master_url?.href ?? item.url?.href;
+    const cached = cacheKey !== undefined ? this.hlsQualityCache.get(cacheKey) : undefined;
+    if (cached !== undefined && Date.now() - cached.at < 300_000) return cached.quality;
     try {
       const fetched = await fetchBytes(
         this.fetchImpl,
@@ -836,17 +861,22 @@ export class MediaDownloaderService {
       );
       if (fetched.tag === "Err") return {};
       const dimensions = probeMpegTsVideoSize(fetched.value.bytes);
-      if (dimensions === undefined) return {};
+      if (dimensions === undefined) {
+        if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, { at: Date.now(), quality: {} });
+        return {};
+      }
       const duration = segment.duration;
       const bitrate =
         duration !== undefined && Number.isFinite(duration) && duration > 0
           ? Math.round((fetched.value.bytes.byteLength * 8) / duration)
           : undefined;
-      console.info("[media-downloader] probed HLS segment quality", dimensions.width, dimensions.height);
-      return {
+      debugInfo("probed HLS segment quality", dimensions.width, dimensions.height);
+      const quality = {
         size: dimensions,
         ...(bitrate !== undefined && bitrate > 0 ? { bitrate } : {}),
       };
+      if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, { at: Date.now(), quality });
+      return quality;
     } catch {
       return {};
     }
@@ -1215,20 +1245,23 @@ export class MediaDownloaderService {
         const raw = (data as { media?: unknown }).media;
         const media = decodeMaybe(raw) as MediaItem | undefined;
         if (media && senderTabId !== undefined) {
-          const alreadyKnown = this.engine.mediaForTab(senderTabId).has(media.hash);
+          const existingHint = this.findByManifestUrl(senderTabId, media);
+          const alreadyKnown = this.engine.mediaForTab(senderTabId).has(media.hash) || existingHint !== undefined;
           if (alreadyKnown) {
             // Same media identity, fresh signed URL (YouTube rotates them): keep one panel row.
             // The network sniffer may have registered the URL first without enrichment; try the
             // same observed/same-origin gate as the sniffer path before fetching the manifest.
             this.rememberPreview(senderTabId, media);
-            this.engine.refreshExternal(media, senderTabId);
-            await this.enrichIfNeeded(media, senderTabId);
+            const existing =
+              existingHint ?? this.engine.mediaForTab(senderTabId).get(media.hash);
+            this.engine.refreshExternal({ ...media, hash: existing?.hash ?? media.hash }, senderTabId);
+            if (existing?.playlist === undefined) await this.enrichIfNeeded(media, senderTabId);
             this.normaliseDetectedUrls(media);
             this.refreshTab(senderTabId);
             await this.publish();
             return;
           }
-          console.info("[media-downloader] adapter hint", media.type, mediaUrl(media), "tab", senderTabId);
+          debugInfo("adapter hint", media.type, mediaUrl(media), "tab", senderTabId);
           this.rememberPreview(senderTabId, media);
           const inserted = this.engine.insertExternal(media, senderTabId);
           if (inserted) {

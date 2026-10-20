@@ -53,7 +53,7 @@ export interface PageMediaHint {
   durationSeconds?: number;
   title?: string;
   referer?: string;
-  /** Poster/og:image/link-rel thumbnail for the media. */
+  /** Poster/og:image/link-rel thumbnail for the media (VDH shows one per item). */
   thumbnail?: string;
   /** Direct video track URL used for a hover preview when the item itself is a manifest. */
   preview?: string;
@@ -72,7 +72,9 @@ export interface PageMediaHint {
 
 const IGNORED_PATH = /\.(?:ts|m4s|m2ts|jpg|jpeg|png|gif|webp|avif|svg|css|js|json|html?)(?:[?#]|$)/i;
 const FILE_PATH = /\.(mp4|m4v|webm|mkv|mov|mp3|m4a|ogg|opus)(?:[?#]|$)/i;
-const HLS_PATH = /\.m3u8(?:[?#]|$)|m3u8/i;
+const HLS_PATH = /\.m3u8(?:[?#]|$)/i;
+const HLS_FRAGMENT_PATH = /(?:_part\d+|_init_[A-Za-z0-9_-]+)\.(?:mp4|m4s|ts)(?:[?#]|$)/i;
+const HLS_REFRESH_PARAMS = ["_HLS_msn", "_HLS_part", "_HLS_skip"] as const;
 const DASH_PATH = /\.mpd(?:[?#]|$)/i;
 
 /** Query parameters used by players to request a byte range of the same asset. */
@@ -111,11 +113,14 @@ export function classifyHintUrl(raw: string, baseUrl: string): { url: string; ki
   if (resolved.searchParams.get("sabr") === "1") return undefined;
   // Byte-range chunk: not a file on its own. Callers use `classifyRangeChunkUrl` for fallbacks.
   if (isRangeChunk(resolved)) return undefined;
+  if (HLS_FRAGMENT_PATH.test(resolved.pathname)) return undefined;
   const href = resolved.href;
   if (IGNORED_PATH.test(resolved.pathname) && !HLS_PATH.test(resolved.pathname)) return undefined;
 
   if (HLS_PATH.test(resolved.pathname) || HLS_PATH.test(resolved.search)) {
-    return { url: href, kind: "hls" };
+    const canonical = new URL(resolved.href);
+    for (const param of HLS_REFRESH_PARAMS) canonical.searchParams.delete(param);
+    return { url: canonical.href, kind: "hls" };
   }
   if (DASH_PATH.test(resolved.pathname)) return { url: href, kind: "dash" };
   // YouTube/GoogleVideo media files do not end in a file extension.

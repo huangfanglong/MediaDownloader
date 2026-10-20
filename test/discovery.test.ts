@@ -300,6 +300,8 @@ describe("segment path rejection (D9 step 3)", () => {
     ["/segments/1.TS", true],
     ["/segments/1.tsx", false],
     ["/media/video.mp4", false],
+    ["/b-hls-08/73697527_693_x_1792462825_part0.mp4", true],
+    ["/b-hls-08/73697527_init_jk9NeJb8Tz5Z882F.mp4", true],
   ])("matches %j -> %j", (pathname, expected) => {
     expect(SEGMENT_PATH_PATTERN.test(pathname)).toBe(expected);
   });
@@ -461,10 +463,9 @@ describe("engine: playlist sniffing branches", () => {
     expect(engine.mediaForTab(1).size).toBe(1);
   });
 
-  it("detects HLS from the URL and from the master-API path (D10)", () => {
+  it("detects HLS only from .m3u8 URLs and the master-API path (D10)", () => {
     for (const url of [
       "https://cdn.example.com/master.m3u8",
-      "https://cdn.example.com/hls/playlist",
       "https://cdn.example.com/api/playlist/master/abc",
     ]) {
       const engine = makeEngine();
@@ -1125,6 +1126,29 @@ describe("engine: per-tab registry", () => {
     expect(engine.mediaForTab(2).size).toBe(1);
     expect(engine.mediaForTab(99).size).toBe(0);
     expect(engine.tabIds().sort()).toEqual([1, 2]);
+  });
+
+  it("keeps an enriched playlist when an adapter refresh carries no playlist", () => {
+    const engine = makeEngine();
+    const master = engine.onResponseStarted(
+      makeResponseStartedEvent({
+        url: "https://cdn.example.com/master.m3u8",
+        type: "xmlhttprequest",
+        responseHeaders: headerList({ "content-type": "application/vnd.apple.mpegurl" }),
+      }),
+    );
+    engine.attachPlaylist(
+      1,
+      master!.hash,
+      [{ demuxer: "mp4", quality: {}, av: { video: new URL("https://cdn.example.com/720.m3u8"), audio: false } }],
+      { type: "m3u8_playlist", manifestText: "#EXTM3U" },
+    );
+    const enriched = [...engine.mediaForTab(1).values()][0]!;
+    const playlist = enriched.playlist;
+    const refreshed = { ...enriched, url: new URL(enriched.url?.href ?? "https://cdn.example.com/master.m3u8"), playlist: undefined };
+    expect(engine.refreshExternal(refreshed, 1)).toBe(true);
+    const after = [...engine.mediaForTab(1).values()][0]!;
+    expect(after.playlist).toBe(playlist);
   });
 
   it("returns null when attaching to a missing tab or hash", () => {

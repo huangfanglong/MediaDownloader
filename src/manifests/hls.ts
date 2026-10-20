@@ -113,6 +113,13 @@ export type HlsResult =
   | { kind: "subtitle"; segments: HlsSegment[] }
   | { kind: "invalid"; reason: "parse error" | "not a valid m3u8" };
 
+/** Remove low-latency playlist refresh params so repeated refreshes share one identity. */
+export function canonicalHlsManifestUrl(url: URL): URL {
+  const copy = new URL(url.href);
+  for (const key of ["_HLS_msn", "_HLS_part", "_HLS_skip"]) copy.searchParams.delete(key);
+  return copy;
+}
+
 /** Defense-in-depth limits from adversarial review 3.1 (hostile manifests must not DoS us). */
 export const MAX_HLS_MANIFEST_BYTES = 8 * 1024 * 1024;
 export const MAX_HLS_LINES = 200_000;
