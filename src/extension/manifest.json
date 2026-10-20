@@ -3,7 +3,7 @@
   "name": "Media Downloader",
   "short_name": "Media Downloader",
   "version": "1.0.0",
-  "description": "Media Downloader ? clean-room page-media discovery and download loop (own implementation, own UI).",
+  "description": "Media Downloader is a simple video/audio downloader.",
   "minimum_chrome_version": "116",
   "background": {
     "service_worker": "boot.js",
