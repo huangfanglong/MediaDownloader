@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="Media Downloader">
+  <defs>
+    <linearGradient id="tile" x1="18" y1="12" x2="112" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E9E3FF"/>
+      <stop offset="0.5" stop-color="#C9B8FF"/>
+      <stop offset="1" stop-color="#9F7AEA"/>
+    </linearGradient>
+    <linearGradient id="glyph" x1="64" y1="26" x2="64" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F5F2FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="30" fill="url(#tile)"/>
+  <path d="M64 30V69" stroke="url(#glyph)" stroke-width="11" stroke-linecap="round"/>
+  <path d="M43 55L64 76L85 55" fill="none" stroke="url(#glyph)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M35 82V94C35 99.5 39.5 104 45 104H83C88.5 104 93 99.5 93 94V82" fill="none" stroke="url(#glyph)" stroke-width="11" stroke-linecap="round"/>
+</svg>

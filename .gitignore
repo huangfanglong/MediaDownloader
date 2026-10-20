@@ -1,0 +1,20 @@
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db
+node_modules/
+# Third-party reference copies: analysis only, never packaged or redistributed.
+analysis/original/
+analysis/pretty/
+analysis/evidence/rea-service-scan.json
+analysis/evidence/rea-service-scan.err
+dist/
+coverage/
+*.log
+# Local scratch: may contain browser-profile databases, cookies, signed URLs and paths.
+analysis/scratch/
+analysis/sandbox-brave/
+analysis/sandbox-downloads/

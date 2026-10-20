@@ -1,0 +1,28 @@
+{
+  "name": "media-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A simple video/audio downloader.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node tools/bundle-extension.mjs . && node tools/check-extension-build.mjs .",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@types/chrome": "^0.3.5",
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "jsdom": "^25.0.1",
+    "prettier": "^3.3.3",
+    "sharp": "^0.35.5",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.11"
+  },
+  "license": "GPL-3.0-or-later"
+}

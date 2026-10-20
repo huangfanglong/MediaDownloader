@@ -1,0 +1,77 @@
+{
+  "manifest_version": 3,
+  "name": "Media Downloader",
+  "short_name": "Media Downloader",
+  "version": "1.0.0",
+  "description": "Media Downloader ? clean-room page-media discovery and download loop (own implementation, own UI).",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "boot.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "bitmaps/icon-16.png",
+    "32": "bitmaps/icon-32.png",
+    "48": "bitmaps/icon-48.png",
+    "128": "bitmaps/icon-128.png"
+  },
+  "action": {
+    "default_title": "Media Downloader",
+    "default_popup": "panel/panel.html",
+    "default_icon": {
+      "16": "bitmaps/icon-16.png",
+      "32": "bitmaps/icon-32.png",
+      "48": "bitmaps/icon-48.png",
+      "128": "bitmaps/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "panel/panel.html"
+  },
+  "permissions": [
+    "tabs",
+    "webRequest",
+    "downloads",
+    "declarativeNetRequest",
+    "storage",
+    "sidePanel",
+    "offscreen",
+    "scripting",
+    "notifications",
+    "contextMenus",
+    "unlimitedStorage"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; img-src 'self' https: http:; media-src 'self' https: http: blob:"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["page-hook.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "ISOLATED"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "commands": {
+    "default-action": {
+      "description": "Run the default action for the current tab",
+      "suggested_key": { "default": "Alt+Down" }
+    }
+  }
+}
+
