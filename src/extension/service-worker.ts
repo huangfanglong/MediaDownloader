@@ -793,8 +793,14 @@ export class MediaDownloaderService {
     const existing =
       this.findByManifestUrl(details.tabId, item) ?? this.engine.mediaForTab(details.tabId).get(item.hash);
     if (item.type === "m3u8" && existing?.playlist !== undefined) {
+      // onResponseStarted registers the fresh candidate under its URL hash before this check.
+      // The enriched row is keyed by its manifest-body hash, so remove the just-registered
+      // duplicate; otherwise it remains in the panel as a second, bare HLS row.
+      if (existing.hash !== item.hash) this.engine.removeMedia(details.tabId, item.hash);
       // Refresh the signed URL but do not re-fetch/re-probe the already-parsed manifest.
       this.engine.refreshExternal({ ...item, hash: existing.hash }, details.tabId);
+      this.refreshTab(details.tabId);
+      await this.publish();
       return;
     }
     await this.enrichIfNeeded(item, details.tabId);

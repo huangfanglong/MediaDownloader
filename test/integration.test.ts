@@ -545,6 +545,38 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     harness.service.stop();
   });
 
+  it("keeps one enriched HLS row when the same manifest response repeats", async () => {
+    const harness = createHarness({
+      masterUrl: "https://cdn.test/repeat/master.m3u8",
+      mediaPlaylistUrl: "https://cdn.test/1080/index.m3u8",
+      mediaPlaylist: fmp4MediaPlaylist,
+      segmentPrefix: "https://cdn.test/1080/",
+      segments: 1,
+      initBytes: "INIT",
+    });
+    await harness.service.start();
+    harness.gateway.triggerSendHeaders({
+      requestId: "req-repeat",
+      url: "https://cdn.test/repeat/master.m3u8",
+      tabId: 7,
+      frameId: 0,
+      type: "xmlhttprequest",
+      timeStamp: 1_700_000_000_000,
+      requestHeaders: [{ name: "referer", value: "https://site.test/watch" }],
+    });
+    const details = sniffDetails("https://cdn.test/repeat/master.m3u8", "application/vnd.apple.mpegurl");
+    await harness.gateway.triggerResponseStarted(details);
+    const first = [...harness.service.getEngine().mediaForTab(7).values()];
+    expect(first).toHaveLength(1);
+    expect(first[0]?.playlist).toBeDefined();
+    await harness.gateway.triggerResponseStarted(details);
+    const again = [...harness.service.getEngine().mediaForTab(7).values()];
+    expect(again).toHaveLength(1);
+    expect(again[0]?.hash).toBe(first[0]?.hash);
+    expect(again[0]?.playlist).toBeDefined();
+    harness.service.stop();
+  });
+
   it("saves MPEG-TS HLS without an init segment as .m2ts", async () => {
     const harness = createHarness({
       masterUrl: "https://cdn.test/ts/master.m3u8",
