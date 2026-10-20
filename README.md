@@ -12,7 +12,7 @@ assembles the bytes, and saves the file. Tested on Brave Browser on Windows.
 0. Clone this repository, then at repository's root:
 ```powershell
 npm install
-npm run verify     # typecheck + 645 behaviour/parity/hardening tests + loadable-extension build
+npm run verify     # typecheck + 649 behaviour/parity/hardening tests + loadable-extension build
 npm run build      # compile TS -> dist/extension + copy manifest/panel assets
 ```
 1. Open browser's menu -> Extension -> Manage extensions. 
