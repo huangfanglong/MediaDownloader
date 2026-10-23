@@ -40,6 +40,8 @@ export interface WorkerClientOptions {
   offscreenUrl: string;
   /** Poll interval for the readiness handshake. */
   readyTimeoutMs?: number;
+  /** Clean up a result whose download was cancelled or timed out. */
+  onLateOutcome?: (outcome: TransferOutcome) => void;
 }
 
 export class WorkerClient {
@@ -47,6 +49,7 @@ export class WorkerClient {
   private readonly offscreen: OffscreenGateway;
   private readonly offscreenUrl: string;
   private readonly readyTimeoutMs: number;
+  private readonly onLateOutcome?: (outcome: TransferOutcome) => void;
   private readonly pending = new Map<string, PendingDownload>();
   private ready = false;
   private preparing?: Promise<void>;
@@ -57,6 +60,7 @@ export class WorkerClient {
     this.offscreen = options.offscreen;
     this.offscreenUrl = options.offscreenUrl;
     this.readyTimeoutMs = options.readyTimeoutMs ?? WORKER_READY_TIMEOUT_MS;
+    this.onLateOutcome = options.onLateOutcome;
     this.listen();
   }
 
@@ -141,6 +145,14 @@ export class WorkerClient {
     this.post(RELAY_MESSAGES.WorkerRelayAbort, { download_id: downloadId });
   }
 
+  /** Reject and forget a download that the service no longer awaits. */
+  cancel(downloadId: string): void {
+    const pending = this.pending.get(downloadId);
+    if (pending === undefined) return;
+    this.pending.delete(downloadId);
+    pending.reject(new Error("download cancelled"));
+  }
+
   /** Ask the worker to abort a running download. */
   abort(downloadId: string): void {
     this.post(MSG.worker.AbortDownload, { download_id: downloadId });
@@ -154,6 +166,7 @@ export class WorkerClient {
   dispose(): void {
     this.detach?.();
     this.detach = undefined;
+    for (const pending of this.pending.values()) pending.reject(new Error("worker client disposed"));
     this.pending.clear();
   }
 
@@ -182,7 +195,11 @@ export class WorkerClient {
         // The original correlates results by download_id when present; the worker also includes
         // it in its payload. Fall back to the only pending entry to stay tolerant.
         const pending = entry ?? (this.pending.size === 1 ? [...this.pending.values()][0] : undefined);
-        if (!pending) return;
+        if (!pending) {
+          if (outcome.internal_bloburl) this.revokeBlobUrl(outcome.internal_bloburl);
+          this.onLateOutcome?.(outcome);
+          return;
+        }
         for (const [id, candidate] of this.pending) {
           if (candidate === pending) this.pending.delete(id);
         }

@@ -228,6 +228,12 @@ export class MediaDownloaderService {
         channel: createWorkerChannel((name) => this.gateway.workerBus.openWorkerChannel()),
         offscreen: this.gateway.offscreen,
         offscreenUrl: this.gateway.runtime.getUrl(OFFSCREEN_URL),
+        onLateOutcome: (outcome) => {
+          if (outcome.internal_filename === undefined) return;
+          void this.opfsRoot()
+            .then((root) => root ? removeStagedFile(root, outcome.internal_filename as string) : undefined)
+            .catch(() => undefined);
+        },
       });
 
     this.ready = new Promise<void>((resolve) => {
@@ -1492,13 +1498,14 @@ export class MediaDownloaderService {
           outcome = ranged.value;
         }
       } else {
-      const timeout = new Promise<never>((_, reject) => {
-        deadline = setTimeout(() => {
-          console.warn("[media-downloader] transfer deadline exceeded; aborting");
-          this.worker.abort(plan.download_id);
-          reject(new Error("transfer timed out"));
-        }, TRANSFER_DEADLINE_MS);
-      });
+        const timeout = new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => {
+            console.warn("[media-downloader] transfer deadline exceeded; aborting");
+            this.worker.cancel(plan.download_id);
+            this.worker.abort(plan.download_id);
+            reject(new Error("transfer timed out"));
+          }, TRANSFER_DEADLINE_MS);
+        });
         outcome = await Promise.race([
           this.worker.download(plan, (progress) => this.onProgress(plan.download_id, progress)),
           timeout,
@@ -1544,9 +1551,11 @@ export class MediaDownloaderService {
     const requestId = crypto.randomUUID();
     this.relayRequests.set(requestId, { downloadId: plan.download_id, seq: 0 });
     const completion = this.worker.streamDownload(plan);
+    completion.catch(() => undefined);
     const timer = setTimeout(() => {
       console.warn("[media-downloader] page relay timed out");
       this.relayRequests.delete(requestId);
+      this.worker.cancel(plan.download_id);
       this.worker.abortRelay(plan.download_id);
     }, 30 * 60 * 1000);
     try {
@@ -1560,6 +1569,8 @@ export class MediaDownloaderService {
       const outcome = await completion;
       return { tag: "Ok", value: outcome };
     } catch (error) {
+      this.worker.cancel(plan.download_id);
+      this.worker.abortRelay(plan.download_id);
       return { tag: "Err", error: extractWorkerError(error) };
     } finally {
       clearTimeout(timer);
@@ -1580,6 +1591,7 @@ export class MediaDownloaderService {
     plan: DownloadPlan,
   ): Promise<Result<TransferOutcome, string>> {
     const completion = this.worker.streamDownload(plan);
+    completion.catch(() => undefined);
     const chunkSize = 2 * 1024 * 1024;
     const total = declaredSize(plan.url);
     let offset = 0;
@@ -1621,7 +1633,10 @@ export class MediaDownloaderService {
     } catch (error) {
       return { tag: "Err", error: extractWorkerError(error) };
     } finally {
-      if (!finished) this.worker.abortRelay(plan.download_id);
+      if (!finished) {
+        this.worker.cancel(plan.download_id);
+        this.worker.abortRelay(plan.download_id);
+      }
     }
   }
 
