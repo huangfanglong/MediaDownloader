@@ -28,26 +28,15 @@ import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
 import { buildPanelSnapshot, type PanelSnapshot } from "./panel-snapshot.js";
 import { debugInfo } from "./log.js";
-import { BoundedCache } from "./bounded-cache.js";
 import { filterFocusedMedia, type MediaFocusState } from "./focus.js";
 import { REBUILD_MESSAGES, RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
 import type { Result } from "../core/option.js";
 import { isErr } from "../core/option.js";
-import { DiscoveryEngine, SNIFF_RESOURCE_TYPES, type BehaviourGate, type HeaderPair } from "../discovery/engine.js";
-import { parsePlaylist } from "../manifests/hls.js";
-import { probeMpegTsVideoSize } from "../manifests/ts-probe.js";
-import { parseMpd } from "../manifests/dash.js";
+import { DiscoveryEngine, SNIFF_RESOURCE_TYPES, type BehaviourGate } from "../discovery/engine.js";
 import { buildPlan } from "../plan/build.js";
 import { applyOutputFormat, normalizeOutputFormat } from "../plan/output-format.js";
 import { buildPreviewPlan } from "../plan/strategies.js";
-import type { PlaylistEntry, SubtitleTrack } from "../core/types.js";
-import {
-  buildDnrRule,
-  fetchBytes,
-  headersForPlan,
-  sanitizeReplayHeaders,
-  type FetchLike,
-} from "../transfer/fetch.js";
+import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
 import {
   isSafeManifestUrl,
@@ -79,6 +68,9 @@ import { createWorkerChannel, WorkerClient } from "./worker-client.js";
 import { openOpfsRoot, removeStagedFile, type OpfsRoot } from "./staging.js";
 import { detectPlatform, type PlatformProfile } from "./platform.js";
 import { loadSmartnaming, materializeRule, selectRule } from "../naming/rules.js";
+import { HeaderReplay, normalizeHeaderReplayUrl } from "./header-replay.js";
+import { ManifestEnrichment } from "./manifest-enrichment.js";
+import { TabHealing } from "./tab-healing.js";
 
 /** Storage keys proven in the original (01 §5). */
 export const PERSISTENT_KEY = "global_persistent_state";
@@ -181,27 +173,18 @@ export class MediaDownloaderService {
   private readonly previewsByTab = new Map<number, { byAsset: Map<string, string> }>();
   /** Exact names to re-assert for extension-originated blob downloads. */
   private readonly pendingDownloadNames = new Map<string, string>();
-  /** Guards against concurrent manifest enrichment for the same item (review 2.1). */
   private readonly enriching = new Set<string>();
-  /** Session DNR rules currently installed (review 2.3 quota guard). */
-  private readonly activeRuleIds = new Set<number>();
+  private readonly headerReplay: HeaderReplay;
+  private readonly manifests: ManifestEnrichment;
+  private readonly tabHealing: TabHealing;
   /** Media hashes with a download in flight (review 4.1 duplicate downloads). */
   private readonly activeMediaHashes = new Set<string>();
   /** Page-relay request id -> download id (review: protected CDNs). */
   private readonly relayRequests = new Map<string, { downloadId: string; seq: number }>();
   /** Keeps the MV3 worker alive while transfers run (review 4.2). */
   private keepAliveTimer?: ReturnType<typeof setInterval>;
-  /** Recent request headers by normalised URL / asset key, for CDN header replay. */
-  private readonly capturedHeaders = new Map<
-    string,
-    { headers: HeaderPair[]; at: number; scheme: string; tabId?: number; frameId?: number; initiator?: string }
-  >();
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
   private readonly observedRequests = new Map<number, Set<string>>();
-  private readonly hlsQualityCache: BoundedCache<
-    string,
-    { size?: { width: number; height: number }; bitrate?: number }
-  >;
   private lastSnapshotSignature = "";
   private markReady!: () => void;
 
@@ -209,7 +192,6 @@ export class MediaDownloaderService {
     this.gateway = options.gateway;
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? (() => Date.now());
-    this.hlsQualityCache = new BoundedCache(100, 300_000, undefined, this.now);
     this.downloadIdFactory = options.downloadIdFactory ?? (() => `download_${crypto.randomUUID()}`);
     this.opfsRoot = options.opfsRoot ?? openOpfsRoot;
     this.platform =
@@ -223,6 +205,9 @@ export class MediaDownloaderService {
       enabled: (flag, host) => isFlagEnabled(this.settings.remote_behaviours, flag, host),
     };
     this.engine = new DiscoveryEngine({ flags: gate, now: this.now });
+    this.headerReplay = new HeaderReplay(this.gateway.network, this.now);
+    this.manifests = new ManifestEnrichment(this.fetchImpl, this.engine, this.now);
+    this.tabHealing = new TabHealing(this.gateway);
     this.queue =
       options.queue ??
       new DownloadQueue(
@@ -257,7 +242,7 @@ export class MediaDownloaderService {
     // content scripts. Force a fresh injection there so updates do not silently kill detection.
     this.disposers.push(
       this.gateway.runtime.onInstalled(() => {
-        void this.healOpenTabs(true);
+        void this.tabHealing.heal(true);
       }),
     );
     console.info("[media-downloader] service worker constructed");
@@ -280,18 +265,15 @@ export class MediaDownloaderService {
     return this.engine;
   }
 
-  private healingStarted = false;
-  private healInFlight: Promise<void> | undefined;
-
   /** Boot: restore state, purge staging, publish. Listeners are already registered. */
   async start(): Promise<void> {
     try {
       await this.restoreState();
-      await this.clearStaleHeaderRules();
+      await this.headerReplay.clearStaleRules();
       await this.resolveCurrentTab();
       await this.syncContextMenus();
       await this.publish();
-      void this.healOpenTabs();
+      void this.tabHealing.heal();
       console.info("[media-downloader] service worker ready");
     } catch (error) {
       console.error("[media-downloader] service worker start failed", error);
@@ -303,140 +285,6 @@ export class MediaDownloaderService {
   stop(): void {
     for (const dispose of this.disposers.splice(0)) dispose();
     this.worker.dispose();
-  }
-
-  /**
-   * Chrome does not inject content scripts into tabs that were already open when the extension is
-   * reloaded/updated. This probes every http(s) tab once per extension lifetime and injects the
-   * page hook + bridge only where they are missing (the page-hook has its own install guard).
-   */
-  private async healOpenTabs(force = false): Promise<void> {
-    // Serialise the startup heal and the onInstalled force heal; they inject into the same tabs.
-    if (force) {
-      await this.healInFlight?.catch(() => undefined);
-      this.healingStarted = true;
-      this.healInFlight = this.performHeal(true);
-      return this.healInFlight;
-    }
-    if (this.healingStarted) return;
-    this.healingStarted = true;
-    this.healInFlight = this.performHeal(false);
-    return this.healInFlight;
-  }
-
-  private async performHeal(force: boolean): Promise<void> {
-    const marker = "content_scripts_healed";
-    if (!force) {
-      try {
-        const stored = (await this.gateway.storage.session.get(marker).catch(() => ({}))) as Record<string, unknown>;
-        if (stored[marker] === true) return;
-      } catch {
-        /* session storage unavailable: still try once */
-      }
-    }
-    let injected = 0;
-    let skipped = 0;
-    let tabs: Awaited<ReturnType<typeof this.gateway.tabs.query>> = [];
-    try {
-      tabs = await this.gateway.tabs.query({});
-    } catch {
-      return;
-    }
-    for (const tab of tabs) {
-      if (tab.id === undefined || tab.url === undefined || !/^https?:\/\//u.test(tab.url)) continue;
-      // Chrome refuses script injection on the Web Store / restricted hosts without host access.
-      if (/^https?:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)/u.test(tab.url)) {
-        skipped += 1;
-        continue;
-      }
-      try {
-        if (force) {
-          const healed = await (async () => {
-            try {
-              // Clear the old generation's install guards, then load both scripts fresh.
-              await this.gateway.scripting.executeInTab(
-                tab.id,
-                () => {
-                  delete (globalThis as { __mediaDownloaderHookInstalled?: boolean }).__mediaDownloaderHookInstalled;
-                },
-                [],
-                { world: "MAIN" },
-              );
-              await this.gateway.scripting.executeFilesInTab(tab.id, ["page-hook.js"], { world: "MAIN" });
-              await this.gateway.scripting.executeInTab(
-                tab.id,
-                () => {
-                  const scope = globalThis as {
-                    __mediaDownloaderContentBridgeInstalled?: boolean;
-                    __mediaDownloaderBridgePing?: () => boolean;
-                  };
-                  delete scope.__mediaDownloaderContentBridgeInstalled;
-                  delete scope.__mediaDownloaderBridgePing;
-                },
-                [],
-                { world: "ISOLATED" },
-              );
-              await this.gateway.scripting.executeFilesInTab(tab.id, ["content-script.js"]);
-              return true;
-            } catch {
-              return false;
-            }
-          })();
-          if (healed) injected += 2;
-          else skipped += 1;
-          continue;
-        }
-        const hookAlive = await this.gateway.scripting
-          .executeInTab(
-            tab.id,
-            () => Boolean((globalThis as { __mediaDownloaderHookInstalled?: boolean }).__mediaDownloaderHookInstalled),
-            [],
-            { world: "MAIN" },
-          )
-          .catch(() => false);
-        if (hookAlive !== true) {
-          const hookInjected = await this.gateway.scripting
-            .executeFilesInTab(tab.id, ["page-hook.js"], { world: "MAIN" })
-            .then(() => true)
-            .catch(() => false);
-          if (hookInjected) injected += 1;
-          else skipped += 1;
-        }
-        const bridgeAlive = await this.gateway.scripting
-          .executeInTab(
-            tab.id,
-            () => {
-              const scope = globalThis as { __mediaDownloaderBridgePing?: () => boolean };
-              try {
-                return scope.__mediaDownloaderBridgePing?.() === true;
-              } catch {
-                return false;
-              }
-            },
-            [],
-            { world: "ISOLATED" },
-          )
-          .catch(() => false);
-        if (bridgeAlive !== true) {
-          const bridgeInjected = await this.gateway.scripting
-            .executeFilesInTab(tab.id, ["content-script.js"])
-            .then(() => true)
-            .catch(() => false);
-          if (bridgeInjected) injected += 1;
-          else skipped += 1;
-        }
-      } catch {
-        // Restricted pages/host-access denials are expected for some tabs; count them once.
-        skipped += 1;
-      }
-    }
-    await this.gateway.storage.session.set({ [marker]: true }).catch(() => undefined);
-    if (injected > 0) {
-      console.info("[media-downloader] injected bridge into", injected, "pre-existing tab context(s)", force ? "(forced after install/update)" : "");
-    }
-    if (skipped > 0) {
-      console.info("[media-downloader] skipped", skipped, "restricted or host-denied tab(s) during healing");
-    }
   }
 
   // -------------------------------------------------------------------------
@@ -465,19 +313,6 @@ export class MediaDownloaderService {
     await this.gateway.storage.local
       .set({ [PERSISTENT_KEY]: encodeState(this.settings) })
       .catch(() => undefined);
-  }
-
-  /** Session DNR rules are per-extension: remove leftovers from a previous worker lifetime. */
-  private async clearStaleHeaderRules(): Promise<void> {
-    try {
-      const rules = await this.gateway.network.getSessionRules();
-      const ids = rules.map((rule) => rule.id);
-      if (ids.length === 0) return;
-      await this.gateway.network.updateSessionRules({ removeRuleIds: ids });
-      console.info("[media-downloader] cleared", ids.length, "stale header rule(s)");
-    } catch (error) {
-      console.warn("[media-downloader] stale rule cleanup failed", error);
-    }
   }
 
   /** Track the active tab from boot; later kept in sync by `tabs.onActivated`. */
@@ -602,7 +437,7 @@ export class MediaDownloaderService {
           });
           this.rememberObservedRequest(details.tabId, details.url);
           if (details.requestHeaders && details.requestHeaders.length > 0) {
-            this.rememberRequestHeaders(details.url, details.requestHeaders, {
+            this.headerReplay.remember(details.url, details.requestHeaders, {
               tabId: details.tabId,
               frameId: details.frameId,
               ...(details.initiator ? { initiator: details.initiator } : {}),
@@ -853,200 +688,13 @@ export class MediaDownloaderService {
     if (this.enriching.has(key)) return;
     this.enriching.add(key);
     try {
-      if (item.type === "m3u8") await this.enrichHls(item, tabId);
-      else await this.enrichDash(item, tabId);
+      if (item.type === "m3u8") await this.manifests.enrichHls(item, tabId);
+      else await this.manifests.enrichDash(item, tabId);
     } catch (error) {
       console.warn("[media-downloader] manifest enrichment failed", item.type, error);
     } finally {
       this.enriching.delete(key);
     }
-  }
-
-  /** Media playlists have no RESOLUTION; read the first TS segment's SPS instead. */
-  private async probeHlsMediaQuality(
-    segment: { uri: URL; duration?: number } | undefined,
-    item: MediaItem,
-  ): Promise<{ size?: { width: number; height: number }; bitrate?: number }> {
-    if (segment === undefined) return {};
-    if (segment.uri.protocol !== "https:" && segment.uri.protocol !== "http:") return {};
-    if (!isSafeManifestUrl(segment.uri)) return {};
-    const cacheKey = item.master_url?.href ?? item.url?.href;
-    const cached = cacheKey !== undefined ? this.hlsQualityCache.get(cacheKey) : undefined;
-    if (cached !== undefined) return cached;
-    try {
-      const fetched = await fetchBytes(
-        this.fetchImpl,
-        segment.uri.href,
-        { headers: headersForPlan(item.sent_headers) },
-        { maxBytes: 8 * 1024 * 1024 },
-      );
-      if (fetched.tag === "Err") return {};
-      const dimensions = probeMpegTsVideoSize(fetched.value.bytes);
-      if (dimensions === undefined) {
-        if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, {});
-        return {};
-      }
-      const duration = segment.duration;
-      const bitrate =
-        duration !== undefined && Number.isFinite(duration) && duration > 0
-          ? Math.round((fetched.value.bytes.byteLength * 8) / duration)
-          : undefined;
-      debugInfo("probed HLS segment quality", dimensions.width, dimensions.height);
-      const quality = {
-        size: dimensions,
-        ...(bitrate !== undefined && bitrate > 0 ? { bitrate } : {}),
-      };
-      if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, quality);
-      return quality;
-    } catch {
-      return {};
-    }
-  }
-
-  /** Fetch and attach the HLS playlist structure to a sniffed manifest candidate. */
-  private async enrichHls(item: MediaItem, tabId: number): Promise<void> {
-    const manifestUrl = item.master_url ?? item.url;
-    if (!manifestUrl) return;
-    const fetched = await fetchBytes(
-      this.fetchImpl,
-      manifestUrl.href,
-      { headers: headersForPlan(item.sent_headers) },
-      { maxBytes: MAX_MANIFEST_BYTES },
-    );
-    if (fetched.tag === "Err") return;
-    const text = new TextDecoder().decode(fetched.value.bytes);
-    const parsed = parsePlaylist(text, manifestUrl);
-    if (parsed.kind === "invalid" || parsed.kind === "subtitle") return;
-
-    if (parsed.kind === "media") {
-      const quality = await this.probeHlsMediaQuality(parsed.segments[0], item);
-      const entry: PlaylistEntry = {
-        demuxer: item.demuxer ?? "mp4",
-        quality,
-        av: { video: manifestUrl, audio: false },
-      };
-      this.engine.attachPlaylist(tabId, item.hash, [entry], {
-        type: "m3u8",
-        duration: parsed.duration,
-        has_drm: parsed.hasDrm,
-        manifestText: text,
-        ...(item.demuxer ? { demuxer: item.demuxer } : {}),
-      });
-      return;
-    }
-
-    // Master playlist: the original fetches the first variant's media playlist to report a
-    // duration (5 s timeout). Do the same, but never let it block detection.
-    const firstVariant = parsed.variants[0];
-    const probeController = new AbortController();
-    const probe = firstVariant
-      ? await withTimeout(
-          this.fetchVariantProbe(firstVariant.uri, item.sent_headers, probeController.signal),
-          5000,
-          { hasDrm: false } as VariantProbe,
-          () => probeController.abort(),
-        )
-      : ({ hasDrm: false } as VariantProbe);
-    const duration = probe.duration;
-    const hasDrm = probe.hasDrm;
-
-    const entries: PlaylistEntry[] = parsed.variants.map((variant) => {
-      const rendition = parsed.audioRenditions.find(
-        (candidate) => candidate.group === variant.audioGroup && candidate.uri !== undefined,
-      );
-      const audioUri = rendition?.uri ?? false;
-      return {
-        demuxer: variant.demuxer ?? "mp4",
-        quality: {
-          ...(variant.resolution ? { size: variant.resolution } : {}),
-          ...(variant.bandwidth !== undefined ? { bitrate: variant.bandwidth } : {}),
-        },
-        av: { video: variant.uri, audio: audioUri },
-        ...(rendition?.language ? { audio_language: rendition.language } : {}),
-      };
-    });
-    const subtitles: SubtitleTrack[] = parsed.subtitleRenditions
-      .filter((rendition) => rendition.url !== undefined)
-      .map((rendition) => ({
-        language: rendition.language ?? "und",
-        type: "http" as const,
-        url: rendition.url as URL,
-      }));
-    this.engine.attachPlaylist(tabId, item.hash, entries, {
-      type: "m3u8_playlist",
-      ...(duration !== undefined ? { duration } : {}),
-      has_drm: hasDrm,
-      manifestText: text,
-      ...(subtitles.length > 0 ? { subtitles } : {}),
-    });
-  }
-
-  /** One fetch of the first variant's media playlist: master-level duration + DRM probe. */
-  private async fetchVariantProbe(
-    url: URL,
-    sentHeaders: Headers,
-    signal: AbortSignal,
-  ): Promise<VariantProbe> {
-    const fetched = await fetchBytes(
-      this.fetchImpl,
-      url.href,
-      { headers: headersForPlan(sentHeaders) },
-      { maxBytes: MAX_PROBE_BYTES, signal },
-    );
-    if (fetched.tag === "Err") return { hasDrm: false };
-    const parsed = parsePlaylist(new TextDecoder().decode(fetched.value.bytes), url);
-    if (parsed.kind !== "media") return { hasDrm: false };
-    return { duration: parsed.duration, hasDrm: parsed.hasDrm };
-  }
-
-  /** Fetch and attach DASH representations to a sniffed MPD candidate. */
-  private async enrichDash(item: MediaItem, tabId: number): Promise<void> {
-    const manifestUrl = item.master_url ?? item.url;
-    if (!manifestUrl) return;
-    const fetched = await fetchBytes(
-      this.fetchImpl,
-      manifestUrl.href,
-      { headers: headersForPlan(item.sent_headers) },
-      { maxBytes: MAX_MANIFEST_BYTES },
-    );
-    if (fetched.tag === "Err") return;
-    const text = new TextDecoder().decode(fetched.value.bytes);
-    const parsed = parseMpd(text, manifestUrl);
-    if (parsed.tag === "Err") return;
-    const mpd = parsed.value;
-    const entries: PlaylistEntry[] = [
-      ...mpd.video.map((entry) => ({
-        demuxer: entry.demuxer,
-        quality: {
-          ...(entry.height !== undefined || entry.width !== undefined
-            ? {
-                size: {
-                  height: entry.height ?? 0,
-                  ...(entry.width !== undefined ? { width: entry.width } : {}),
-                },
-              }
-            : {}),
-          ...(entry.bandwidth !== undefined ? { bitrate: entry.bandwidth } : {}),
-        },
-        index: entry.index,
-        ...(entry.audioId !== undefined ? { audio_id: entry.audioId } : {}),
-        ...(entry.language !== undefined ? { audio_language: entry.language } : {}),
-      })),
-      ...mpd.audio.map((entry) => ({
-        demuxer: entry.demuxer,
-        quality: { ...(entry.bandwidth !== undefined ? { bitrate: entry.bandwidth } : {}) },
-        index: entry.index,
-        ...(entry.audioId !== undefined ? { audio_id: entry.audioId } : {}),
-        ...(entry.language !== undefined ? { audio_language: entry.language } : {}),
-      })),
-    ];
-    this.engine.attachPlaylist(tabId, item.hash, entries, {
-      type: "mpd_playlist",
-      ...(mpd.duration !== undefined ? { duration: mpd.duration } : {}),
-      has_drm: mpd.hasDrm,
-      manifestText: text,
-      ...(mpd.subtitles.length > 0 ? { subtitles: mpd.subtitles } : {}),
-    });
   }
 
   /** Capture page title/thumbnail and the smart-naming rule for a tab. */
@@ -1498,7 +1146,7 @@ export class MediaDownloaderService {
     if (entry) entry.status = "downloading";
     await this.publish();
     let outcome: TransferOutcome | undefined;
-    const ruleIds = await this.applyHeaderRules(plan, {
+    const ruleIds = await this.headerReplay.apply(plan, {
       ...(meta.tab_id !== undefined ? { tabId: meta.tab_id } : {}),
       ...(media.initiator !== undefined ? { initiator: media.initiator.origin } : {}),
     });
@@ -1535,7 +1183,7 @@ export class MediaDownloaderService {
       failure = extractWorkerError(error);
     } finally {
       if (deadline !== undefined) clearTimeout(deadline);
-      await this.removeHeaderRules(ruleIds);
+      await this.headerReplay.remove(ruleIds);
     }
     if (failure !== undefined) {
       const retryThroughPage =
@@ -1660,42 +1308,6 @@ export class MediaDownloaderService {
     }
   }
 
-  /**
-   * Store the headers the page actually sent for a media URL (for CDN replay).
-   * Values are length/control-character checked; the cache prunes expired entries on every
-   * insert and evicts oldest-first at the cap (review 1.2 / 2.2).
-   */
-  private rememberRequestHeaders(
-    rawUrl: string,
-    headers: HeaderPair[],
-    context: { tabId?: number; frameId?: number; initiator?: string } = {},
-  ): void {
-    if (rawUrl.length > MAX_CAPTURED_URL_LENGTH) return;
-    const now = this.now();
-    this.pruneCapturedHeaders(now);
-    const normalized = normalizeHeaderReplayUrl(rawUrl);
-    const safe = headers
-      .filter((header) => header.value !== undefined)
-      .filter((header) => HEADER_NAME.test(header.name))
-      .filter((header) => (header.value as string).length <= MAX_CAPTURED_HEADER_LENGTH)
-      .filter((header) => !/[\r\n\0]/.test(header.value as string))
-      .slice(0, MAX_CAPTURED_HEADERS);
-    if (safe.length === 0) return;
-    const entry = {
-      headers: safe,
-      at: now,
-      scheme: normalized.scheme,
-      ...(context.tabId !== undefined ? { tabId: context.tabId } : {}),
-      ...(context.frameId !== undefined ? { frameId: context.frameId } : {}),
-      ...(context.initiator !== undefined ? { initiator: context.initiator } : {}),
-    };
-    this.capturedHeaders.set(normalized.href, entry);
-    if (normalized.assetKey !== undefined) {
-      this.capturedHeaders.set(normalized.assetKey, entry);
-    }
-    this.pruneCapturedHeaders(now);
-  }
-
   /** Remember a URL the browser actually requested in a tab (bounded, per-tab). */
   private rememberObservedRequest(tabId: number, rawUrl: string): void {
     if (tabId < 0 || rawUrl.length > MAX_CAPTURED_URL_LENGTH) return;
@@ -1711,99 +1323,6 @@ export class MediaDownloaderService {
     } catch {
       /* malformed URL; ignore */
     }
-  }
-
-  /** Drop expired entries, then evict oldest until the cap holds. */
-  private pruneCapturedHeaders(now: number): void {
-    for (const [key, entry] of this.capturedHeaders) {
-      if (now - entry.at > HEADER_REPLAY_TTL_MS) this.capturedHeaders.delete(key);
-    }
-    while (this.capturedHeaders.size > HEADER_REPLAY_CAP) {
-      const oldest = this.capturedHeaders.keys().next();
-      if (oldest.done) break;
-      this.capturedHeaders.delete(oldest.value);
-    }
-  }
-
-  /** Add a session DNR rule so the worker's request carries captured CDN headers. */
-  private async applyHeaderRules(
-    plan: DownloadPlan,
-    context: { tabId?: number; initiator?: string } = {},
-  ): Promise<number[]> {
-    // Signed googlevideo URLs (e.g. the ANDROID_VR muxed format) are self-authorising and are
-    // rejected when a browser context is forced onto them; live E2E showed replaying captured
-    // page headers here turns a working ranged request into a 403. Skip replay for them.
-    if (plan.is_youtube && /(^|\.)googlevideo\.com$/iu.test(plan.url.hostname)) return [];
-    // Merge the page's captured request headers (memory only) for this exact asset.
-    const merged = sanitizeReplayHeaders(plan.headers);
-    this.pruneCapturedHeaders(this.now());
-    const normalized = normalizeHeaderReplayUrl(plan.url.href);
-    const candidate =
-      this.capturedHeaders.get(normalized.href) ??
-      (normalized.assetKey !== undefined ? this.capturedHeaders.get(normalized.assetKey) : undefined);
-    // Credentials are bound to the exact browser context: same scheme (never an HTTPS->HTTP
-    // downgrade), same tab and, when both are known, the same initiator origin.
-    const captured =
-      candidate !== undefined &&
-      candidate.scheme === plan.url.protocol &&
-      context.tabId !== undefined &&
-      candidate.tabId === context.tabId &&
-      (context.initiator === undefined ||
-        candidate.initiator === undefined ||
-        originOf(candidate.initiator) === context.initiator)
-        ? candidate
-        : undefined;
-    if (captured) {
-      const pairs = captured.headers.map((header) => [header.name, header.value ?? ""] as [string, string]);
-      for (const [name, value] of sanitizeReplayHeaders(pairs)) {
-        merged.set(name, value);
-      }
-    }
-    // DNR rules are browser-wide, and a live Chromium probe confirmed `tabIds` does not gate
-    // extension-worker fetches (the fetch carries no tab id). Do not replay Cookie on a rule
-    // that another tab's request to the same exact URL could match. Non-credential headers
-    // (referer/origin) still use the exact-URL rule.
-    const hadCookie = merged.has("cookie");
-    merged.delete("cookie");
-    if (hadCookie) {
-      console.info("[media-downloader] skipped Cookie DNR replay (worker requests cannot be tab-scoped)");
-    }
-    const replayedHeaderCount = [...merged.keys()].length;
-    if (replayedHeaderCount === 0) return [];
-    if (this.activeRuleIds.size >= MAX_ACTIVE_DNR_RULES) {
-      console.warn("[media-downloader] DNR rule budget exhausted; skipping header replay");
-      return [];
-    }
-    const rule = buildDnrRule({
-      id: Math.ceil(Math.random() * 1e8),
-      // Literal URL match: the plan URL is page-influenced, so never interpolate it into a
-      // wildcard DNR filter (a `*` in the path would broaden credential replay).
-      exactUrl: `${plan.url.origin}${plan.url.pathname}${plan.url.search}`,
-      headers: merged,
-    });
-    try {
-      await this.gateway.network.updateSessionRules({ addRules: [rule] });
-      this.activeRuleIds.add(rule.id);
-      console.info(
-        "[media-downloader] replayed",
-        replayedHeaderCount,
-        "captured headers for",
-        plan.url.hostname,
-        "[",
-        [...merged.keys()].join(","),
-        "]",
-      );
-      return [rule.id];
-    } catch (error) {
-      console.warn("[media-downloader] header replay failed", error);
-      return [];
-    }
-  }
-
-  private async removeHeaderRules(ruleIds: number[]): Promise<void> {
-    if (ruleIds.length === 0) return;
-    for (const id of ruleIds) this.activeRuleIds.delete(id);
-    await this.gateway.network.updateSessionRules({ removeRuleIds: ruleIds }).catch(() => undefined);
   }
 
   private async saveOutcome(
@@ -1994,25 +1513,9 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
   };
 }
 
-const HEADER_REPLAY_TTL_MS = 10 * 60 * 1000;
-/** Defensive caps for the header-replay cache (review 1.2 / 2.2). */
 const MAX_CAPTURED_URL_LENGTH = 8192;
-const MAX_CAPTURED_HEADER_LENGTH = 8192;
-const MAX_CAPTURED_HEADERS = 60;
-const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
-/** Manifest fetch caps (review 3.1). */
-const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
-const MAX_PROBE_BYTES = 2 * 1024 * 1024;
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
-/** Keep well below Chrome's 750 session-rule limit. */
-const MAX_ACTIVE_DNR_RULES = 700;
-
-interface VariantProbe {
-  duration?: MediaItem["duration"];
-  hasDrm: boolean;
-}
-const HEADER_REPLAY_CAP = 300;
 
 /** Output containers this rebuild can actually produce. */
 const ALLOWED_OUTPUT_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mp3", "m4a", "ogg", "ts", "m2ts"]);
@@ -2050,14 +1553,6 @@ export function redactSessionForStorage(session: SessionState): SessionState {
 }
 
 /** Validate a plan before it can reach the download queue (review 3.3). */
-function originOf(raw: string): string | undefined {
-  try {
-    return new URL(raw).origin;
-  } catch {
-    return undefined;
-  }
-}
-
 export function validateDownloadPlan(plan: DownloadPlan): string | undefined {
   if (plan === null || typeof plan !== "object") return "Malformed download plan";
   if (!(plan.url instanceof URL)) return "Malformed media URL";
@@ -2088,28 +1583,6 @@ function mediaUrl(item: MediaItem): string {
     item.master_url?.href ??
     (video ? video.href : "")
   );
-}
-
-/** Normalise a URL for header replay: drop byte-range/volatile params, keep asset identity. */
-const VOLATILE_QUERY_PARAMS = [
-  "range", "rn", "rbuf", "bytestart", "byteend",
-  "mx", "mh", "mm", "mn", "ms", "mv", "mvi", "pl", "initcwndbps", "met", "cps", "xpc", "c",
-];
-
-export function normalizeHeaderReplayUrl(raw: string): { href: string; scheme: string; assetKey?: string } {
-  try {
-    const url = new URL(raw);
-    for (const param of VOLATILE_QUERY_PARAMS) url.searchParams.delete(param);
-    const id = url.searchParams.get("id");
-    const itag = url.searchParams.get("itag");
-    return {
-      href: url.href,
-      scheme: url.protocol,
-      ...(id && itag ? { assetKey: `${url.protocol}//${url.host}${url.pathname}|${id}|${itag}` } : {}),
-    };
-  } catch {
-    return { href: raw, scheme: "" };
-  }
 }
 
 /**
@@ -2159,31 +1632,17 @@ function decodeMaybe(value: unknown): unknown {
   return value;
 }
 
-/** Resolve with `fallback` when `promise` takes longer than `ms` (original uses 5 s here). */
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  fallback: T,
-  onTimeout?: () => void,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<T>((resolve) => {
-    timer = setTimeout(() => {
-      onTimeout?.();
-      resolve(fallback);
-    }, ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
 /** Entry point used by `boot.ts`. */
 export function createMediaDownloaderService(options: ServiceWorkerOptions): MediaDownloaderService {
   return new MediaDownloaderService(options);
 }
 
-export { userAbortReason, httpFailureReason, otherFailureReason, buildDownloadRequest, composeFilename };
+export {
+  userAbortReason,
+  httpFailureReason,
+  otherFailureReason,
+  buildDownloadRequest,
+  composeFilename,
+  normalizeHeaderReplayUrl,
+};
 export type { ContextMenuItem, TabInfo };
