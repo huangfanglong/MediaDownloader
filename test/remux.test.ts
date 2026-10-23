@@ -213,10 +213,12 @@ describe("remux decisions helpers", () => {
     expect(muxerFormatName("mp3")).toBe("mp3");
   });
 
-  it("provides blob MIME types for the two special extensions", () => {
+  it("provides explicit blob MIME types for media outputs", () => {
     expect(blobMimeType("mkv")).toBe("video/x-matroska");
     expect(blobMimeType("flv")).toBe("video/x-flv");
-    expect(blobMimeType("mp4")).toBeUndefined();
+    expect(blobMimeType("mp4")).toBe("video/mp4");
+    expect(blobMimeType("m2ts")).toBe("video/mp2t");
+    expect(blobMimeType("unknown")).toBe("application/octet-stream");
   });
 
   it("every strategy except the progressive copy needs libav", () => {

@@ -159,11 +159,35 @@ export function muxerFormatName(muxer: string): string {
   return muxer === "mkv" ? "matroska" : muxer;
 }
 
-/** Blob MIME type for the saved file, when the browser needs one (E20, download_worker 2132-2142). */
-export function blobMimeType(extension: string): string | undefined {
-  if (extension === "mkv") return "video/x-matroska";
-  if (extension === "flv") return "video/x-flv";
-  return undefined;
+/** MIME type for the staged download blob. An empty type lets Chromium replace media extensions. */
+export function blobMimeType(extension: string): string {
+  switch (extension.toLowerCase()) {
+    case "mp4":
+    case "m4v":
+      return "video/mp4";
+    case "mkv":
+      return "video/x-matroska";
+    case "webm":
+      return "video/webm";
+    case "mov":
+      return "video/quicktime";
+    case "flv":
+      return "video/x-flv";
+    case "ts":
+    case "m2ts":
+      return "video/mp2t";
+    case "mp3":
+      return "audio/mpeg";
+    case "m4a":
+      return "audio/mp4";
+    case "ogg":
+    case "opus":
+      return "audio/ogg";
+    case "wav":
+      return "audio/wav";
+    default:
+      return "application/octet-stream";
+  }
 }
 
 /** Convenience: remux is needed for every strategy except the progressive copy (E25). */

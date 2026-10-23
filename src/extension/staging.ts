@@ -9,6 +9,8 @@
  * The browser surface is injected (an `OpfsRoot`-shaped object) so the logic is testable in Node.
  */
 
+import { blobMimeType } from "../transfer/remux.js";
+
 export interface OpfsFileHandle {
   write(data: Uint8Array): Promise<{ written: number }>;
   close(): Promise<void>;
@@ -65,7 +67,12 @@ export class StagedFile {
     await this.handle.close();
     const entry = await this.directory.getFileHandle(this.name);
     const file = await entry.getFile();
-    return { filename: this.name, blobUrl: URL.createObjectURL(file) };
+    const extension = this.name.includes(".") ? this.name.slice(this.name.lastIndexOf(".") + 1) : "";
+    const typedFile = new File([file], this.name, {
+      type: blobMimeType(extension),
+      lastModified: file.lastModified,
+    });
+    return { filename: this.name, blobUrl: URL.createObjectURL(typedFile) };
   }
 
   async abort(): Promise<void> {
