@@ -278,6 +278,16 @@ describe("panel snapshot (UI contract)", () => {
     ]);
   });
 
+  it("marks DASH rows unavailable instead of offering a failing download", () => {
+    const snapshot = buildPanelSnapshot({
+      media: [item({ type: "mpd_playlist", master_url: new URL("https://cdn.test/manifest.mpd") })],
+      downloading: new Map(),
+      notifications: new Map(),
+    });
+
+    expect(snapshot.media[0]?.download_disabled_reason).toBe("DASH downloads are not supported yet");
+  });
+
   it("falls back to the media type when no title is available", () => {
     expect(mediaLabel(item({ hash: "media_hash_abcdef" }), undefined)).toBe("http_playlist abcdef.mp4");
   });

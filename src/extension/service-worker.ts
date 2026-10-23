@@ -1391,6 +1391,16 @@ export class MediaDownloaderService {
     const meta = decodeMaybe(payload.meta) as TabMeta | undefined;
     if (!media || !meta) return;
     if (this.activeMediaHashes.has(media.hash)) return;
+    if (media.type === "mpd_playlist") {
+      this.addNotification({
+        type: "download_error",
+        timestamp: this.now(),
+        details: "DASH downloads are not supported yet",
+        media_type: media.type,
+      });
+      await this.publish();
+      return;
+    }
     if (media.has_drm) {
       this.addNotification({
         type: "download_error",

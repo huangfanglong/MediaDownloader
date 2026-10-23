@@ -22,6 +22,8 @@ export interface PanelMediaRow {
   muxNote?: string;
   /** Muted hover-preview source (direct video track; absent for manifests). */
   preview?: string;
+  /** Visible reason when this detected media cannot be downloaded yet. */
+  download_disabled_reason?: string;
   /** Default download source tag (FMT for direct formats, HLS for m3u8). */
   source?: "FMT" | "HLS" | "DASH";
   /** Selectable sources; more than one only when the player exposed both FMT and HLS. */
@@ -205,6 +207,9 @@ export function buildPanelSnapshot(input: PanelSnapshotInput): PanelSnapshot {
       };
     })(),
     ...(previewUrl(item) !== undefined ? { preview: previewUrl(item) } : {}),
+    ...(item.type === "mpd_playlist"
+      ? { download_disabled_reason: "DASH downloads are not supported yet" }
+      : {}),
     ...((): { source: PanelMediaRow["source"]; sources: NonNullable<PanelMediaRow["sources"]> } => {
       if (item.hls_url !== undefined) {
         return {
@@ -280,6 +285,7 @@ export function panelMediaSignature(media: readonly PanelMediaRow[]): string {
         (row.sources ?? []).map((source) => source.value).join(","),
         (row.variants ?? []).map((variant) => `${variant.index}:${variant.label}:${variant.container ?? ""}`).join(","),
         row.muxNote ?? "",
+        row.download_disabled_reason ?? "",
       ].join("\u0001"),
     )
     .join("\u0002");

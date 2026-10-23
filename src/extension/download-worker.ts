@@ -6,10 +6,9 @@
  * download plans (`download`), fetches/assembles them (HLS segment path or libav js-fetch path),
  * stages the output in OPFS, then posts `download_result` with a blob URL, or `download_error`.
  *
- * Rebuilt scope: byte-accurate assembly for progressive HTTP responses and HLS segment lists
- * (fMP4 via `#EXT-X-MAP`, MPEG-TS as concatenated `.ts`). DASH and audio/video muxing need the
- * FFmpeg remuxer, which is deliberately out of scope (docs/UNKNOWNS.md) and reported as an
- * explicit error rather than silently producing a broken file.
+ * The worker assembles progressive HTTP responses and HLS segment lists, with FFmpeg used for
+ * remuxing, muxing, and format conversion. DASH segment resolution is not implemented, so those
+ * plans are rejected before any transfer rather than producing a broken file.
  */
 import { Channel } from "../protocol/channels.js";
 import { MSG, type DownloadProgressPayload } from "../protocol/messages.js";
@@ -393,9 +392,8 @@ export class DownloadWorker {
     const headers = headersForPlan(plan.headers);
 
     if (plan.strategy.startsWith("mpd_")) {
-      return err("DASH transfer requires the libav remuxer, which is not part of the rebuilt scope");
+      return err("DASH downloads require segment resolution, which is not supported yet");
     }
-
 
     let bytes: Uint8Array;
     // Produced (source) extension; plan.extension is the *requested* target and may differ.

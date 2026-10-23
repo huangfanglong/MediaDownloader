@@ -403,17 +403,27 @@ function renderRows(snapshot: PanelSnapshot): void {
     meta.textContent = bits.join(" · ");
     details.append(titleLine, meta);
 
-    const { qualitySelect, formatSelect } = createSelectors(row, details);
+    const selectors = row.download_disabled_reason === undefined ? createSelectors(row, details) : undefined;
+    const qualitySelect = selectors?.qualitySelect;
+    const formatSelect = selectors?.formatSelect;
     if (row.muxNote !== undefined) {
       const note = document.createElement("span");
       note.className = "media-note";
       note.textContent = row.muxNote;
       details.append(note);
     }
+    if (row.download_disabled_reason !== undefined) {
+      const note = document.createElement("span");
+      note.className = "media-note";
+      note.textContent = row.download_disabled_reason;
+      details.append(note);
+    }
 
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = "Download";
+    button.disabled = row.download_disabled_reason !== undefined;
+    button.textContent = button.disabled ? "Unavailable" : "Download";
+    button.title = row.download_disabled_reason ?? "";
     button.addEventListener("click", () => {
       button.disabled = true;
       send(MSG.contentToService.DoDownload, {
@@ -424,7 +434,7 @@ function renderRows(snapshot: PanelSnapshot): void {
         ...(qualitySelect !== undefined && qualitySelect.options.length > 1
           ? { preferred_entry: Number(qualitySelect.value) }
           : {}),
-        ...(formatSelect.value !== "" ? { output_format: formatSelect.value } : {}),
+        ...(formatSelect !== undefined && formatSelect.value !== "" ? { output_format: formatSelect.value } : {}),
         ...(() => {
           const select = titleLine.querySelector("select.media-source-select") as HTMLSelectElement | null;
           return select !== null ? { source: select.value } : {};

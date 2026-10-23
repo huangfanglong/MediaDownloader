@@ -1,8 +1,10 @@
 # Media Downloader
 
-An MV3 extension that watches page network traffic, recognises downloadable media
-(progressive files, HLS playlists, DASH manifests), builds a download plan, fetches and
-assembles the bytes, and saves the file. Tested on Brave Browser on Windows.
+An MV3 extension that watches page network traffic, recognises downloadable media, builds a
+download plan, fetches and assembles the bytes, and saves the file. Progressive files and HLS
+playlists can be downloaded. DASH manifests are detected and shown with quality information, but
+DASH downloads are disabled until segment resolution is implemented. Tested on Brave Browser on
+Windows.
 
   This was a half a day project built for fun entirely with DeepSeek-V4.1-Flash-1017 to test its capabilities.
 
@@ -12,7 +14,7 @@ assembles the bytes, and saves the file. Tested on Brave Browser on Windows.
 0. Clone this repository, then at repository's root:
 ```powershell
 npm install
-npm run verify     # typecheck + 650 behaviour/parity/hardening tests + loadable-extension build
+npm run verify     # typecheck + behaviour/parity/hardening tests + loadable-extension build
 npm run build      # compile TS -> dist/extension + copy manifest/panel assets
 ```
 1. Open browser's menu -> Extension -> Manage extensions. 
