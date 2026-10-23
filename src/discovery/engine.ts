@@ -169,6 +169,8 @@ export interface AttachPlaylistExtra {
   /** Playlist kind, when parsing discovers it (e.g. candidate `m3u8` turns out to be a master). */
   type?: MediaType;
   duration?: MediaDuration;
+  /** Native output container detected from the media playlist. */
+  extension?: string;
   has_drm?: boolean;
   subtitles?: SubtitleTrack[];
   /** Demuxer for `m3u8` media playlists (`"mp4"` by default, `"mp3"` audio-only sites). */
@@ -491,6 +493,7 @@ export class DiscoveryEngine {
 
     item.playlist = playlist;
     if (extra.duration !== undefined) item.duration = extra.duration;
+    if (extra.extension !== undefined) item.extension = extra.extension;
     if (extra.has_drm !== undefined) item.has_drm = extra.has_drm;
     if (extra.subtitles !== undefined) item.subtitles = extra.subtitles;
     if (extra.demuxer !== undefined) item.demuxer = extra.demuxer;

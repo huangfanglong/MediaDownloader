@@ -325,9 +325,10 @@ function createSelectors(
       const option = document.createElement("option");
       option.value = String(variant.index);
       option.textContent = variant.label;
-      option.title =
-        variant.container !== undefined
-          ? "Video-only WEBM rendition; its AAC audio is muxed into MKV on download"
+      option.title = variant.container === "mkv"
+        ? "Video-only WEBM rendition. Its AAC audio is muxed into MKV on download"
+        : variant.container !== undefined
+          ? `Native output: ${variant.container.toUpperCase()}`
           : "Approximate average bitrate of this rendition (not the measured download speed)";
       qualitySelect.append(option);
     }
@@ -343,15 +344,23 @@ function createSelectors(
     row.variants?.find((variant) => String(variant.index) === (qualitySelect?.value ?? "0"));
   const autoOption = document.createElement("option");
   autoOption.value = "";
+  let mp4Option: HTMLOptionElement | undefined;
   const syncAutoLabel = (): void => {
     const container = selectedVariant()?.container;
-    autoOption.textContent = container !== undefined ? `Auto (${container.toUpperCase()})` : "Auto (native)";
-    formatSelect.title =
-      container !== undefined
-        ? `Output format (Auto = ${container.toUpperCase()}; selected WEBM video has AAC audio)`
+    autoOption.textContent = container === "m2ts"
+      ? "M2TS (original)"
+      : container !== undefined
+        ? `Auto (${container.toUpperCase()})`
+        : "Auto (native)";
+    formatSelect.title = container === "m2ts"
+      ? "M2TS keeps the original stream. MP4 losslessly remuxes it when conversion is available"
+      : container === "mkv"
+        ? "Output format (Auto = MKV. Selected WEBM video has AAC audio)"
         : "Output format (Auto = the selected rendition's native container)";
+    if (mp4Option !== undefined) {
+      mp4Option.textContent = container === "m2ts" ? "MP4 (lossless remux)" : "MP4";
+    }
   };
-  syncAutoLabel();
   formatSelect.append(autoOption);
   for (const [value, label] of [
     ["mp4", "MP4"],
@@ -362,8 +371,10 @@ function createSelectors(
     const option = document.createElement("option");
     option.value = value;
     option.textContent = label;
+    if (value === "mp4") mp4Option = option;
     formatSelect.append(option);
   }
+  syncAutoLabel();
   formatSelect.value = saved?.format ?? "";
   formatSelect.addEventListener("change", () => saveSelection(row.hash, { format: formatSelect.value }));
   qualitySelect?.addEventListener("change", syncAutoLabel);

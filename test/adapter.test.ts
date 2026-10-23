@@ -343,7 +343,7 @@ describe("panel snapshot (UI contract)", () => {
     expect(snapshot.media[0]?.muxNote).toContain("saves as MKV");
   });
 
-  it("uses rendered size and estimated bitrate when a manifest has no quality metadata", () => {
+  it("does not assume MP4 before the HLS container is known", () => {
     const media = item({
       type: "m3u8",
       extension: undefined,
@@ -354,7 +354,27 @@ describe("panel snapshot (UI contract)", () => {
       thumbnail_url: new URL("https://cdn.test/thumb.jpg"),
     });
     const snapshot = buildPanelSnapshot({ media: [media], downloading: new Map(), notifications: new Map() });
-    expect(snapshot.media[0]?.variants?.[0]?.label).toBe("MP4 · 1920x1080 · 125KB/s");
+    expect(snapshot.media[0]?.variants?.[0]?.label).toBe("HLS · 1920x1080 · 125KB/s");
+  });
+
+  it("shows M2TS as the native output for an MPEG-TS HLS row", () => {
+    const media = item({
+      type: "m3u8",
+      extension: "m2ts",
+      playlist: [
+        {
+          demuxer: "mp4",
+          quality: { size: { width: 1920, height: 1080 } },
+          av: { video: new URL("https://cdn.test/media.m3u8"), audio: false },
+        },
+      ],
+    });
+    const snapshot = buildPanelSnapshot({ media: [media], downloading: new Map(), notifications: new Map() });
+    expect(snapshot.media[0]?.variants?.[0]).toEqual({
+      index: 0,
+      label: "M2TS · 1920x1080",
+      container: "m2ts",
+    });
   });
 
   it("shows a human-readable format instead of the internal media type", () => {

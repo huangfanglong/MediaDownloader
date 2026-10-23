@@ -61,6 +61,7 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     const discovered = harness.service.getSession().discovered.get(7);
     const item = [...(discovered?.media.values() ?? [])][0];
     expect(item?.type).toBe("m3u8_playlist");
+    expect(item?.extension).toBe("mp4");
     expect(item?.playlist?.map((entry) => entry.quality.size?.height)).toEqual([1080, 720]);
     expect(item?.duration).toBe(6);
 
@@ -225,6 +226,11 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     await gateway.triggerResponseStarted(sniffDetails("https://cdn.test/ts/master.m3u8", "application/vnd.apple.mpegurl"));
     const item = [...(service.getSession().discovered.get(7)?.media.values() ?? [])][0];
     expect(item?.type).toBe("m3u8_playlist");
+    expect(item?.extension).toBe("m2ts");
+    expect(service.panelSnapshot().media[0]?.variants?.[0]).toMatchObject({
+      label: expect.stringContaining("M2TS"),
+      container: "m2ts",
+    });
     const meta = service.getSession().discovered.get(7)?.meta as TabMeta;
     await gateway.deliverToService(doDownloadEnvelope(item as MediaItem, meta));
     expect(gateway.downloadRequestsLog[0]?.filename).toBe("Test Page.m2ts");

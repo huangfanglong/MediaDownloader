@@ -13,6 +13,7 @@ const MAX_PROBE_BYTES = 2 * 1024 * 1024;
 
 interface VariantProbe {
   duration?: MediaItem["duration"];
+  extension?: "m2ts" | "mp4";
   hasDrm: boolean;
 }
 
@@ -70,6 +71,7 @@ export class ManifestEnrichment {
       this.engine.attachPlaylist(tabId, item.hash, [entry], {
         type: "m3u8",
         duration: parsed.duration,
+        extension: parsed.segments.some((segment) => segment.map !== undefined) ? "mp4" : "m2ts",
         has_drm: parsed.hasDrm,
         manifestText: text,
         ...(item.demuxer ? { demuxer: item.demuxer } : {}),
@@ -112,6 +114,7 @@ export class ManifestEnrichment {
     this.engine.attachPlaylist(tabId, item.hash, entries, {
       type: "m3u8_playlist",
       ...(probe.duration !== undefined ? { duration: probe.duration } : {}),
+      ...(probe.extension !== undefined ? { extension: probe.extension } : {}),
       has_drm: probe.hasDrm,
       manifestText: text,
       ...(subtitles.length > 0 ? { subtitles } : {}),
@@ -217,6 +220,10 @@ export class ManifestEnrichment {
     if (fetched.tag === "Err") return { hasDrm: false };
     const parsed = parsePlaylist(new TextDecoder().decode(fetched.value.bytes), url);
     if (parsed.kind !== "media") return { hasDrm: false };
-    return { duration: parsed.duration, hasDrm: parsed.hasDrm };
+    return {
+      duration: parsed.duration,
+      extension: parsed.segments.some((segment) => segment.map !== undefined) ? "mp4" : "m2ts",
+      hasDrm: parsed.hasDrm,
+    };
   }
 }

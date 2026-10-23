@@ -163,40 +163,46 @@ export function buildPanelSnapshot(input: PanelSnapshotInput): PanelSnapshot {
         ...(item.estimated_bitrate !== undefined ? { bitrate: item.estimated_bitrate } : {}),
       };
       const entries = item.playlist !== undefined && item.playlist.length > 0 ? item.playlist : undefined;
+      const isHls = item.type === "m3u8" || item.type === "m3u8_playlist";
       if (entries === undefined) {
-        const format =
-          item.type === "m3u8" || item.type === "m3u8_playlist" || item.type === "mpd_playlist"
-            ? item.extension?.toUpperCase() ?? "MP4"
-            : item.extension?.toUpperCase() ?? "Source";
+        const format = item.extension?.toUpperCase() ??
+          (isHls ? "HLS" : item.type === "mpd_playlist" ? "DASH" : "Source");
         const parts = [format];
         if (fallbackQuality.width !== undefined && fallbackQuality.height !== undefined) {
           parts.push(`${fallbackQuality.width}x${fallbackQuality.height}`);
         }
         const rate = bitrateLabel(fallbackQuality.bitrate);
         if (rate !== undefined) parts.push(rate);
-        return { variants: [{ index: 0, label: parts.join(" · ") }] };
+        return {
+          variants: [{
+            index: 0,
+            label: parts.join(" · "),
+            ...(isHls && item.extension !== undefined ? { container: item.extension } : {}),
+          }],
+        };
       }
       // Show the real rendition label even when it is the only one. "Best available" hid the
       // codec/resolution that the adapter already knew.
       const labels = entries.map((entry, index) => variantLabel(entry, index, fallbackQuality));
-      // Instagram WEBM renditions are video-only and pair with AAC audio; Auto must mux them
-      // into Matroska. Surface that so the quality list (WEBM) and the output file (.mkv)
-      // stop looking contradictory.
-      const outputContainers = entries.map((entry) =>
-        item.type === "http_playlist" &&
-        item.is_youtube !== true &&
-        entry.demuxer === "webm" &&
-        entry.av?.audio !== undefined &&
-        entry.av.audio !== false
+      // HLS uses the container found in the media playlist. Instagram WEBM video with AAC audio
+      // uses MKV because that pair cannot be copied into WEBM.
+      const outputContainers = entries.map((entry) => {
+        if (isHls) return item.extension;
+        return item.type === "http_playlist" &&
+          item.is_youtube !== true &&
+          entry.demuxer === "webm" &&
+          entry.av?.audio !== undefined &&
+          entry.av.audio !== false
           ? "mkv"
-          : undefined,
-      );
-      const renderedLabels = labels.map((label, index) =>
-        outputContainers[index] !== undefined ? label.replace(/^WEBM/u, "WEBM video") : label,
-      );
+          : undefined;
+      });
+      const renderedLabels = labels.map((label, index) => {
+        if (outputContainers[index] === "m2ts") return label.replace(/^MP4/u, "M2TS");
+        return outputContainers[index] === "mkv" ? label.replace(/^WEBM/u, "WEBM video") : label;
+      });
       const labelCounts = new Map<string, number>();
       for (const label of renderedLabels) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
-      const mixed = outputContainers.some((container) => container !== undefined);
+      const mixed = outputContainers.some((container) => container === "mkv");
       return {
         variants: renderedLabels.map((label, index) => ({
           index,
