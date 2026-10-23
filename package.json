@@ -1,6 +1,6 @@
 {
   "name": "media-downloader",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "description": "A simple video/audio downloader.",
   "type": "module",
