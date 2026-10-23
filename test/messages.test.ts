@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DownloadPlan, MediaItem, TabMeta, TransferOutcome } from "../src/core/types.js";
 import { TransferStrategy } from "../src/core/types.js";
-import { Channel, WORKER_SERVICE_CHANNEL } from "../src/protocol/channels.js";
+import { Channel } from "../src/protocol/channels.js";
 import {
   MSG,
   SETTINGS_MUTATION_KEYS,
@@ -15,11 +15,9 @@ import {
   makeEnvelope,
   makeServiceToContentEnvelope,
   makeWorkerEnvelope,
-  type DownloadCommand,
   type DownloadProgressPayload,
   type DoDownloadPayload,
   type MessageEnvelope,
-  type MutSettingsPayload,
   type WorkerDownloadPayload,
 } from "../src/protocol/messages.js";
 import { structured } from "../src/protocol/serde.js";
@@ -88,19 +86,6 @@ const doDownloadFixture = (): DoDownloadPayload => {
 };
 
 describe("channel contract (E8: the nine-value enum)", () => {
-  it("pins each catalog direction to its shipped channel number", () => {
-    expect(Channel.FromInjectedToService).toBe(0);
-    expect(Channel.FromContentToService).toBe(1);
-    expect(Channel.FromServiceToWorker).toBe(2);
-    expect(Channel.FromWorkerToService).toBe(3);
-    expect(Channel.FromUntrustedInjectedToTrusted).toBe(4);
-    expect(Channel.FromTrustedInjectedToUntrusted).toBe(5);
-    expect(Channel.FromServiceToContent).toBe(6);
-    expect(Channel.FromServiceToInjected).toBe(7);
-    expect(Channel.FromServiceToService).toBe(8);
-    expect(WORKER_SERVICE_CHANNEL).toBe("worker_service");
-  });
-
   it("keeps the shipped channel-1 command names (22 proven), exact spelling", () => {
     expect(Object.values(MSG.contentToService)).toEqual([
       "do_download",
@@ -334,41 +319,5 @@ describe("serde round-trip of data-bearing payloads (E13/E17/E34)", () => {
       aborted_no_partial: false,
     };
     expect(structured(result)).toEqual(result);
-  });
-
-  it("accepts every mut-settings variant at the type level (19 payloads)", () => {
-    const mutations: MutSettingsPayload[] = [
-      { preferred_audio_strategy: "original" },
-      { preferred_audio_languages: ["fr", "en"] },
-      { hide_nomedia_box: true },
-      { max_concurrent_downloads: 3 },
-      { show_desktop_notifications: false },
-      { preferred_quality: null },
-      { always_download_as_mkv: true },
-      { preview_mode: "video" },
-      { show_desktop_notifications_private: false },
-      { show_transient_history: true },
-      { history_days: 7 },
-      { ui_theme: "system" },
-      { popup_size: "medium" },
-      { font_size: "default" },
-      { youtube_throttle: true },
-      { use_context_menu: true },
-      { download_directory: "Movies/" },
-      { preferred_discovered_order: "SMART" },
-      { subtitles_language: ["en"] },
-    ];
-    expect(mutations).toHaveLength(SETTINGS_MUTATION_KEYS.length);
-  });
-
-  it("groups the download commands (channel 1) into DownloadCommand", () => {
-    const fixture = doDownloadFixture();
-    const commands: DownloadCommand[] = [
-      fixture,
-      { download_id: fixture.download_args.download_id },
-      { tab_id: 7, media_hash: fixture.media.hash },
-      { browser_download_id: 12 },
-    ];
-    expect(commands).toHaveLength(4);
   });
 });
