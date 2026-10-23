@@ -28,6 +28,7 @@ import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
 import { buildPanelSnapshot, type PanelSnapshot } from "./panel-snapshot.js";
 import { debugInfo } from "./log.js";
+import { BoundedCache } from "./bounded-cache.js";
 import { filterFocusedMedia, type MediaFocusState } from "./focus.js";
 import { REBUILD_MESSAGES, RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
 import type { Result } from "../core/option.js";
@@ -60,7 +61,13 @@ import {
   type DownloadTerminalState,
 } from "../transfer/save.js";
 import { DownloadQueue } from "../transfer/queue.js";
-import { createDefaultSettings, applySettingsMutation, decodeState, encodeState } from "../settings/local.js";
+import {
+  createDefaultSettings,
+  applySettingsMutation,
+  decodeState,
+  encodeState,
+  pruneDownloadHistory,
+} from "../settings/local.js";
 import type { PersistentSettings } from "../settings/local.js";
 import { isFlagEnabled, type Behaviours } from "../settings/flags.js";
 import {
@@ -191,10 +198,10 @@ export class MediaDownloaderService {
   >();
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
   private readonly observedRequests = new Map<number, Set<string>>();
-  private readonly hlsQualityCache = new Map<
+  private readonly hlsQualityCache: BoundedCache<
     string,
-    { at: number; quality: { size?: { width: number; height: number }; bitrate?: number } }
-  >();
+    { size?: { width: number; height: number }; bitrate?: number }
+  >;
   private lastSnapshotSignature = "";
   private markReady!: () => void;
 
@@ -202,6 +209,7 @@ export class MediaDownloaderService {
     this.gateway = options.gateway;
     this.fetchImpl = options.fetchImpl;
     this.now = options.now ?? (() => Date.now());
+    this.hlsQualityCache = new BoundedCache(100, 300_000, undefined, this.now);
     this.downloadIdFactory = options.downloadIdFactory ?? (() => `download_${crypto.randomUUID()}`);
     this.opfsRoot = options.opfsRoot ?? openOpfsRoot;
     this.platform =
@@ -450,6 +458,7 @@ export class MediaDownloaderService {
     if (sessionStored[SESSION_KEY] !== undefined) {
       this.session = decode(sessionStored[SESSION_KEY]) as SessionState;
     }
+    if (pruneDownloadHistory(this.settings, this.now())) await this.persistSettings();
   }
 
   private async persistSettings(): Promise<void> {
@@ -863,7 +872,7 @@ export class MediaDownloaderService {
     if (!isSafeManifestUrl(segment.uri)) return {};
     const cacheKey = item.master_url?.href ?? item.url?.href;
     const cached = cacheKey !== undefined ? this.hlsQualityCache.get(cacheKey) : undefined;
-    if (cached !== undefined && Date.now() - cached.at < 300_000) return cached.quality;
+    if (cached !== undefined) return cached;
     try {
       const fetched = await fetchBytes(
         this.fetchImpl,
@@ -874,7 +883,7 @@ export class MediaDownloaderService {
       if (fetched.tag === "Err") return {};
       const dimensions = probeMpegTsVideoSize(fetched.value.bytes);
       if (dimensions === undefined) {
-        if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, { at: Date.now(), quality: {} });
+        if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, {});
         return {};
       }
       const duration = segment.duration;
@@ -887,7 +896,7 @@ export class MediaDownloaderService {
         size: dimensions,
         ...(bitrate !== undefined && bitrate > 0 ? { bitrate } : {}),
       };
-      if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, { at: Date.now(), quality });
+      if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, quality);
       return quality;
     } catch {
       return {};
@@ -1338,6 +1347,7 @@ export class MediaDownloaderService {
     const result = applySettingsMutation(this.settings, mutation);
     if (!result.changed) return;
     this.settings = result.state;
+    pruneDownloadHistory(this.settings, this.now());
     this.queue.setTotalCapacity(this.settings.max_concurrent_downloads);
     this.queue.setYoutubeCapacity(
       this.settings.youtube_throttle ? 1 : this.settings.max_concurrent_downloads,
@@ -1908,8 +1918,8 @@ export class MediaDownloaderService {
     }
     if (this.settings.history_days > 0) {
       this.settings.downloaded.set(record.downloaded_id, record as never);
-      await this.persistSettings();
     }
+    pruneDownloadHistory(this.settings, this.now());
     this.settings.successful_downloads_count += 1;
     this.settings.lsd = this.now();
     await this.persistSettings();

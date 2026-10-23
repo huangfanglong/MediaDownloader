@@ -14,6 +14,7 @@ import { MSG } from "../../protocol/messages.js";
 import { REBUILD_MESSAGES } from "../../protocol/rebuild-messages.js";
 import { decode } from "../../protocol/serde.js";
 import { statusPresentation } from "../panel-status.js";
+import { BoundedCache } from "../bounded-cache.js";
 import {
   formatLabel,
   panelMediaSignature,
@@ -111,7 +112,12 @@ function createThumbnail(mediaWrap: HTMLElement, row: PanelSnapshot["media"][num
 /** Page-context fetches keep Referer/cookies; Chrome refuses these media URLs from the panel. */
 const PREVIEW_PROXY_MAX_BYTES = 262_144;
 const PREVIEW_PROXY_TTL_MS = 30_000;
-const proxiedPreviewCache = new Map<string, { url: string; at: number }>();
+const PREVIEW_PROXY_MAX_ENTRIES = 8;
+const proxiedPreviewCache = new BoundedCache<string, string>(
+  PREVIEW_PROXY_MAX_ENTRIES,
+  PREVIEW_PROXY_TTL_MS,
+  (objectUrl) => URL.revokeObjectURL(objectUrl),
+);
 
 function needsPagePreviewProxy(url: string): boolean {
   try {
@@ -129,7 +135,7 @@ function needsPagePreviewProxy(url: string): boolean {
 async function fetchPagePreviewBlob(url: string): Promise<string | undefined> {
   if (scripting === undefined || activeTabId === undefined) return undefined;
   const cached = proxiedPreviewCache.get(url);
-  if (cached !== undefined && Date.now() - cached.at < PREVIEW_PROXY_TTL_MS) return cached.url;
+  if (cached !== undefined) return cached;
   try {
     const results = await scripting.executeScript({
       target: { tabId: activeTabId },
@@ -183,7 +189,7 @@ async function fetchPagePreviewBlob(url: string): Promise<string | undefined> {
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     const blob = new Blob([bytes], { type: typeof result.type === "string" ? result.type : "video/mp4" });
     const objectUrl = URL.createObjectURL(blob);
-    proxiedPreviewCache.set(url, { url: objectUrl, at: Date.now() });
+    proxiedPreviewCache.set(url, objectUrl);
     return objectUrl;
   } catch {
     return undefined;
@@ -273,10 +279,7 @@ function attachHoverPreview(mediaWrap: HTMLElement, row: PanelSnapshot["media"][
   });
 }
 
-window.addEventListener("unload", () => {
-  for (const entry of proxiedPreviewCache.values()) URL.revokeObjectURL(entry.url);
-  proxiedPreviewCache.clear();
-});
+window.addEventListener("unload", () => proxiedPreviewCache.clear());
 function createSourceControl(row: PanelSnapshot["media"][number]): HTMLElement | undefined {
   const sources = row.sources;
   if (sources === undefined || sources.length === 0) return undefined;

@@ -196,6 +196,23 @@ export function createDefaultSettings(): PersistentSettings {
  */
 export const DEFAULT_SETTINGS: PersistentSettings = createDefaultSettings();
 
+/** Apply the retention window to stored history. Zero disables persistent history. */
+export function pruneDownloadHistory(state: PersistentSettings, now: number): boolean {
+  if (!Number.isFinite(state.history_days) || state.history_days <= 0) {
+    const changed = state.downloaded.size > 0;
+    state.downloaded.clear();
+    return changed;
+  }
+  const cutoff = now - state.history_days * 86_400_000;
+  let changed = false;
+  for (const [id, record] of state.downloaded) {
+    if (record.download_timestamp >= cutoff) continue;
+    state.downloaded.delete(id);
+    changed = true;
+  }
+  return changed;
+}
+
 // ---------------------------------------------------------------------------
 // `mut-settings` mutations (channel 1; E22/§3.7). 19 keys proven — strict superset of the
 // brief's 18 (the shipped `else if` chain has 19 branches, pretty 23076-23142).

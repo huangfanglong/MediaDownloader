@@ -29,6 +29,7 @@ import {
   effectiveDefaultAction,
   encodeState,
   isSettingsMutationKey,
+  pruneDownloadHistory,
   type PersistentSettings,
 } from "../src/settings/local.js";
 import * as settings from "../src/settings/index.js";
@@ -447,5 +448,39 @@ describe("behaviour flags: hash parity with the shipped ruleset (E19-E20)", () =
     expect(rulesetUrl({ release: "beta", platform: "mozilla" })).toBe(
       "https://files.downloadhelper.net/4/ruleset-beta-mozilla.json",
     );
+  });
+});
+
+describe("download history retention", () => {
+  const record = (id: string, download_timestamp: number) => ({
+    downloaded_id: id,
+    media_hash: id,
+    path: `${id}.mp4`,
+    browser_download_id: 1,
+    download_timestamp,
+    origin_url: null,
+    origin_favicon_url: null,
+    has_drm: false,
+  });
+
+  it("removes records outside the retention window", () => {
+    const settings = createDefaultSettings();
+    settings.history_days = 7;
+    settings.downloaded = new Map([
+      ["old", record("old", 1_699_000_000_000)],
+      ["recent", record("recent", 1_700_500_000_000)],
+    ]);
+
+    expect(pruneDownloadHistory(settings, 1_700_500_000_000)).toBe(true);
+    expect([...settings.downloaded.keys()]).toEqual(["recent"]);
+    expect(pruneDownloadHistory(settings, 1_700_500_000_000)).toBe(false);
+  });
+
+  it("clears existing records when persistent history is disabled", () => {
+    const settings = createDefaultSettings();
+    settings.downloaded.set("old", record("old", 1_700_000_000_000));
+
+    expect(pruneDownloadHistory(settings, 1_700_500_000_000)).toBe(true);
+    expect(settings.downloaded.size).toBe(0);
   });
 });
