@@ -522,7 +522,7 @@ export class DownloadWorker {
       duration = videoAssembled.value.duration ?? duration;
       }
     } else if (isHlsStrategy(plan.strategy)) {
-      const stream = plan.output_format === undefined
+      const stream = plan.output_format === undefined || plan.output_format === "mp4"
         ? { root, downloadId: plan.download_id }
         : undefined;
       const assembled = await this.assembleHls(plan, headers, signal, stream);
@@ -530,10 +530,16 @@ export class DownloadWorker {
       duration = assembled.value.duration ?? duration;
       extension = assembled.value.extension;
       const staged = assembled.value.staged;
+      const shouldRemux = extension === "m2ts" && plan.output_format === "mp4";
+      if (shouldRemux && this.deps.ffmpeg === undefined) {
+        await staged?.abort();
+        return err("MP4 conversion requires FFmpeg. Choose M2TS to keep the original stream.");
+      }
+      if (shouldRemux && assembled.value.totalBytes > MAX_FFMPEG_INPUT_BYTES) {
+        await staged?.abort();
+        return err("MP4 conversion is limited to 600 MiB in the browser. Choose M2TS to keep the original stream.");
+      }
       const finished = staged !== undefined ? await staged.finish() : undefined;
-      const shouldRemux = extension === "m2ts" &&
-        this.deps.ffmpeg !== undefined &&
-        assembled.value.totalBytes <= MAX_FFMPEG_INPUT_BYTES;
       if (finished !== undefined && !shouldRemux) {
         this.emitProgress(plan.download_id, {
           status: "finalizing",
@@ -556,7 +562,7 @@ export class DownloadWorker {
       bytes = finished !== undefined
         ? new Uint8Array(await finished.file.arrayBuffer())
         : assembled.value.bytes;
-      // Remux raw TS when it fits the bounded WASM input budget. Larger streams stay in OPFS.
+      // Explicit MP4 copies the streams into a new container without re-encoding them.
       if (shouldRemux) {
         try {
           const remuxed = await this.deps.ffmpeg?.run({
@@ -564,13 +570,18 @@ export class DownloadWorker {
             args: ["-hide_banner", "-y", "-i", "input.m2ts", "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
             outputName: "output.mp4",
           });
-          if (remuxed !== undefined && remuxed.byteLength >= MIN_OUTPUT_BYTES) {
-            bytes = remuxed;
-            extension = "mp4";
-            console.info("[media-downloader] remuxed HLS TS to mp4", bytes.byteLength, "bytes");
+          if (remuxed === undefined || remuxed.byteLength < MIN_OUTPUT_BYTES) {
+            throw new Error("FFmpeg produced an empty MP4");
           }
+          bytes = remuxed;
+          extension = "mp4";
+          console.info("[media-downloader] remuxed HLS TS to mp4", bytes.byteLength, "bytes");
         } catch (error) {
-          console.warn("[media-downloader] HLS TS to mp4 remux failed; keeping m2ts", String(error));
+          if (finished !== undefined) {
+            URL.revokeObjectURL(finished.blobUrl);
+            await removeStagedFile(root, finished.filename).catch(() => undefined);
+          }
+          return err(`MP4 remux failed: ${String(error)}`);
         }
       }
       if (finished !== undefined) {

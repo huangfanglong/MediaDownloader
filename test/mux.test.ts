@@ -288,8 +288,8 @@ describe("single-source FFmpeg conversion", () => {
   });
 });
 
-describe("HLS TS remux", () => {
-  it("remuxes a staged stream and removes the temporary file", async () => {
+describe("HLS TS output formats", () => {
+  async function runHlsTs(options: { outputFormat?: "mp4"; withFfmpeg?: boolean } = {}) {
     const manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n0.ts\n#EXTINF:4,\n1.ts\n#EXT-X-ENDLIST\n";
     const payloads = new Map<string, Uint8Array>([
       ["https://cdn.test/media.m3u8", encoder.encode(manifest)],
@@ -308,9 +308,9 @@ describe("HLS TS remux", () => {
       } as unknown as BroadcastChannelLike,
       fetchImpl,
       openRoot: async () => root,
-      ffmpeg: ffmpeg.runner,
+      ...(options.withFfmpeg === false ? {} : { ffmpeg: ffmpeg.runner }),
     });
-    vi.spyOn(URL, "createObjectURL").mockReturnValueOnce("blob:temp").mockReturnValueOnce("blob:final");
+    vi.spyOn(URL, "createObjectURL").mockReset().mockReturnValueOnce("blob:temp").mockReturnValueOnce("blob:final");
     const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
     const plan = {
       download_id: "download_hls_remux",
@@ -324,12 +324,27 @@ describe("HLS TS remux", () => {
       carry_get_params: false,
       extension: "mp4",
       muxer: "mp4",
+      ...(options.outputFormat === undefined ? {} : { output_format: options.outputFormat }),
       is_youtube: false,
       throttle: false,
       cache: "default",
     } as DownloadPlan;
 
     const result = await worker.runPlan(plan);
+    return { result, files, ffmpeg, revoke };
+  }
+
+  it("keeps the original M2TS unless MP4 was requested", async () => {
+    const { result, files, ffmpeg } = await runHlsTs();
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    if (result.tag === "Ok") expect(result.value.output_extension).toBe("m2ts");
+    expect(ffmpeg.jobs).toHaveLength(0);
+    expect(files.has("download_hls_remux.m2ts")).toBe(true);
+  });
+
+  it("remuxes explicit MP4 and removes the temporary M2TS file", async () => {
+    const { result, files, ffmpeg, revoke } = await runHlsTs({ outputFormat: "mp4" });
 
     expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
     if (result.tag === "Ok") {
@@ -340,6 +355,13 @@ describe("HLS TS remux", () => {
     expect(files.has("download_hls_remux.m2ts")).toBe(false);
     expect(files.has("download_hls_remux.mp4")).toBe(true);
     expect(revoke).toHaveBeenCalledWith("blob:temp");
+  });
+
+  it("reports an error instead of saving M2TS when MP4 conversion is unavailable", async () => {
+    const { result } = await runHlsTs({ outputFormat: "mp4", withFfmpeg: false });
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/MP4 conversion requires FFmpeg/i);
   });
 });
 
