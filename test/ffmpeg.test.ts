@@ -1,5 +1,39 @@
-import { describe, expect, it } from "vitest";
-import { convertArgs, mergeArgs, mp3Args } from "../src/transfer/ffmpeg.js";
+import { describe, expect, it, vi } from "vitest";
+import { convertArgs, FfmpegRunner, mergeArgs, mp3Args, type FfmpegJob } from "../src/transfer/ffmpeg.js";
+
+const ffmpegState = vi.hoisted(() => ({ active: 0, maxActive: 0, failNext: false }));
+
+vi.mock("@ffmpeg/ffmpeg", () => ({
+  FFmpeg: class {
+    loaded = true;
+
+    on(): void {}
+
+    async load(): Promise<void> {}
+
+    async writeFile(): Promise<void> {}
+
+    async exec(): Promise<number> {
+      ffmpegState.active += 1;
+      ffmpegState.maxActive = Math.max(ffmpegState.maxActive, ffmpegState.active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      ffmpegState.active -= 1;
+      if (ffmpegState.failNext) {
+        ffmpegState.failNext = false;
+        return 1;
+      }
+      return 0;
+    }
+
+    async readFile(): Promise<Uint8Array> {
+      return new Uint8Array([1]);
+    }
+
+    async deleteFile(): Promise<void> {}
+
+    terminate(): void {}
+  },
+}));
 import { applyOutputFormat, normalizeOutputFormat } from "../src/plan/output-format.js";
 import type { DownloadPlan } from "../src/core/types.js";
 
@@ -22,6 +56,33 @@ describe("ffmpeg argument builders", () => {
     expect(mp3Args("in.mp4", "out.mp3")).toContain("-vn");
     expect(convertArgs("in.mp4", "out.mkv", "mkv", false)).toContain("copy");
     expect(convertArgs("in.mp4", "out.webm", "webm", true)).toContain("libvpx");
+  });
+});
+
+describe("ffmpeg job scheduling", () => {
+  it("runs one job at a time on a shared runner", async () => {
+    ffmpegState.active = 0;
+    ffmpegState.maxActive = 0;
+    const runner = new FfmpegRunner("https://extension.test/vendor/");
+    const job: FfmpegJob = {
+      inputs: [{ name: "video.bin", bytes: new Uint8Array([1]) }],
+      args: ["-i", "video.bin", "out.mp4"],
+      outputName: "out.mp4",
+    };
+
+    await Promise.all([runner.run(job), runner.run(job)]);
+
+    expect(ffmpegState.maxActive).toBe(1);
+  });
+
+  it("continues with the next job after a failure", async () => {
+    const runner = new FfmpegRunner("https://extension.test/vendor/");
+    const job: FfmpegJob = { inputs: [], args: ["out.mp4"], outputName: "out.mp4" };
+    ffmpegState.failNext = true;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await expect(runner.run(job)).rejects.toThrow("ffmpeg exited with 1");
+    await expect(runner.run(job)).resolves.toEqual(new Uint8Array([1]));
   });
 });
 

@@ -90,6 +90,7 @@ export function defaultVendorBase(): string {
 export class FfmpegRunner implements FfmpegRunnerLike {
   private instance: FFmpeg | undefined;
   private loading: Promise<FFmpeg> | undefined;
+  private queue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly vendorBase: string = defaultVendorBase(),
@@ -117,7 +118,13 @@ export class FfmpegRunner implements FfmpegRunnerLike {
     return this.loading;
   }
 
-  async run(job: FfmpegJob): Promise<Uint8Array> {
+  run(job: FfmpegJob): Promise<Uint8Array> {
+    const result = this.queue.then(() => this.runExclusive(job));
+    this.queue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async runExclusive(job: FfmpegJob): Promise<Uint8Array> {
     const ffmpeg = await this.ensureLoaded();
     try {
       for (const input of job.inputs) await ffmpeg.writeFile(input.name, input.bytes);
