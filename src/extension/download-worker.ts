@@ -395,7 +395,7 @@ export class DownloadWorker {
       return err("DASH downloads require segment resolution, which is not supported yet");
     }
 
-    let bytes: Uint8Array;
+    let bytes = new Uint8Array();
     // Produced (source) extension; plan.extension is the *requested* target and may differ.
     let extension = plan.source_demuxer ?? extensionForUrl(plan.url) ?? plan.extension ?? "bin";
     let duration: number | undefined = typeof plan.duration === "number" ? plan.duration : undefined;
@@ -535,10 +535,6 @@ export class DownloadWorker {
         await staged?.abort();
         return err("MP4 conversion requires FFmpeg. Choose M2TS to keep the original stream.");
       }
-      if (shouldRemux && assembled.value.totalBytes > MAX_FFMPEG_INPUT_BYTES) {
-        await staged?.abort();
-        return err("MP4 conversion is limited to 600 MiB in the browser. Choose M2TS to keep the original stream.");
-      }
       const finished = staged !== undefined ? await staged.finish() : undefined;
       if (finished !== undefined && !shouldRemux) {
         this.emitProgress(plan.download_id, {
@@ -559,14 +555,16 @@ export class DownloadWorker {
         } as TransferOutcome);
       }
 
-      bytes = finished !== undefined
-        ? new Uint8Array(await finished.file.arrayBuffer())
-        : assembled.value.bytes;
-      // Explicit MP4 copies the streams into a new container without re-encoding them.
+      if (!shouldRemux || finished === undefined) {
+        bytes = finished !== undefined
+          ? new Uint8Array(await finished.file.arrayBuffer())
+          : assembled.value.bytes;
+      }
+      // WORKERFS reads a staged File directly, so large inputs do not fill FFmpeg's memory filesystem.
       if (shouldRemux) {
         try {
           const remuxed = await this.deps.ffmpeg?.run({
-            inputs: [{ name: "input.m2ts", bytes }],
+            inputs: [{ name: "input.m2ts", ...(finished !== undefined ? { file: finished.file } : { bytes }) }],
             args: ["-hide_banner", "-y", "-i", "input.m2ts", "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
             outputName: "output.mp4",
           });

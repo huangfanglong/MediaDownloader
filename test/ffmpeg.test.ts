@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { convertArgs, FfmpegRunner, mergeArgs, mp3Args, type FfmpegJob } from "../src/transfer/ffmpeg.js";
 
-const ffmpegState = vi.hoisted(() => ({ active: 0, maxActive: 0, failNext: false }));
+const ffmpegState = vi.hoisted(() => ({
+  active: 0,
+  maxActive: 0,
+  failNext: false,
+  writes: [] as unknown[],
+  mounts: [] as unknown[],
+  unmounts: [] as string[],
+  execArgs: [] as string[][],
+}));
 
 vi.mock("@ffmpeg/ffmpeg", () => ({
+  FFFSType: { WORKERFS: "WORKERFS" },
   FFmpeg: class {
     loaded = true;
 
@@ -11,9 +20,25 @@ vi.mock("@ffmpeg/ffmpeg", () => ({
 
     async load(): Promise<void> {}
 
-    async writeFile(): Promise<void> {}
+    async writeFile(path: string, data: unknown): Promise<void> {
+      ffmpegState.writes.push({ path, data });
+    }
 
-    async exec(): Promise<number> {
+    async createDir(): Promise<void> {}
+
+    async mount(fsType: string, options: unknown, mountPoint: string): Promise<boolean> {
+      ffmpegState.mounts.push({ fsType, options, mountPoint });
+      return true;
+    }
+
+    async unmount(mountPoint: string): Promise<void> {
+      ffmpegState.unmounts.push(mountPoint);
+    }
+
+    async deleteDir(): Promise<void> {}
+
+    async exec(args: string[]): Promise<number> {
+      ffmpegState.execArgs.push(args);
       ffmpegState.active += 1;
       ffmpegState.maxActive = Math.max(ffmpegState.maxActive, ffmpegState.active);
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -73,6 +98,36 @@ describe("ffmpeg job scheduling", () => {
     await Promise.all([runner.run(job), runner.run(job)]);
 
     expect(ffmpegState.maxActive).toBe(1);
+  });
+
+  it("mounts staged files instead of copying them into FFmpeg memory", async () => {
+    ffmpegState.writes.length = 0;
+    ffmpegState.mounts.length = 0;
+    ffmpegState.unmounts.length = 0;
+    ffmpegState.execArgs.length = 0;
+    const runner = new FfmpegRunner("https://extension.test/vendor/");
+    const file = new File([new Uint8Array(1200)], "input.m2ts");
+
+    await runner.run({
+      inputs: [{ name: "input.m2ts", file }],
+      args: ["-i", "input.m2ts", "-c", "copy", "output.mp4"],
+      outputName: "output.mp4",
+    });
+
+    expect(ffmpegState.writes).toHaveLength(0);
+    expect(ffmpegState.mounts).toEqual([{
+      fsType: "WORKERFS",
+      options: { blobs: [{ name: "input.m2ts", data: file }] },
+      mountPoint: "/media-downloader-input",
+    }]);
+    expect(ffmpegState.execArgs[0]).toEqual([
+      "-i",
+      "/media-downloader-input/input.m2ts",
+      "-c",
+      "copy",
+      "output.mp4",
+    ]);
+    expect(ffmpegState.unmounts).toEqual(["/media-downloader-input"]);
   });
 
   it("continues with the next job after a failure", async () => {

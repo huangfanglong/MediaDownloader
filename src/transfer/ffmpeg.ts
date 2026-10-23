@@ -7,14 +7,13 @@
  * vendored wrapper worker, and the extension-page CSP needs `'wasm-unsafe-eval'`.
  * Licensing: the bundled core is GPL-2.0-or-later (GPLv3-compatible; see docs/THIRD_PARTY.md).
  */
-import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { FFmpeg, FFFSType } from "@ffmpeg/ffmpeg";
 
 export type FfmpegContainer = "mp4" | "mkv" | "webm" | "mp3";
 
-export interface FfmpegInput {
-  name: string;
-  bytes: Uint8Array;
-}
+export type FfmpegInput =
+  | { name: string; bytes: Uint8Array; file?: never }
+  | { name: string; file: File; bytes?: never };
 
 export interface FfmpegJob {
   inputs: FfmpegInput[];
@@ -126,9 +125,29 @@ export class FfmpegRunner implements FfmpegRunnerLike {
 
   private async runExclusive(job: FfmpegJob): Promise<Uint8Array> {
     const ffmpeg = await this.ensureLoaded();
+    const fileInputs = job.inputs.filter(
+      (input): input is Extract<FfmpegInput, { file: File }> => input.file !== undefined,
+    );
+    const byteInputs = job.inputs.filter(
+      (input): input is Extract<FfmpegInput, { bytes: Uint8Array }> => input.bytes !== undefined,
+    );
+    const mountPoint = "/media-downloader-input";
+    let mountDirCreated = false;
+    let mounted = false;
     try {
-      for (const input of job.inputs) await ffmpeg.writeFile(input.name, input.bytes);
-      const exitCode = await ffmpeg.exec(job.args);
+      if (fileInputs.length > 0) {
+        await ffmpeg.createDir(mountPoint).catch(() => undefined);
+        mountDirCreated = true;
+        const mountedOk = await ffmpeg.mount(FFFSType.WORKERFS, {
+          blobs: fileInputs.map((input) => ({ name: input.name, data: input.file })),
+        }, mountPoint);
+        if (!mountedOk) throw new Error("ffmpeg WORKERFS is unavailable");
+        mounted = true;
+      }
+      for (const input of byteInputs) await ffmpeg.writeFile(input.name, input.bytes);
+      const mountedPaths = new Map(fileInputs.map((input) => [input.name, `${mountPoint}/${input.name}`]));
+      const args = job.args.map((arg) => mountedPaths.get(arg) ?? arg);
+      const exitCode = await ffmpeg.exec(args);
       if (exitCode !== 0) throw new Error(`ffmpeg exited with ${exitCode}`);
       const output = await ffmpeg.readFile(job.outputName);
       const bytes = output instanceof Uint8Array ? output : new TextEncoder().encode(String(output));
@@ -145,8 +164,10 @@ export class FfmpegRunner implements FfmpegRunnerLike {
       this.loading = undefined;
       throw error;
     } finally {
-      for (const input of job.inputs) await ffmpeg.deleteFile(input.name).catch(() => undefined);
+      for (const input of byteInputs) await ffmpeg.deleteFile(input.name).catch(() => undefined);
       await ffmpeg.deleteFile(job.outputName).catch(() => undefined);
+      if (mounted) await ffmpeg.unmount(mountPoint).catch(() => undefined);
+      if (mountDirCreated) await ffmpeg.deleteDir(mountPoint).catch(() => undefined);
     }
   }
 }

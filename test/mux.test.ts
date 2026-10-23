@@ -137,11 +137,11 @@ describe("worker direct two-source muxing", () => {
 
 /** Fake ffmpeg runner: records jobs and returns a large deterministic output. */
 function fakeFfmpeg() {
-  const jobs: Array<{ args: string[]; outputName: string; inputs: Array<{ name: string; bytes: Uint8Array }> }> = [];
+  const jobs: Array<{ args: string[]; outputName: string; inputs: Array<{ name: string; bytes?: Uint8Array; file?: File }> }> = [];
   return {
     jobs,
     runner: {
-      run: async (job: { args: string[]; outputName: string; inputs: Array<{ name: string; bytes: Uint8Array }> }) => {
+      run: async (job: { args: string[]; outputName: string; inputs: Array<{ name: string; bytes?: Uint8Array; file?: File }> }) => {
         jobs.push(job);
         return new Uint8Array(2048).fill(9);
       },
@@ -351,7 +351,8 @@ describe("HLS TS output formats", () => {
       expect(result.value.output_extension).toBe("mp4");
       expect(result.value.internal_bloburl).toBe("blob:final");
     }
-    expect(ffmpeg.jobs[0]?.inputs[0]?.bytes.byteLength).toBe(1200);
+    expect(ffmpeg.jobs[0]?.inputs[0]?.file?.size).toBe(1200);
+    expect(ffmpeg.jobs[0]?.inputs[0]?.bytes).toBeUndefined();
     expect(files.has("download_hls_remux.m2ts")).toBe(false);
     expect(files.has("download_hls_remux.mp4")).toBe(true);
     expect(revoke).toHaveBeenCalledWith("blob:temp");
