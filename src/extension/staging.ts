@@ -61,7 +61,7 @@ export class StagedFile {
     return this.pending;
   }
 
-  async finish(): Promise<{ filename: string; blobUrl: string }> {
+  async finish(): Promise<{ filename: string; blobUrl: string; file: File }> {
     await this.pending;
     this.closed = true;
     await this.handle.close();
@@ -72,7 +72,7 @@ export class StagedFile {
       type: blobMimeType(extension),
       lastModified: file.lastModified,
     });
-    return { filename: this.name, blobUrl: URL.createObjectURL(typedFile) };
+    return { filename: this.name, blobUrl: URL.createObjectURL(typedFile), file: typedFile };
   }
 
   async abort(): Promise<void> {

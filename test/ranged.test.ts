@@ -67,6 +67,21 @@ describe("bounded-range download helper (googlevideo evidence)", () => {
     expect(RANGE_CHUNK_BYTES).toBe(2 * 1024 * 1024);
   });
 
+  it("streams bounded chunks to a sink without combining them", async () => {
+    const payload = new Uint8Array(2 * 1024 * 1024 + 500).fill(9);
+    const chunks: Uint8Array[] = [];
+    const result = await fetchRanged(
+      rangeFetch(payload),
+      new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=18"),
+      new Headers(),
+      { chunkSize: 1024 * 1024, onChunk: (chunk) => { chunks.push(chunk); } },
+    );
+    expect(result.tag).toBe("Ok");
+    if (result.tag !== "Ok") return;
+    expect(result.value.bytes).toEqual(new Uint8Array());
+    expect(chunks.map((chunk) => chunk.byteLength)).toEqual([1024 * 1024, 1024 * 1024, 500]);
+  });
+
   it("stops on the short final chunk when the size is not declared", async () => {
     const size = 2 * 1024 * 1024 + 500;
     const payload = new Uint8Array(size).fill(9);
@@ -162,6 +177,7 @@ describe("worker ranged transfer (YouTube itag=18 path)", () => {
     }
     const staged = [...(files.get(`${plan.download_id}.mp4`) ?? [])];
     const total = staged.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    expect(staged.length).toBeGreaterThan(1);
     expect(total).toBe(size);
     const merged = new Uint8Array(total);
     let offset = 0;

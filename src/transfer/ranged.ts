@@ -28,6 +28,7 @@ export interface RangedFetchOptions {
   chunkSize?: number;
   signal?: AbortSignal;
   onBytes?: (fetched: number, total: number | undefined) => void;
+  onChunk?: (chunk: Uint8Array) => void | Promise<void>;
 }
 
 /** True for googlevideo-style media URLs that only answer bounded byte ranges. */
@@ -84,18 +85,20 @@ export async function fetchRanged(
     );
     if (result.tag === "Err") {
       // A 416 after at least one chunk means the caller's size was larger than the object.
-      if (result.error.kind === "http" && result.error.status === 416 && parts.length > 0) break;
+      if (result.error.kind === "http" && result.error.status === 416 && offset > 0) break;
       return result;
     }
     const bytes = result.value.bytes;
     if (bytes.byteLength === 0) break;
     // Defensive: if the server ignored the range and returned the whole object, keep it once.
-    if (bytes.byteLength > chunkSize && parts.length === 0) {
-      parts.push(bytes);
+    if (bytes.byteLength > chunkSize && offset === 0) {
+      if (options.onChunk !== undefined) await options.onChunk(bytes);
+      else parts.push(bytes);
       offset = bytes.byteLength;
       break;
     }
-    parts.push(bytes);
+    if (options.onChunk !== undefined) await options.onChunk(bytes);
+    else parts.push(bytes);
     offset += bytes.byteLength;
     options.onBytes?.(offset, fetchedTotal);
     if (fetchedTotal === undefined && bytes.byteLength < chunkSize) {
@@ -104,10 +107,12 @@ export async function fetchRanged(
     }
   }
 
-  if (parts.length === 0) {
+  if (offset === 0) {
     return err(otherError("range download returned no data"));
   }
   const totalBytes = Math.max(offset, ...parts.map((part) => part.byteLength));
-  const bytes = concatenateParts(parts, parts.reduce((sum, part) => sum + part.byteLength, 0));
+  const bytes = options.onChunk === undefined
+    ? concatenateParts(parts, parts.reduce((sum, part) => sum + part.byteLength, 0))
+    : new Uint8Array();
   return ok({ bytes, total_bytes: fetchedTotal ?? totalBytes });
 }

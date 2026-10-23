@@ -289,6 +289,8 @@ export interface FetchBytesOptions {
   maxBytes?: number;
   /** Cancels the fetch and the body read. Combined with `init.signal` when both are present. */
   signal?: AbortSignal;
+  /** Write chunks to a consumer instead of retaining and concatenating the complete body. */
+  onChunk?: (chunk: Uint8Array) => void | Promise<void>;
 }
 
 /** Combine two optional abort signals without relying on `AbortSignal.any` (Node/browser parity). */
@@ -390,17 +392,18 @@ export async function fetchBytes(
     if (read.done) break;
     const value = read.value;
     if (value !== undefined) {
-      chunks.push(value);
       total += value.length;
       if (options.maxBytes !== undefined && total > options.maxBytes) {
         await reader.cancel?.().catch(() => undefined);
         return err(otherError(`Response exceeds ${options.maxBytes} bytes`));
       }
+      if (options.onChunk !== undefined) await options.onChunk(value);
+      else chunks.push(value);
     }
   }
 
   return ok({
-    bytes: concatenateBytes(chunks, total),
+    bytes: options.onChunk === undefined ? concatenateBytes(chunks, total) : new Uint8Array(),
     status: response.status,
   });
 }

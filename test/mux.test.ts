@@ -345,6 +345,74 @@ describe("single-source FFmpeg conversion", () => {
   });
 });
 
+describe("HLS TS remux", () => {
+  it("remuxes a staged stream and removes the temporary file", async () => {
+    const manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n0.ts\n#EXTINF:4,\n1.ts\n#EXT-X-ENDLIST\n";
+    const payloads = new Map<string, Uint8Array>([
+      ["https://cdn.test/media.m3u8", encoder.encode(manifest)],
+      ["https://cdn.test/0.ts", new Uint8Array(600).fill(1)],
+      ["https://cdn.test/1.ts", new Uint8Array(600).fill(2)],
+    ]);
+    const fetchImpl = (async (url: string) => {
+      const payload = payloads.get(url);
+      if (payload === undefined) return { status: 404, ok: false, body: null };
+      let sent = false;
+      return {
+        status: 200,
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: async () => sent ? { done: true } : (sent = true, { done: false, value: payload }),
+          }),
+        },
+      };
+    }) as FetchLike;
+    const files = new Map<string, Uint8Array[]>();
+    const ffmpeg = fakeFfmpeg();
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      } as unknown as BroadcastChannelLike,
+      fetchImpl,
+      openRoot: async () => fakeRoot(files),
+      ffmpeg: ffmpeg.runner,
+    });
+    vi.spyOn(URL, "createObjectURL").mockReturnValueOnce("blob:temp").mockReturnValueOnce("blob:final");
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const plan = {
+      download_id: "download_hls_remux",
+      headers: new Headers(),
+      good_basename: "hls",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "m3u8_audio_video_one_source",
+      url: new URL("https://cdn.test/media.m3u8"),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      is_youtube: false,
+      throttle: false,
+      cache: "default",
+    } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    if (result.tag === "Ok") {
+      expect(result.value.output_extension).toBe("mp4");
+      expect(result.value.internal_bloburl).toBe("blob:final");
+    }
+    expect(ffmpeg.jobs[0]?.inputs[0]?.bytes.byteLength).toBe(1200);
+    expect(files.has("download_hls_remux.m2ts")).toBe(false);
+    expect(files.has("download_hls_remux.mp4")).toBe(true);
+    expect(revoke).toHaveBeenCalledWith("blob:temp");
+  });
+});
+
 describe("webm copy merge", () => {
   it("stream-copies VP9/Opus tracks into WebM without transcoding", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);

@@ -28,7 +28,6 @@ import {
   computePercent,
   concatenate,
   isTooManyFailedSegments,
-  totalBytes,
 } from "../transfer/assemble.js";
 import type { HlsInitSegment, HlsSegment as TransferSegment } from "../transfer/assemble.js";
 import type { HlsSegment as ParsedSegment } from "../manifests/hls.js";
@@ -302,6 +301,91 @@ export class DownloadWorker {
     return ok(fetched.value.bytes);
   }
 
+  /** Stage a direct download without retaining a second complete copy in memory. */
+  private async streamDirect(
+    root: OpfsRoot,
+    plan: DownloadPlan,
+    headers: Headers,
+    sourceExtension: string,
+    signal?: AbortSignal,
+  ): Promise<Result<TransferOutcome, string>> {
+    let extension = sourceExtension;
+    let staged: StagedFile | undefined;
+    let total = 0;
+    const onChunk = async (chunk: Uint8Array): Promise<void> => {
+      if (staged === undefined) {
+        extension = normalizeMediaOutputExtension(extension, chunk, true);
+        staged = await createStagedFile(root, `${plan.download_id}.${extension}`);
+      }
+      await staged.append(chunk);
+      total += chunk.byteLength;
+      this.emitProgress(plan.download_id, { status: "downloading", fetched_bytes_count: total });
+    };
+    try {
+      if (isRangeBoundCdn(plan.url)) {
+        const ranged = await fetchRanged(this.deps.fetchImpl, plan.url, headers, {
+          signal,
+          onChunk,
+          onBytes: (fetched) => {
+            this.emitProgress(plan.download_id, {
+              status: "downloading",
+              fetched_bytes_count: fetched,
+            });
+          },
+        });
+        if (ranged.tag === "Err") {
+          if (staged !== undefined) await staged.abort().catch(() => undefined);
+          const status = ranged.error.status !== undefined ? ` ${ranged.error.status}` : "";
+          return err(`ranged ${ranged.error.kind}${status}: ${ranged.error.message ?? "download failed"}`);
+        }
+      } else {
+        const directUrl = plan.url.href;
+        let fetched = await fetchBytes(this.deps.fetchImpl, directUrl, { headers }, { signal, onChunk });
+        if (
+          fetched.tag === "Err" &&
+          total === 0 &&
+          fetched.error.kind === "http" &&
+          [400, 401, 403, 416].includes(fetched.error.status ?? 0)
+        ) {
+          console.info("[media-downloader] retrying direct request with Range: bytes=0-", directUrl);
+          fetched = await fetchBytes(
+            this.deps.fetchImpl,
+            directUrl,
+            { headers, range: "bytes=0-" },
+            { signal, onChunk },
+          );
+        }
+        if (fetched.tag === "Err") {
+          if (staged !== undefined) await staged.abort().catch(() => undefined);
+          const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
+          return err(`${fetched.error.kind}${status}: ${fetched.error.message ?? "download failed"} (${directUrl})`);
+        }
+      }
+      if (total < MIN_OUTPUT_BYTES || staged === undefined) {
+        if (staged !== undefined) await staged.abort().catch(() => undefined);
+        return err(`direct response too small (${total} bytes)`);
+      }
+      const finished = await staged.finish();
+      this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: total });
+      console.info("[media-downloader] direct transfer ok", total, "bytes", plan.url.href);
+      return ok({
+        download_id: plan.download_id,
+        internal_filename: finished.filename,
+        internal_bloburl: finished.blobUrl,
+        output_extension: extension,
+        ending_reason: {
+          user_abort: false,
+          e4XX_5XX_failure: false,
+          percentage_incomplete: false,
+          other_failure: false,
+        },
+      } as TransferOutcome);
+    } catch (error) {
+      if (staged !== undefined) await staged.abort().catch(() => undefined);
+      return err(String(error));
+    }
+  }
+
   /** Execute one plan into a staged file and a blob URL. */
   async runPlan(plan: DownloadPlan, signal?: AbortSignal): Promise<Result<TransferOutcome, string>> {
     const root = await this.deps.openRoot();
@@ -440,21 +524,49 @@ export class DownloadWorker {
       duration = videoAssembled.value.duration ?? duration;
       }
     } else if (isHlsStrategy(plan.strategy)) {
-      const assembled = await this.assembleHls(plan, headers, signal);
+      const stream = plan.output_format === undefined
+        ? { root, downloadId: plan.download_id }
+        : undefined;
+      const assembled = await this.assembleHls(plan, headers, signal, stream);
       if (assembled.tag === "Err") return assembled;
-      bytes = assembled.value.bytes;
       duration = assembled.value.duration ?? duration;
       extension = assembled.value.extension;
-      // Raw TS is playable, but Chrome/Windows may rename .ts/.m2ts to .txt. Remux it to
-      // MP4 with stream copy when it fits the WASM input budget; otherwise keep m2ts.
-      if (extension === "m2ts" && this.deps.ffmpeg !== undefined && bytes.byteLength <= MAX_FFMPEG_INPUT_BYTES) {
+      const staged = assembled.value.staged;
+      const finished = staged !== undefined ? await staged.finish() : undefined;
+      const shouldRemux = extension === "m2ts" &&
+        this.deps.ffmpeg !== undefined &&
+        assembled.value.totalBytes <= MAX_FFMPEG_INPUT_BYTES;
+      if (finished !== undefined && !shouldRemux) {
+        this.emitProgress(plan.download_id, {
+          status: "finalizing",
+          fetched_bytes_count: assembled.value.totalBytes,
+        });
+        return ok({
+          download_id: plan.download_id,
+          internal_filename: finished.filename,
+          internal_bloburl: finished.blobUrl,
+          output_extension: extension,
+          ending_reason: {
+            user_abort: false,
+            e4XX_5XX_failure: false,
+            percentage_incomplete: false,
+            other_failure: false,
+          },
+        } as TransferOutcome);
+      }
+
+      bytes = finished !== undefined
+        ? new Uint8Array(await finished.file.arrayBuffer())
+        : assembled.value.bytes;
+      // Remux raw TS when it fits the bounded WASM input budget. Larger streams stay in OPFS.
+      if (shouldRemux) {
         try {
-          const remuxed = await this.deps.ffmpeg.run({
+          const remuxed = await this.deps.ffmpeg?.run({
             inputs: [{ name: "input.m2ts", bytes }],
             args: ["-hide_banner", "-y", "-i", "input.m2ts", "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
             outputName: "output.mp4",
           });
-          if (remuxed.byteLength >= MIN_OUTPUT_BYTES) {
+          if (remuxed !== undefined && remuxed.byteLength >= MIN_OUTPUT_BYTES) {
             bytes = remuxed;
             extension = "mp4";
             console.info("[media-downloader] remuxed HLS TS to mp4", bytes.byteLength, "bytes");
@@ -463,6 +575,26 @@ export class DownloadWorker {
           console.warn("[media-downloader] HLS TS to mp4 remux failed; keeping m2ts", String(error));
         }
       }
+      if (finished !== undefined) {
+        if (extension === "m2ts") {
+          return ok({
+            download_id: plan.download_id,
+            internal_filename: finished.filename,
+            internal_bloburl: finished.blobUrl,
+            output_extension: extension,
+            ending_reason: {
+              user_abort: false,
+              e4XX_5XX_failure: false,
+              percentage_incomplete: false,
+              other_failure: false,
+            },
+          } as TransferOutcome);
+        }
+        URL.revokeObjectURL(finished.blobUrl);
+        await removeStagedFile(root, finished.filename).catch(() => undefined);
+      }
+    } else if (plan.output_format === undefined) {
+      return this.streamDirect(root, plan, headers, extension, signal);
     } else if (isRangeBoundCdn(plan.url)) {
       // googlevideo rejects plain GETs and open-ended ranges; the player itself uses bounded
       // byte ranges, so download the file as sequential 2 MiB chunks (live probe evidence).
@@ -600,7 +732,14 @@ export class DownloadWorker {
     plan: DownloadPlan,
     headers: Headers,
     signal?: AbortSignal,
-  ): Promise<Result<{ bytes: Uint8Array; extension: string; duration?: number }, string>> {
+    stream?: { root: OpfsRoot; downloadId: string },
+  ): Promise<Result<{
+    bytes: Uint8Array;
+    extension: string;
+    duration?: number;
+    staged?: StagedFile;
+    totalBytes: number;
+  }, string>> {
     const playlistResult = await this.fetchPlaylistText(plan.url.href, headers, signal);
     if (playlistResult.tag === "Err") return playlistResult;
     let parsed = parsePlaylist(playlistResult.value, plan.url);
@@ -639,10 +778,32 @@ export class DownloadWorker {
       mediaSequence: parsed.mediaSequence,
     });
 
+    // fMP4 HLS keeps the planned container. Raw MPEG-TS uses m2ts because .ts is also a
+    // TypeScript/Qt source extension and browsers may treat it as text.
+    const extension = initSegment ? plan.extension || "mp4" : "m2ts";
+    const staged = stream === undefined
+      ? undefined
+      : await createStagedFile(stream.root, `${stream.downloadId}.${extension}`);
     const concurrency = plan.throttle ? THROTTLED_SEGMENT_CONCURRENCY : SEGMENT_CONCURRENCY;
-    const chunks: Uint8Array[] = new Array(descriptors.length);
+    const chunks: Array<Uint8Array | null | undefined> = new Array(descriptors.length);
     let fetchedBytes = 0;
     let failed = 0;
+    let nextWrite = 0;
+    let writeChain: Promise<void> = Promise.resolve();
+    const flushReady = async (): Promise<void> => {
+      const ready: Uint8Array[] = [];
+      while (nextWrite < chunks.length && chunks[nextWrite] !== undefined) {
+        const chunk = chunks[nextWrite];
+        chunks[nextWrite] = undefined;
+        nextWrite += 1;
+        if (chunk) ready.push(chunk);
+      }
+      for (const chunk of ready) await staged?.append(chunk);
+    };
+    const queueFlush = (): Promise<void> => {
+      writeChain = writeChain.then(flushReady);
+      return writeChain;
+    };
 
     const worker = async (): Promise<void> => {
       for (;;) {
@@ -651,7 +812,6 @@ export class DownloadWorker {
         const descriptor = descriptors[index];
         if (!descriptor) return;
         if (descriptor.aes128) {
-          // Defensive: segment-level encryption is refused before the transfer starts above.
           throw new Error("Encrypted HLS is not supported by this rebuild");
         }
         const response = await fetchBytes(
@@ -663,14 +823,17 @@ export class DownloadWorker {
         if (response.tag === "Err") {
           failed += 1;
           if (index === 0) throw new Error("Required segment was invalid, aborting download.");
+          chunks[index] = null;
+          if (staged !== undefined) await queueFlush();
           continue;
         }
         chunks[index] = response.value.bytes;
         fetchedBytes += response.value.bytes.byteLength;
+        if (staged !== undefined) await queueFlush();
         this.emitProgress(plan.download_id, {
           status: "downloading",
           fetched_bytes_count: fetchedBytes,
-          ...(parsed.kind === "media" && typeof parsed.duration === "number"
+          ...(typeof parsed.duration === "number"
             ? {
                 percent: {
                   is_known: true,
@@ -687,25 +850,23 @@ export class DownloadWorker {
 
     try {
       await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
+      await writeChain;
     } catch (error) {
+      if (staged !== undefined) await staged.abort().catch(() => undefined);
       return err(String(error));
     }
 
-    if (isTooManyFailedSegments(failed, descriptors.length)) {
-      return err("Too many invalid segments, aborting download.");
-    }
-    if (totalBytes(chunks.filter((chunk): chunk is Uint8Array => chunk !== undefined)) < 1_000) {
-      return err("Downloaded content is too small");
+    if (isTooManyFailedSegments(failed, descriptors.length) || fetchedBytes < 1_000) {
+      if (staged !== undefined) await staged.abort().catch(() => undefined);
+      return err(fetchedBytes < 1_000 ? "Downloaded content is too small" : "Too many invalid segments, aborting download.");
     }
 
-    const body = concatenate(chunks.filter((chunk): chunk is Uint8Array => chunk !== undefined));
-    // fMP4 HLS (init segment present) keeps the planned container; raw MPEG-TS segments are
-    // saved as .m2ts (a transport-stream extension Windows/Chrome treat as video, unlike .ts
-    // which is also a TypeScript/Qt source extension and was being renamed to .txt).
-    const extension = initSegment ? plan.extension || "mp4" : "m2ts";
+    const available = chunks.filter((chunk): chunk is Uint8Array => chunk instanceof Uint8Array);
     return ok({
-      bytes: body,
+      bytes: staged === undefined ? concatenate(available) : new Uint8Array(),
       extension,
+      totalBytes: fetchedBytes,
+      ...(staged !== undefined ? { staged } : {}),
       ...(typeof parsed.duration === "number" ? { duration: parsed.duration } : {}),
     });
   }

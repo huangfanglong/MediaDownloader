@@ -407,6 +407,18 @@ describe("fetchBytes (E12)", () => {
     expect(result).toEqual(ok({ bytes: bytes(1, 2, 3), status: 200 }));
   });
 
+  it("passes chunks to a sink without concatenating them", async () => {
+    const chunks: Uint8Array[] = [];
+    const result = await fetchBytes(
+      fakeFetch(chunkedBody([bytes(1, 2), bytes(3)])),
+      "https://x/",
+      {},
+      { onChunk: (chunk) => { chunks.push(chunk); } },
+    );
+    expect(result).toEqual(ok({ bytes: new Uint8Array(), status: 200 }));
+    expect(chunks).toEqual([bytes(1, 2), bytes(3)]);
+  });
+
   it("maps 4xx/5xx to an http error with its status", async () => {
     for (const status of [403, 404, 416, 500]) {
       const result = await fetchBytes(

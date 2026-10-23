@@ -484,6 +484,7 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     const stagedName = "download_test.mp4";
     const staged = harness.opfs.removed.get(stagedName);
     expect(staged).toBeDefined();
+    expect(staged).toHaveLength(4);
     const assembled = new TextDecoder().decode(
       new Uint8Array((staged ?? []).flatMap((chunk) => [...chunk])),
     );
