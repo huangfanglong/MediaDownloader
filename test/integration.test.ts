@@ -13,8 +13,8 @@ import { encode } from "../src/protocol/serde.js";
 import { decode } from "../src/protocol/serde.js";
 import type { BroadcastChannelLike, BrowserGateway, DownloadRequest, Envelope } from "../src/extension/gateways.js";
 import type { FetchLike, FetchResponseLike } from "../src/transfer/fetch.js";
-import type { OpfsDirectory, OpfsRoot } from "../src/extension/staging.js";
 import type { DownloadPlan, MediaItem, TabMeta } from "../src/core/types.js";
+import { createFakeOpfs, createFetch } from "./helpers/transfer-fakes.js";
 
 // ---------------------------------------------------------------------------
 // Fake browser surfaces
@@ -246,72 +246,6 @@ function createFakeGateway(tabUrl: string, fetchMap: Map<string, Uint8Array | st
 
 function fetchMapFor(entries: Record<string, string | Uint8Array>): Map<string, string | Uint8Array> {
   return new Map(Object.entries(entries));
-}
-
-const bytes = (text: string): Uint8Array => new TextEncoder().encode(text);
-
-function createFetch(entries: Map<string, string | Uint8Array>): FetchLike {
-  return async (url): Promise<FetchResponseLike> => {
-    const found = entries.get(url);
-    if (found === undefined) return { status: 404, ok: false, body: null };
-    const data = typeof found === "string" ? bytes(found) : found;
-    let sent = false;
-    return {
-      status: 200,
-      ok: true,
-      body: {
-        getReader: () => ({
-          read: async () => {
-            if (sent) return { done: true };
-            sent = true;
-            return { done: false, value: data };
-          },
-        }),
-      },
-    };
-  };
-}
-
-/** In-memory OPFS with sync access handles. `removed` snapshots files deleted after saving. */
-function createFakeOpfs(): {
-  root: OpfsRoot;
-  files: Map<string, Uint8Array[]>;
-  removed: Map<string, Uint8Array[]>;
-} {
-  const files = new Map<string, Uint8Array[]>();
-  const removed = new Map<string, Uint8Array[]>();
-  const directory: OpfsDirectory = {
-    getFileHandleWithSyncAccess: async (name) => ({
-      handle: {
-        write: async (data) => {
-          const chunks = files.get(name) ?? [];
-          chunks.push(new Uint8Array(data));
-          files.set(name, chunks);
-          return { written: data.byteLength };
-        },
-        close: async () => undefined,
-        truncate: async () => undefined,
-      },
-    }),
-    getFileHandle: async (name) => ({
-      name,
-      getFile: async () =>
-        new Blob((files.get(name) ?? []).map((chunk) => new Blob([chunk as unknown as BlobPart]))) as File,
-    }),
-    removeEntry: async (name) => {
-      const chunks = files.get(name);
-      if (chunks) removed.set(name, chunks.map((chunk) => new Uint8Array(chunk)));
-      files.delete(name);
-    },
-    keys: async function* () {
-      yield* files.keys();
-    },
-  };
-  return {
-    root: { getDirectoryHandle: async () => directory },
-    files,
-    removed,
-  };
 }
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));

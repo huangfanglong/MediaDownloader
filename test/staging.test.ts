@@ -1,31 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createStagedFile, type OpfsDirectory, type OpfsRoot } from "../src/extension/staging.js";
+import { createStagedFile } from "../src/extension/staging.js";
+import { createFakeOpfs } from "./helpers/transfer-fakes.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
-
-function fakeOpfs(): OpfsRoot {
-  const chunks: Uint8Array[] = [];
-  const directory: OpfsDirectory = {
-    getFileHandleWithSyncAccess: async () => ({
-      handle: {
-        write: async (data) => {
-          chunks.push(new Uint8Array(data));
-          return { written: data.byteLength };
-        },
-        close: async () => undefined,
-        truncate: async () => undefined,
-      },
-    }),
-    getFileHandle: async (name) => ({
-      name,
-      getFile: async () => new File(chunks as BlobPart[], name),
-    }),
-    removeEntry: async () => undefined,
-  };
-  return { getDirectoryHandle: async () => directory };
-}
 
 describe("staged download blob", () => {
   it.each([
@@ -39,7 +18,7 @@ describe("staged download blob", () => {
       return "blob:fake-download";
     });
 
-    const staged = await createStagedFile(fakeOpfs(), name);
+    const staged = await createStagedFile(createFakeOpfs().root, name);
     await staged.append(new Uint8Array([0, 1, 2]));
     await staged.finish();
 

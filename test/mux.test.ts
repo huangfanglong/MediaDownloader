@@ -1,10 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { muxFragmentedMp4, readBoxes } from "../src/transfer/mux-fmp4.js";
-import type { FetchLike } from "../src/transfer/fetch.js";
 import { DownloadWorker } from "../src/extension/download-worker.js";
 import type { DownloadPlan } from "../src/core/types.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
-import type { OpfsDirectory, OpfsRoot } from "../src/extension/staging.js";
+import { createFakeOpfs, createFetch, createRangedFetch } from "./helpers/transfer-fakes.js";
 
 const encoder = new TextEncoder();
 
@@ -86,62 +85,6 @@ describe("fMP4 audio+video muxer", () => {
   });
 });
 
-/** Serve a synthetic fMP4 file as bounded ranges (googlevideo behaviour). */
-function rangedFetchFor(payloads: Map<string, Uint8Array>): FetchLike {
-  return (async (url: string, init?: { headers?: HeadersInit }) => {
-    const range = new Headers(init?.headers).get("range");
-    const payload = payloads.get(url);
-    if (!payload) return { status: 404, ok: false, body: null };
-    if (!range) return { status: 403, ok: false, body: null };
-    const match = /^bytes=(\d+)-(\d+)$/u.exec(range);
-    if (!match) return { status: 403, ok: false, body: null };
-    const start = Number(match[1]);
-    const end = Math.min(Number(match[2]), payload.length - 1);
-    if (start >= payload.length) return { status: 416, ok: false, body: null };
-    const slice = payload.slice(start, end + 1);
-    let sent = false;
-    return {
-      status: 206,
-      ok: true,
-      body: {
-        getReader: () => ({
-          read: async () => {
-            if (sent) return { done: true };
-            sent = true;
-            return { done: false, value: slice };
-          },
-          cancel: async () => undefined,
-        }),
-      },
-    };
-  }) as unknown as FetchLike;
-}
-
-const fakeRoot = (files: Map<string, Uint8Array[]>): OpfsRoot => {
-  const directory: OpfsDirectory = {
-    getFileHandleWithSyncAccess: async (name) => ({
-      handle: {
-        write: async (data) => {
-          const chunks = files.get(name) ?? [];
-          chunks.push(new Uint8Array(data));
-          files.set(name, chunks);
-          return { written: data.byteLength };
-        },
-        close: async () => undefined,
-        truncate: async () => undefined,
-      },
-    }),
-    getFileHandle: async (name) => ({
-      name,
-      getFile: async () => new Blob((files.get(name) ?? []).map((chunk) => new Blob([chunk]))) as File,
-    }),
-    removeEntry: async (name) => {
-      files.delete(name);
-    },
-  };
-  return { getDirectoryHandle: async () => directory };
-};
-
 describe("worker direct two-source muxing", () => {
   it("downloads the adaptive video and audio tracks and stages one muxed file", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);
@@ -152,7 +95,7 @@ describe("worker direct two-source muxing", () => {
       [videoUrl, video],
       [audioUrl, audio],
     ]);
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const workerChannel: BroadcastChannelLike = {
       postMessage: () => undefined,
       addEventListener: () => undefined,
@@ -162,8 +105,8 @@ describe("worker direct two-source muxing", () => {
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:muxed");
     const worker = new DownloadWorker({
       channel: workerChannel,
-      fetchImpl: rangedFetchFor(payloads),
-      openRoot: async () => fakeRoot(files),
+      fetchImpl: createRangedFetch(payloads),
+      openRoot: async () => root,
     });
     const plan: DownloadPlan = {
       download_id: "download_two_source",
@@ -216,7 +159,7 @@ describe("worker ffmpeg outputs", () => {
       [videoUrl, video],
       [audioUrl, audio],
     ]);
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const ffmpeg = fakeFfmpeg();
     const worker = new DownloadWorker({
       channel: {
@@ -225,8 +168,8 @@ describe("worker ffmpeg outputs", () => {
         removeEventListener: () => undefined,
         close: () => undefined,
       } as unknown as BroadcastChannelLike,
-      fetchImpl: rangedFetchFor(payloads),
-      openRoot: async () => fakeRoot(files),
+      fetchImpl: createRangedFetch(payloads),
+      openRoot: async () => root,
       ffmpeg: ffmpeg.runner,
     });
     const plan: DownloadPlan = {
@@ -262,7 +205,7 @@ describe("worker ffmpeg outputs", () => {
     const videoUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=137&clen=999`;
     const audioUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=140&clen=${audio.byteLength}`;
     const payloads = new Map<string, Uint8Array>([[audioUrl, audio]]);
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const ffmpeg = fakeFfmpeg();
     const worker = new DownloadWorker({
       channel: {
@@ -271,8 +214,8 @@ describe("worker ffmpeg outputs", () => {
         removeEventListener: () => undefined,
         close: () => undefined,
       } as unknown as BroadcastChannelLike,
-      fetchImpl: rangedFetchFor(payloads),
-      openRoot: async () => fakeRoot(files),
+      fetchImpl: createRangedFetch(payloads),
+      openRoot: async () => root,
       ffmpeg: ffmpeg.runner,
     });
     const plan: DownloadPlan = {
@@ -304,7 +247,7 @@ describe("worker ffmpeg outputs", () => {
 describe("single-source FFmpeg conversion", () => {
   it("converts a fetched MP4 to MP3 when the requested format differs from the source", async () => {
     const source = new Uint8Array(4096).fill(7);
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const ffmpeg = fakeFfmpeg();
     const worker = new DownloadWorker({
       channel: {
@@ -314,7 +257,7 @@ describe("single-source FFmpeg conversion", () => {
         close: () => undefined,
       } as unknown as BroadcastChannelLike,
       fetchImpl: (async () => new Response(source)) as never,
-      openRoot: async () => fakeRoot(files),
+      openRoot: async () => root,
       ffmpeg: ffmpeg.runner,
     });
     const plan: DownloadPlan = {
@@ -353,21 +296,8 @@ describe("HLS TS remux", () => {
       ["https://cdn.test/0.ts", new Uint8Array(600).fill(1)],
       ["https://cdn.test/1.ts", new Uint8Array(600).fill(2)],
     ]);
-    const fetchImpl = (async (url: string) => {
-      const payload = payloads.get(url);
-      if (payload === undefined) return { status: 404, ok: false, body: null };
-      let sent = false;
-      return {
-        status: 200,
-        ok: true,
-        body: {
-          getReader: () => ({
-            read: async () => sent ? { done: true } : (sent = true, { done: false, value: payload }),
-          }),
-        },
-      };
-    }) as FetchLike;
-    const files = new Map<string, Uint8Array[]>();
+    const fetchImpl = createFetch(payloads);
+    const { root, files } = createFakeOpfs();
     const ffmpeg = fakeFfmpeg();
     const worker = new DownloadWorker({
       channel: {
@@ -377,7 +307,7 @@ describe("HLS TS remux", () => {
         close: () => undefined,
       } as unknown as BroadcastChannelLike,
       fetchImpl,
-      openRoot: async () => fakeRoot(files),
+      openRoot: async () => root,
       ffmpeg: ffmpeg.runner,
     });
     vi.spyOn(URL, "createObjectURL").mockReturnValueOnce("blob:temp").mockReturnValueOnce("blob:final");
@@ -420,7 +350,7 @@ describe("webm copy merge", () => {
     const videoUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=248&clen=${video.byteLength}`;
     const audioUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=251&clen=${audio.byteLength}`;
     const payloads = new Map<string, Uint8Array>([[videoUrl, video], [audioUrl, audio]]);
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const ffmpeg = fakeFfmpeg();
     const worker = new DownloadWorker({
       channel: {
@@ -429,8 +359,8 @@ describe("webm copy merge", () => {
         removeEventListener: () => undefined,
         close: () => undefined,
       } as unknown as BroadcastChannelLike,
-      fetchImpl: rangedFetchFor(payloads),
-      openRoot: async () => fakeRoot(files),
+      fetchImpl: createRangedFetch(payloads),
+      openRoot: async () => root,
       ffmpeg: ffmpeg.runner,
     });
     const plan: DownloadPlan = {

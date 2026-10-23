@@ -6,7 +6,7 @@ import { setFlag, type Behaviours } from "../src/settings/flags.js";
 import type { DownloadPlan } from "../src/core/types.js";
 import type { FetchLike } from "../src/transfer/fetch.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
-import type { OpfsDirectory, OpfsRoot } from "../src/extension/staging.js";
+import { createFakeOpfs } from "./helpers/transfer-fakes.js";
 
 const WIDEVINE_URN = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed";
 const MEDIA = [
@@ -64,17 +64,6 @@ const noopChannel = (): BroadcastChannelLike => ({
   close: () => undefined,
 });
 
-const fakeRoot = (): OpfsRoot => {
-  const directory: OpfsDirectory = {
-    getFileHandleWithSyncAccess: async () => ({
-      handle: { write: async (data) => ({ written: data.byteLength }), close: async () => undefined, truncate: async () => undefined },
-    }),
-    getFileHandle: async (name) => ({ name, getFile: async () => new Blob([]) as File }),
-    removeEntry: async () => undefined,
-  };
-  return { getDirectoryHandle: async () => directory };
-};
-
 const planFor = (strategy: DownloadPlan["strategy"]): DownloadPlan => ({
   download_id: "download_enc",
   headers: new Headers(),
@@ -112,7 +101,7 @@ const workerWith = (playlistText: string): DownloadWorker =>
         },
       };
     }) as FetchLike,
-    openRoot: async () => fakeRoot(),
+    openRoot: async () => createFakeOpfs().root,
   });
 
 describe("worker refuses encrypted HLS instead of saving ciphertext", () => {
@@ -197,7 +186,7 @@ describe("direct CDN transfers (live YouTube regression)", () => {
                 },
         };
       }) as never,
-      openRoot: async () => fakeRoot(),
+      openRoot: async () => createFakeOpfs().root,
     });
   };
 
@@ -239,7 +228,7 @@ describe("minimum output size for direct transfers (live 31-byte regression)", (
           },
         };
       }) as never,
-      openRoot: async () => fakeRoot(),
+      openRoot: async () => createFakeOpfs().root,
     });
     const directPlan: DownloadPlan = { ...planFor("http_audio_video_one_source"), url: new URL("https://cdn.test/a.mp4") };
     const result = await worker.runPlan(directPlan);

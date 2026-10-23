@@ -6,7 +6,7 @@ import { Channel } from "../src/protocol/channels.js";
 import { encode } from "../src/protocol/serde.js";
 import type { DownloadPlan } from "../src/core/types.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
-import type { OpfsDirectory, OpfsRoot } from "../src/extension/staging.js";
+import { createFakeOpfs } from "./helpers/transfer-fakes.js";
 
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -66,31 +66,6 @@ describe("page-context relay (content script)", () => {
   });
 });
 
-const fakeRoot = (files: Map<string, Uint8Array[]>): OpfsRoot => {
-  const directory: OpfsDirectory = {
-    getFileHandleWithSyncAccess: async (name) => ({
-      handle: {
-        write: async (data) => {
-          const chunks = files.get(name) ?? [];
-          chunks.push(new Uint8Array(data));
-          files.set(name, chunks);
-          return { written: data.byteLength };
-        },
-        close: async () => undefined,
-        truncate: async () => undefined,
-      },
-    }),
-    getFileHandle: async (name) => ({
-      name,
-      getFile: async () => new Blob((files.get(name) ?? []).map((chunk) => new Blob([chunk]))) as File,
-    }),
-    removeEntry: async (name) => {
-      files.delete(name);
-    },
-  };
-  return { getDirectoryHandle: async () => directory };
-};
-
 const plan: DownloadPlan = {
   download_id: "download_relay",
   headers: new Headers(),
@@ -110,7 +85,7 @@ const plan: DownloadPlan = {
 
 describe("page-context relay (worker staging)", () => {
   it("assembles relayed chunks into a staged file and reports the result", async () => {
-    const files = new Map<string, Uint8Array[]>();
+    const { root, files } = createFakeOpfs();
     const posted: Array<{ msg: { name: string; data: unknown }; channel: number }> = [];
     const listeners: Array<(event: { data: unknown }) => void> = [];
     const workerChannel: BroadcastChannelLike = {
@@ -123,7 +98,7 @@ describe("page-context relay (worker staging)", () => {
     const worker = new DownloadWorker({
       channel: workerChannel,
       fetchImpl: (async () => ({ status: 500, ok: false, body: null })) as never,
-      openRoot: async () => fakeRoot(files),
+      openRoot: async () => root,
     });
     worker.start();
     const send = (name: string, data: unknown): void => {
