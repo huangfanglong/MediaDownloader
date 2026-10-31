@@ -46,7 +46,9 @@ describe("Media Downloader branding", () => {
     const hashes = JSON.parse(
       readFileSync(path.join(process.cwd(), "tools/ffmpeg-vendor-hashes.json"), "utf8"),
     ) as Record<string, string>;
-    expect(Object.keys(hashes)).toHaveLength(9);
+    // The FFmpeg worker is our own code now (src/ffmpeg/worker.ts), so the manifest pins only
+    // the upstream wrapper modules and the wasm core it loads.
+    expect(Object.keys(hashes)).toHaveLength(8);
     expect(hashes["core/ffmpeg-core.wasm"]).toMatch(/^[a-f0-9]{64}$/u);
   });
 

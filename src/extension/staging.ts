@@ -75,6 +75,7 @@ export class StagedFile {
     return { filename: this.name, blobUrl: URL.createObjectURL(typedFile), file: typedFile };
   }
 
+  /** Wrap an existing OPFS staging entry (e.g. written by FFmpeg) as a saved file. */
   async abort(): Promise<void> {
     this.closed = true;
     try {
@@ -102,6 +103,19 @@ export async function createStagedFile(root: OpfsRoot, name: string): Promise<St
     truncate: async () => undefined,
   };
   return new StagedFile(directory, name, handle);
+}
+
+/** Wrap an existing OPFS staging entry (for example one FFmpeg wrote directly) as a file. */
+export async function openStagedFile(
+  root: OpfsRoot,
+  name: string,
+): Promise<{ filename: string; blobUrl: string; file: File }> {
+  const directory = await root.getDirectoryHandle(STAGING_DIRECTORY, { create: true });
+  const entry = await directory.getFileHandle(name);
+  const file = await entry.getFile();
+  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+  const typedFile = new File([file], name, { type: blobMimeType(extension), lastModified: file.lastModified });
+  return { filename: name, blobUrl: URL.createObjectURL(typedFile), file: typedFile };
 }
 
 /** Remove one staged entry, ignoring "not found" (post-save cleanup is best effort). */

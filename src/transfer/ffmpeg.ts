@@ -19,11 +19,40 @@ export interface FfmpegJob {
   inputs: FfmpegInput[];
   args: string[];
   outputName: string;
+  /** Estimated size of the produced file, when the caller knows it (copy/remux jobs). */
+  expectedOutputBytes?: number;
+}
+
+/** Minimal OPFS staging root the runner uses to verify a streamed output exists. */
+export interface OpfsStagingRoot {
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<{
+    getFileHandle(name: string): Promise<{ getFile(): Promise<File> }>;
+  }>;
+}
+
+/** Destination for an FFmpeg output that the worker writes straight into OPFS. */
+export interface FfmpegStagingTarget {
+  root: OpfsStagingRoot;
+  directory: string;
+  filename: string;
+}
+
+/** Marker the worker recognises in the output argument to switch to OPFS output. */
+export const FFMPEG_OUTPUT_MARKER = "/media-downloader-out/";
+
+/** Thrown when the worker could not put the output into OPFS; the caller falls back to memory. */
+export class FfmpegStagingUnavailableError extends Error {
+  constructor() {
+    super("ffmpeg output staging is unavailable");
+    this.name = "FfmpegStagingUnavailableError";
+  }
 }
 
 /** Injectable seam so the download worker can be unit-tested without WASM. */
 export interface FfmpegRunnerLike {
   run(job: FfmpegJob): Promise<Uint8Array>;
+  /** Optional streaming output: the worker writes directly into OPFS staging. */
+  runToStaging?(job: FfmpegJob, target: FfmpegStagingTarget): Promise<void>;
 }
 
 /**
@@ -49,6 +78,25 @@ export class FfmpegInputTooLargeError extends Error {
   ) {
     super("The downloaded media is too large to process in the browser; choose Auto or a lower quality");
     this.name = "FfmpegInputTooLargeError";
+  }
+}
+
+/**
+ * Default ceiling for a whole output pulled back into the caller's memory.
+ *
+ * Without a streamed output the file exists twice (MEMFS copy + read-back copy) before it is
+ * staged, so a 1 GiB output peaks around 2 GiB. Staged/streamed outputs are budgeted separately.
+ */
+export const MAX_FFMPEG_OUTPUT_BYTES = 1024 * 1024 * 1024;
+
+/** Thrown before FFmpeg runs when the produced file would not fit the memory budget. */
+export class FfmpegOutputTooLargeError extends Error {
+  constructor(
+    readonly expectedBytes: number,
+    readonly limitBytes: number,
+  ) {
+    super("The produced file would be too large to keep in the browser; choose Auto or a lower quality");
+    this.name = "FfmpegOutputTooLargeError";
   }
 }
 
@@ -121,6 +169,7 @@ export class FfmpegRunner implements FfmpegRunnerLike {
     private readonly vendorBase: string = defaultVendorBase(),
     private readonly onLog?: (line: string) => void,
     private readonly maxByteInputBytes: number = MAX_FFMPEG_BYTE_INPUT_BYTES,
+    private readonly maxMemoryOutputBytes: number = MAX_FFMPEG_OUTPUT_BYTES,
   ) {}
 
   private async ensureLoaded(): Promise<FFmpeg> {
@@ -150,6 +199,54 @@ export class FfmpegRunner implements FfmpegRunnerLike {
     return result;
   }
 
+  /** Run an FFmpeg job whose output is written straight into an OPFS staging file. */
+  async runToStaging(job: FfmpegJob, target: FfmpegStagingTarget): Promise<void> {
+    const byteLength = job.inputs.reduce((total, input) => total + (input.bytes?.byteLength ?? 0), 0);
+    if (byteLength > this.maxByteInputBytes) throw new FfmpegInputTooLargeError(byteLength, this.maxByteInputBytes);
+    const ffmpeg = await this.ensureLoaded();
+    const fileInputs = job.inputs.filter(
+      (input): input is Extract<FfmpegInput, { file: File }> => input.file !== undefined,
+    );
+    const byteInputs = job.inputs.filter(
+      (input): input is Extract<FfmpegInput, { bytes: Uint8Array }> => input.bytes !== undefined,
+    );
+    const mountPoint = "/media-downloader-input";
+    let mounted = false;
+    let mountDirCreated = false;
+    const marker = `${FFMPEG_OUTPUT_MARKER}${target.directory}/${target.filename}`;
+    const args = job.args.map((arg) => (arg === job.outputName ? marker : arg));
+    try {
+      if (fileInputs.length > 0) {
+        await ffmpeg.createDir(mountPoint).catch(() => undefined);
+        mountDirCreated = true;
+        const mountedOk = await ffmpeg.mount(FFFSType.WORKERFS, {
+          blobs: fileInputs.map((input) => ({ name: input.name, data: input.file })),
+        }, mountPoint);
+        if (!mountedOk) throw new Error("ffmpeg WORKERFS is unavailable");
+        mounted = true;
+      }
+      for (const input of byteInputs) await ffmpeg.writeFile(input.name, input.bytes);
+      const mountedPaths = new Map(fileInputs.map((input) => [input.name, `${mountPoint}/${input.name}`]));
+      const exitCode = await ffmpeg.exec(args.map((arg) => mountedPaths.get(arg) ?? arg));
+      if (exitCode !== 0) throw new Error(`ffmpeg exited with ${exitCode}`);
+    } finally {
+      for (const input of byteInputs) await ffmpeg.deleteFile(input.name).catch(() => undefined);
+      if (mounted) await ffmpeg.unmount(mountPoint).catch(() => undefined);
+      if (mountDirCreated) await ffmpeg.deleteDir(mountPoint).catch(() => undefined);
+    }
+    const directory = await target.root.getDirectoryHandle(target.directory, { create: true });
+    let file: File | undefined;
+    try {
+      file = await (await directory.getFileHandle(target.filename)).getFile();
+    } catch {
+      file = undefined;
+    }
+    if (file === undefined || file.size === 0) {
+      await ffmpeg.deleteFile(`/${target.filename}`).catch(() => undefined);
+      throw new FfmpegStagingUnavailableError();
+    }
+  }
+
   private async runExclusive(job: FfmpegJob): Promise<Uint8Array> {
     // Byte inputs are the only ones that occupy FFmpeg's memory filesystem; refuse an
     // oversized job here so every caller gets the same budget, not just the paths that
@@ -157,6 +254,9 @@ export class FfmpegRunner implements FfmpegRunnerLike {
     const byteLength = job.inputs.reduce((total, input) => total + (input.bytes?.byteLength ?? 0), 0);
     if (byteLength > this.maxByteInputBytes) {
       throw new FfmpegInputTooLargeError(byteLength, this.maxByteInputBytes);
+    }
+    if (job.expectedOutputBytes !== undefined && job.expectedOutputBytes > this.maxMemoryOutputBytes) {
+      throw new FfmpegOutputTooLargeError(job.expectedOutputBytes, this.maxMemoryOutputBytes);
     }
     const ffmpeg = await this.ensureLoaded();
     const fileInputs = job.inputs.filter(
@@ -184,8 +284,8 @@ export class FfmpegRunner implements FfmpegRunnerLike {
       const exitCode = await ffmpeg.exec(args);
       if (exitCode !== 0) throw new Error(`ffmpeg exited with ${exitCode}`);
       const output = await ffmpeg.readFile(job.outputName);
-      const bytes = output instanceof Uint8Array ? output : new TextEncoder().encode(String(output));
-      return new Uint8Array(bytes);
+      // readFile already returns a fresh Uint8Array; wrapping it again copies the whole output.
+      return output instanceof Uint8Array ? output : new TextEncoder().encode(String(output));
     } catch (error) {
       console.error("[media-downloader] ffmpeg failed", job.args.join(" "), String(error));
       // A trapped WASM core cannot be reused; drop it so the next attempt loads cleanly.

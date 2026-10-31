@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   convertArgs,
   FfmpegInputTooLargeError,
+  FfmpegOutputTooLargeError,
   FfmpegRunner,
   MAX_FFMPEG_BYTE_INPUT_BYTES,
+  MAX_FFMPEG_OUTPUT_BYTES,
   mergeArgs,
   mp3Args,
   type FfmpegJob,
@@ -17,6 +19,7 @@ const ffmpegState = vi.hoisted(() => ({
   mounts: [] as unknown[],
   unmounts: [] as string[],
   execArgs: [] as string[][],
+  readResult: new Uint8Array([1]),
 }));
 
 vi.mock("@ffmpeg/ffmpeg", () => ({
@@ -59,7 +62,7 @@ vi.mock("@ffmpeg/ffmpeg", () => ({
     }
 
     async readFile(): Promise<Uint8Array> {
-      return new Uint8Array([1]);
+      return ffmpegState.readResult;
     }
 
     async deleteFile(): Promise<void> {}
@@ -195,6 +198,29 @@ describe("ffmpeg byte-input budget", () => {
 
   it("keeps the default budget at 600 MiB for byte inputs", () => {
     expect(MAX_FFMPEG_BYTE_INPUT_BYTES).toBe(600 * 1024 * 1024);
+  });
+
+  it("returns the read-back buffer without copying it a second time", async () => {
+    ffmpegState.readResult = new Uint8Array([7, 8, 9]);
+    const runner = new FfmpegRunner("https://extension.test/vendor/");
+    const job: FfmpegJob = { inputs: [], args: ["out.mp4"], outputName: "out.mp4" };
+
+    const result = await runner.run(job);
+
+    expect(result).toBe(ffmpegState.readResult);
+  });
+
+  it("rejects a known-large output before running FFmpeg", async () => {
+    const runner = new FfmpegRunner("https://extension.test/vendor/");
+    const job: FfmpegJob = {
+      inputs: [],
+      args: ["out.mp4"],
+      outputName: "out.mp4",
+      expectedOutputBytes: MAX_FFMPEG_OUTPUT_BYTES + 1,
+    };
+
+    await expect(runner.run(job)).rejects.toBeInstanceOf(FfmpegOutputTooLargeError);
+    expect(MAX_FFMPEG_OUTPUT_BYTES).toBe(1024 * 1024 * 1024);
   });
 });
 

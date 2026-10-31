@@ -75,7 +75,7 @@ for (const file of STATIC_FILES) {
 // ---------------------------------------------------------------------------
 const ffmpegWrapperDir = path.join(ROOT, "node_modules", "@ffmpeg", "ffmpeg", "dist", "esm");
 const ffmpegCoreDir = path.join(ROOT, "node_modules", "@ffmpeg", "core", "dist", "esm");
-const ffmpegWrapperFiles = ["classes.js", "const.js", "errors.js", "index.js", "types.js", "utils.js", "worker.js"];
+const ffmpegWrapperFiles = ["classes.js", "const.js", "errors.js", "index.js", "types.js", "utils.js"];
 const ffmpegCoreFiles = ["ffmpeg-core.js", "ffmpeg-core.wasm"];
 const ffmpegHashesPath = path.join(TOOLS, "ffmpeg-vendor-hashes.json");
 const expectedHashes = JSON.parse(await readFile(ffmpegHashesPath, "utf8"));
@@ -100,7 +100,20 @@ try {
 } catch (error) {
   throw new Error(`ffmpeg.wasm vendor files missing (run npm install): ${String(error)}`);
 }
-console.log("vendored ffmpeg.wasm (wrapper + single-thread core)");
+// Our worker (same URL as the upstream wrapper) adds the OPFS output path and the chunked
+// MEMFS copy fallback; see src/ffmpeg/worker.ts.
+await esbuild.build({
+  entryPoints: [path.join(SRC, "ffmpeg", "worker.ts")],
+  outfile: path.join(OUT, "vendor", "ffmpeg", "worker.js"),
+  bundle: true,
+  format: "esm",
+  platform: "browser",
+  target: ["chrome116"],
+  sourcemap: false,
+  legalComments: "none",
+  logLevel: "warning",
+});
+console.log("vendored ffmpeg.wasm (worker + single-thread core)");
 
 // Action icons: rasterized from our own SVG (`src/assets/icon.svg`) at every manifest size.
 // The toolbar badge is drawn by Chrome (red count pill); the artwork itself stays constant.

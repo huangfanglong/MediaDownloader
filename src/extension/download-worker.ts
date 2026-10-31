@@ -31,7 +31,15 @@ import {
 import type { HlsInitSegment, HlsSegment as TransferSegment, SegmentDescriptor } from "../transfer/assemble.js";
 import type { HlsSegment as ParsedSegment } from "../manifests/hls.js";
 import { headersForPlan, fetchBytes, scopedHeadersFor, type FetchLike } from "../transfer/fetch.js";
-import { convertArgs, FfmpegInputTooLargeError, mergeArgs, mp3Args, type FfmpegJob, type FfmpegRunnerLike } from "../transfer/ffmpeg.js";
+import {
+  convertArgs,
+  FfmpegInputTooLargeError,
+  FfmpegOutputTooLargeError,
+  mergeArgs,
+  mp3Args,
+  type FfmpegJob,
+  type FfmpegRunnerLike,
+} from "../transfer/ffmpeg.js";
 import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
 import { muxFragmentedMp4 } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
@@ -40,8 +48,10 @@ import { isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
   createStagedFile,
   openOpfsRoot,
+  openStagedFile,
   purgeStaging,
   removeStagedFile,
+  STAGING_DIRECTORY,
   type OpfsRoot,
   type StagedFile,
 } from "./staging.js";
@@ -489,6 +499,52 @@ export class DownloadWorker {
     }
   }
 
+  /** Result describing a finished staged output. */
+  private stagedOutcome(plan: DownloadPlan, staged: StagedTransfer, extension: string): TransferOutcome {
+    this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: staged.totalBytes });
+    return {
+      download_id: plan.download_id,
+      internal_filename: staged.filename,
+      internal_bloburl: staged.blobUrl,
+      output_extension: extension,
+      ending_reason: { user_abort: false, e4XX_5XX_failure: false, percentage_incomplete: false, other_failure: false },
+    } as TransferOutcome;
+  }
+
+  /** Run an ffmpeg job whose output streams into OPFS, falling back to a memory run. */
+  private async runFfmpegStaged(
+    job: FfmpegJob,
+    root: OpfsRoot,
+    filename: string,
+    extension: string,
+  ): Promise<Result<StagedTransfer, string>> {
+    const ffmpeg = this.deps.ffmpeg;
+    if (ffmpeg === undefined) return err("ffmpeg unavailable");
+    if (ffmpeg.runToStaging !== undefined) {
+      try {
+        await ffmpeg.runToStaging(job, { root, directory: STAGING_DIRECTORY, filename });
+        const staged = await openStagedFile(root, filename);
+        return ok({ ...staged, extension, totalBytes: staged.file.size });
+      } catch (error) {
+        if (error instanceof FfmpegInputTooLargeError || error instanceof FfmpegOutputTooLargeError) {
+          return err(error.message);
+        }
+        // Staging unavailable: fall through to the legacy memory path below.
+      }
+    }
+    const result = await this.runFfmpeg(job);
+    if (result.tag === "Err") return result;
+    const staged = await createStagedFile(root, filename);
+    try {
+      await staged.append(result.value);
+      const finished = await staged.finish();
+      return ok({ ...finished, extension, totalBytes: result.value.byteLength });
+    } catch (error) {
+      await staged.abort();
+      return err(String(error));
+    }
+  }
+
   /** Run an ffmpeg job, turning the byte-input budget into a normal download error. */
   private async runFfmpeg(job: FfmpegJob): Promise<Result<Uint8Array, string>> {
     const ffmpeg = this.deps.ffmpeg;
@@ -496,7 +552,9 @@ export class DownloadWorker {
     try {
       return ok(await ffmpeg.run(job));
     } catch (error) {
-      if (error instanceof FfmpegInputTooLargeError) return err(error.message);
+      if (error instanceof FfmpegInputTooLargeError || error instanceof FfmpegOutputTooLargeError) {
+        return err(error.message);
+      }
       throw error;
     }
   }
@@ -552,15 +610,19 @@ export class DownloadWorker {
               return err(`audio track too small (${audioStaged.value.totalBytes} bytes)`);
             }
             this.emitProgress(plan.download_id, { status: "finalizing" });
-            const extracted = await this.runFfmpeg({
-              inputs: [{ name: audioStaged.value.filename, file: audioStaged.value.file }],
-              args: mp3Args(audioStaged.value.filename, "out.mp3"),
-              outputName: "out.mp3",
-            });
+            const extracted = await this.runFfmpegStaged(
+              {
+                inputs: [{ name: audioStaged.value.filename, file: audioStaged.value.file }],
+                args: mp3Args(audioStaged.value.filename, "out.mp3"),
+                outputName: "out.mp3",
+              },
+              root,
+              `${plan.download_id}.mp3`,
+              "mp3",
+            );
             if (extracted.tag === "Err") return extracted;
-            bytes = extracted.value;
-            extension = "mp3";
-            console.info("[media-downloader] ffmpeg extracted mp3", bytes.byteLength, "bytes");
+            console.info("[media-downloader] ffmpeg extracted mp3", extracted.value.totalBytes, "bytes");
+            return ok(this.stagedOutcome(plan, extracted.value, "mp3"));
           } finally {
             await this.cleanupStagedTransfer(root, audioStaged.value);
           }
@@ -591,7 +653,7 @@ export class DownloadWorker {
               return err("WebM output needs a WEBM quality; choose a WEBM rendition or keep Auto");
             }
             const outputName = `out.${container}`;
-            const runMerge = (transcode: boolean): Promise<Result<Uint8Array, string>> => {
+            const runMerge = (transcode: boolean): Promise<Result<StagedTransfer, string>> => {
               const args = mergeArgs(
                 videoStaged.value.filename,
                 audioStaged.value.filename,
@@ -608,16 +670,23 @@ export class DownloadWorker {
                 audioStaged.value.totalBytes,
                 args.join(" "),
               );
-              return this.runFfmpeg({
-                inputs: [
-                  { name: videoStaged.value.filename, file: videoStaged.value.file },
-                  { name: audioStaged.value.filename, file: audioStaged.value.file },
-                ],
-                args,
-                outputName,
-              });
+              return this.runFfmpegStaged(
+                {
+                  inputs: [
+                    { name: videoStaged.value.filename, file: videoStaged.value.file },
+                    { name: audioStaged.value.filename, file: audioStaged.value.file },
+                  ],
+                  args,
+                  outputName,
+                  expectedOutputBytes: videoStaged.value.totalBytes + audioStaged.value.totalBytes,
+                },
+                root,
+                `${plan.download_id}.${container}`,
+                container,
+              );
             };
             this.emitProgress(plan.download_id, { status: "finalizing" });
+            let mergedStaged: StagedTransfer;
             if (container === "webm") {
               // Builder sends mixed WebM/AAC pairs to MKV; a WebM plan here should already be
               // VP8/VP9 + Opus/Vorbis, so copy both streams and never invoke libopus.
@@ -625,11 +694,11 @@ export class DownloadWorker {
               if (merged.tag === "Err") {
                 return err(`WebM mux failed; keep Auto to copy mixed audio into MKV: ${merged.error}`);
               }
-              bytes = merged.value;
+              mergedStaged = merged.value;
             } else {
               const copied = await runMerge(false);
               if (copied.tag === "Ok") {
-                bytes = copied.value;
+                mergedStaged = copied.value;
               } else {
                 // Copy can fail for mixed codec families; one transcode retry is cheaper than failing.
                 if (container === "mkv") return err(`ffmpeg merge failed: ${copied.error}`);
@@ -638,11 +707,23 @@ export class DownloadWorker {
                 }
                 const transcoded = await runMerge(true);
                 if (transcoded.tag === "Err") return transcoded;
-                bytes = transcoded.value;
+                mergedStaged = transcoded.value;
               }
             }
-            extension = container;
-            console.info("[media-downloader] ffmpeg merged tracks", bytes.byteLength, "bytes", container);
+            console.info("[media-downloader] ffmpeg merged tracks", mergedStaged.totalBytes, "bytes", container);
+            if (plan.output_format !== undefined && plan.output_format !== container) {
+              conversionInput = {
+                name: mergedStaged.filename,
+                file: mergedStaged.file,
+                filename: mergedStaged.filename,
+                blobUrl: mergedStaged.blobUrl,
+                totalBytes: mergedStaged.totalBytes,
+                cleanup: () => this.cleanupStagedTransfer(root, mergedStaged),
+              };
+              extension = container;
+            } else {
+              return ok(this.stagedOutcome(plan, mergedStaged, container));
+            }
           } finally {
             await this.cleanupStagedTransfer(root, videoStaged.value);
             await this.cleanupStagedTransfer(root, audioStaged.value);
@@ -699,18 +780,35 @@ export class DownloadWorker {
           }
           const outputName = `out.${container}`;
           this.emitProgress(plan.download_id, { status: "finalizing" });
-          const merged = await this.runFfmpeg({
-            inputs: [
-              { name: videoFinished.filename, file: videoFinished.file },
-              { name: audioFinished.filename, file: audioFinished.file },
-            ],
-            args: mergeArgs(videoFinished.filename, audioFinished.filename, outputName, container, false),
-            outputName,
-          });
+          const merged = await this.runFfmpegStaged(
+            {
+              inputs: [
+                { name: videoFinished.filename, file: videoFinished.file },
+                { name: audioFinished.filename, file: audioFinished.file },
+              ],
+              args: mergeArgs(videoFinished.filename, audioFinished.filename, outputName, container, false),
+              outputName,
+              expectedOutputBytes: videoAssembled.value.totalBytes + audioAssembled.value.totalBytes,
+            },
+            root,
+            `${plan.download_id}.${container}`,
+            container,
+          );
           if (merged.tag === "Err") return merged;
-          bytes = merged.value;
-          extension = container;
-          console.info("[media-downloader] ffmpeg merged HLS tracks", bytes.byteLength, "bytes", container);
+          console.info("[media-downloader] ffmpeg merged HLS tracks", merged.value.totalBytes, "bytes", container);
+          if (plan.output_format !== undefined && plan.output_format !== container) {
+            conversionInput = {
+              name: merged.value.filename,
+              file: merged.value.file,
+              filename: merged.value.filename,
+              blobUrl: merged.value.blobUrl,
+              totalBytes: merged.value.totalBytes,
+              cleanup: () => this.cleanupStagedTransfer(root, merged.value),
+            };
+            extension = container;
+          } else {
+            return ok(this.stagedOutcome(plan, merged.value, container));
+          }
         } finally {
           await this.cleanupStagedTransfer(root, videoFinished);
           await this.cleanupStagedTransfer(root, audioFinished);
@@ -755,16 +853,21 @@ export class DownloadWorker {
         if (finished === undefined) bytes = assembled.value.bytes;
         try {
           const inputName = finished !== undefined ? finished.filename : "input.m2ts";
-          const remuxed = await this.runFfmpeg({
-            inputs: [finished !== undefined ? { name: inputName, file: finished.file } : { name: inputName, bytes }],
-            args: ["-hide_banner", "-y", "-i", inputName, "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
-            outputName: "output.mp4",
-          });
+          const remuxed = await this.runFfmpegStaged(
+            {
+              inputs: [finished !== undefined ? { name: inputName, file: finished.file } : { name: inputName, bytes }],
+              args: ["-hide_banner", "-y", "-i", inputName, "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
+              outputName: "output.mp4",
+              expectedOutputBytes: finished !== undefined ? assembled.value.totalBytes : bytes.byteLength,
+            },
+            root,
+            `${plan.download_id}.mp4`,
+            "mp4",
+          );
           if (remuxed.tag === "Err") throw new Error(remuxed.error);
-          if (remuxed.value.byteLength < MIN_OUTPUT_BYTES) throw new Error("FFmpeg produced an empty MP4");
-          bytes = remuxed.value;
-          extension = "mp4";
-          console.info("[media-downloader] remuxed HLS TS to mp4", bytes.byteLength, "bytes");
+          if (remuxed.value.totalBytes < MIN_OUTPUT_BYTES) throw new Error("FFmpeg produced an empty MP4");
+          console.info("[media-downloader] remuxed HLS TS to mp4", remuxed.value.totalBytes, "bytes");
+          return ok(this.stagedOutcome(plan, remuxed.value, "mp4"));
         } catch (error) {
           return err(`MP4 remux failed: ${String(error)}`);
         } finally {
@@ -832,6 +935,17 @@ export class DownloadWorker {
       this.emitProgress(plan.download_id, { status: "finalizing" });
       try {
         if (requestedFormat === "mp3") {
+          if (conversionInput !== undefined) {
+            const converted = await this.runFfmpegStaged(
+              { inputs, args: mp3Args(inputName, outputName), outputName },
+              root,
+              `${plan.download_id}.${requestedFormat}`,
+              requestedFormat,
+            );
+            if (converted.tag === "Err") return converted;
+            console.info("[media-downloader] ffmpeg converted output", converted.value.totalBytes, "bytes", requestedFormat);
+            return ok(this.stagedOutcome(plan, converted.value, requestedFormat));
+          }
           const converted = await this.runFfmpeg({
             inputs,
             args: mp3Args(inputName, outputName),
@@ -852,6 +966,21 @@ export class DownloadWorker {
                 : false;
           if (transcode && (duration ?? 0) > MAX_TRANSCODE_SECONDS) {
             return err(`converting ${extension} to ${requestedFormat} is limited to 3-minute clips in the browser`);
+          }
+          if (conversionInput !== undefined) {
+            const converted = await this.runFfmpegStaged(
+              {
+                inputs,
+                args: convertArgs(inputName, outputName, requestedFormat, transcode),
+                outputName,
+              },
+              root,
+              `${plan.download_id}.${requestedFormat}`,
+              requestedFormat,
+            );
+            if (converted.tag === "Err") return converted;
+            console.info("[media-downloader] ffmpeg converted output", converted.value.totalBytes, "bytes", requestedFormat);
+            return ok(this.stagedOutcome(plan, converted.value, requestedFormat));
           }
           const converted = await this.runFfmpeg({
             inputs,

@@ -5,6 +5,7 @@ import { DownloadWorker } from "../src/extension/download-worker.js";
 import type { DownloadPlan } from "../src/core/types.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
 import { createFakeOpfs, createFetch, createRangedFetch } from "./helpers/transfer-fakes.js";
+import { createStagedFile } from "../src/extension/staging.js";
 
 const encoder = new TextEncoder();
 
@@ -565,6 +566,66 @@ describe("ffmpeg inputs are staged files", () => {
   });
 });
 
+describe("streamed FFmpeg output", () => {
+  it("writes an HLS TS remux through the staging runner instead of memory", async () => {
+    const manifest = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n0.ts\n#EXTINF:4,\n1.ts\n#EXT-X-ENDLIST\n";
+    const payloads = new Map<string, string | Uint8Array>([
+      ["https://cdn.test/media.m3u8", manifest],
+      ["https://cdn.test/0.ts", new Uint8Array(600).fill(1)],
+      ["https://cdn.test/1.ts", new Uint8Array(600).fill(2)],
+    ]);
+    const { root, files } = createFakeOpfs();
+    let memoryRuns = 0;
+    let stagedRuns = 0;
+    const runner = {
+      run: async (): Promise<Uint8Array> => {
+        memoryRuns += 1;
+        return new Uint8Array(2048).fill(9);
+      },
+      runToStaging: async (_job: unknown, target: { root: typeof root; directory: string; filename: string }) => {
+        stagedRuns += 1;
+        const staged = await createStagedFile(target.root, target.filename);
+        await staged.append(new Uint8Array(2048).fill(5));
+        await staged.finish();
+      },
+    };
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      } as unknown as BroadcastChannelLike,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+      ffmpeg: runner,
+    });
+    const plan = {
+      download_id: "download_staged_remux",
+      headers: new Headers(),
+      good_basename: "hls",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "m3u8_audio_video_one_source",
+      url: new URL("https://cdn.test/media.m3u8"),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      output_format: "mp4",
+      is_youtube: false,
+      throttle: false,
+      cache: "default",
+    } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    expect(stagedRuns).toBe(1);
+    expect(memoryRuns).toBe(0);
+    expect(files.has("download_staged_remux.mp4")).toBe(true);
+  });
+});
 describe("webm copy merge", () => {  it("stream-copies VP9/Opus tracks into WebM without transcoding", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);
     const audio = fragmentedTrack(1, [0, 1024, 2048]);
