@@ -1,0 +1,153 @@
+# Publishes a ready-to-load build whenever a version bump commit lands on main.
+#
+# A push triggers this workflow only when one of its commits starts with
+# "release: bump Media Downloader to <version>" — e.g. "release: bump Media Downloader to 1.0.7".
+# The workflow builds the extension, zips the loadable package with manifest.json at the archive
+# root, and publishes it as release <version> (same tags, titles and asset names as previous
+# releases), so the zip can be unpacked and loaded with "Load unpacked" in Brave/Chrome.
+
+name: Release Media Downloader
+
+on:
+  push:
+    branches:
+      - main
+
+# Creating a release and its tag needs write access to the repository contents.
+permissions:
+  contents: write
+
+# Publish one release at a time; never cancel a run halfway through an upload.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - name: Find the release commit in this push
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MESSAGE_PREFIX: "release: bump Media Downloader to "
+        run: |
+          set -euo pipefail
+
+          # A push can carry several commits. The last one that matches decides the version.
+          version="$(
+            jq -r --arg prefix "$MESSAGE_PREFIX" '
+              [.commits[]?
+               | (.message // "")
+               | split("\n")[0]
+               | sub("\\s+$"; "")
+               | select(startswith($prefix))
+               | ltrimstr($prefix)]
+              | last // ""
+            ' "$GITHUB_EVENT_PATH"
+          )"
+
+          if [ -z "$version" ]; then
+            echo "No release commit in this push, nothing to publish."
+            exit 0
+          fi
+
+          # Chrome manifest versions are dot-separated integers, so keep releases to MAJOR.MINOR.PATCH.
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release commit has an invalid version '$version'; expected something like 1.0.7."
+            exit 1
+          fi
+
+          # The same bump can reach main twice (merge commits, re-pushes). If a release already
+          # has the archive there is nothing left to do.
+          release_json="$(gh release view "$version" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null || true)"
+          if [ -n "$release_json" ] \
+            && jq -e --arg asset "media-downloader-$version.zip" '[.assets[].name] | index($asset)' \
+              >/dev/null <<<"$release_json"; then
+            echo "Release $version already has media-downloader-$version.zip, nothing to publish."
+            exit 0
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing release $version"
+
+  release:
+    name: Build and publish
+    needs: detect
+    if: needs.detect.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check the version bump is complete
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          for file in package.json src/extension/manifest.json; do
+            actual="$(jq -r .version "$file")"
+            if [ "$actual" != "$VERSION" ]; then
+              echo "::error file=$file::Version is $actual but the release commit says $VERSION. Bump every version file in the release commit."
+              exit 1
+            fi
+          done
+
+      - name: Build the extension
+        run: npm run build
+
+      - name: Package the loadable extension
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Archive the contents of dist/extension, not the folder itself, so manifest.json sits
+          # at the zip root and "Load unpacked" accepts the unzipped folder as-is.
+          (cd dist/extension && zip -r -X "$GITHUB_WORKSPACE/media-downloader-$VERSION.zip" .)
+
+          # Check the packaging contract before anything is published.
+          if ! unzip -Z1 "media-downloader-$VERSION.zip" | sed 's#^\./##' | grep -qx "manifest.json"; then
+            echo "::error::manifest.json is not at the root of the packaged zip."
+            exit 1
+          fi
+          packaged="$(unzip -p "media-downloader-$VERSION.zip" manifest.json | jq -r .version)"
+          if [ "$packaged" != "$VERSION" ]; then
+            echo "::error::Packaged manifest.json says $packaged but the release is $VERSION."
+            exit 1
+          fi
+          ls -lh "media-downloader-$VERSION.zip"
+
+      - name: Publish the GitHub release
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A previous run created the release but died before the upload finished: add the
+            # archive and make sure the release is public.
+            gh release upload "$VERSION" "media-downloader-$VERSION.zip" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          else
+            gh release create "$VERSION" "media-downloader-$VERSION.zip" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "MediaDownloader $VERSION" \
+              --generate-notes
+          fi
