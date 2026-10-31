@@ -35,7 +35,7 @@ import { RANGE_CHUNK_BYTES, fetchRanged, isRangeBoundCdn } from "../transfer/ran
 import { muxFragmentedMp4 } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
 import { convertArgs, mergeArgs, mp3Args, type FfmpegRunnerLike } from "../transfer/ffmpeg.js";
-import { sleepWithAbort } from "../transfer/retry.js";
+import { sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
 import { isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
   createStagedFile,
@@ -765,8 +765,8 @@ export class DownloadWorker {
   }, string>> {
     const playlistResult = await this.fetchPlaylistText(plan.url.href, headers, signal);
     if (playlistResult.tag === "Err") {
-      // treat "aborted" as user_abort
-      return err(playlistResult.error === "aborted" ? "user_abort" : playlistResult.error);
+      // fetchPlaylistText now returns "user_abort" for aborted requests
+      return err(playlistResult.error);
     }
     let parsed = parsePlaylist(playlistResult.value, plan.url);
     if (parsed.kind === "invalid") return err(parsed.reason);
@@ -865,12 +865,15 @@ export class DownloadWorker {
         if (descriptor.aes128) {
           throw new Error("Encrypted HLS is not supported by this rebuild");
         }
-        const response = await fetchBytes(
-          this.deps.fetchImpl,
-          descriptor.url,
-          { headers: descriptor.requestHeaders, ...(descriptor.range ? { range: descriptor.range } : {}) },
-          { signal },
-        );
+        // wrap segment fetch in withSegmentRetry (5 attempts, 0/500/1000/1500ms backoff)
+        const response = await withSegmentRetry(async () => {
+          return fetchBytes(
+            this.deps.fetchImpl,
+            descriptor.url,
+            { headers: descriptor.requestHeaders, ...(descriptor.range ? { range: descriptor.range } : {}) },
+            { signal },
+          );
+        }, signal);
         if (response.tag === "Err") {
           failed += 1;
           if (index === 0) throw new Error("Required segment was invalid, aborting download.");
@@ -937,24 +940,25 @@ export class DownloadWorker {
     headers: Headers,
     signal?: AbortSignal,
   ): Promise<Result<string, string>> {
-    const attempts = 5;
-    let last = "manifest fetch failed";
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      if (signal?.aborted) return err("aborted");
-      const response = await fetchBytes(
+    // use tested withManifestRetry instead of hand-rolled loop
+    const response = await withManifestRetry(async () => {
+      return fetchBytes(
         this.deps.fetchImpl,
         url,
         { headers },
         { signal, maxBytes: MAX_HLS_MANIFEST_BYTES },
       );
-      if (response.tag === "Ok") return ok(new TextDecoder().decode(response.value.bytes));
-      last = response.error.message ?? "manifest fetch failed";
-      if (response.error.kind === "http" && (response.error.status === 404 || response.error.status === 416)) {
-        return err(last);
+    }, signal);
+
+    if (response.tag === "Err") {
+      // Convert RetryError to string, treating aborted as special marker
+      if (response.error.kind === "aborted") {
+        return err("user_abort");
       }
-      await sleepWithAbort(2 ** attempt * 500, signal).catch(() => undefined);
+      return err(response.error.message ?? "manifest fetch failed");
     }
-    return err(last);
+
+    return ok(new TextDecoder().decode(response.value.bytes));
   }
 
   private emitProgress(downloadId: string, progress: DownloadProgress): void {
