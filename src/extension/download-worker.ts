@@ -16,7 +16,12 @@ import { RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
 import { decode } from "../protocol/serde.js";
 import type { BroadcastChannelLike } from "./gateways.js";
 import type { DownloadPlan, DownloadProgress, TransferOutcome } from "../core/types.js";
-import { httpFailureReason, isHlsStrategy, otherFailureReason } from "../core/types.js";
+import {
+  PROGRESS_INTERVAL_MS,
+  httpFailureReason,
+  isHlsStrategy,
+  otherFailureReason,
+} from "../core/types.js";
 import { err, ok, type Result } from "../core/option.js";
 import { MAX_HLS_MANIFEST_BYTES, parsePlaylist } from "../manifests/hls.js";
 import {
@@ -59,8 +64,6 @@ import {
 /** Segment fetch concurrency proven in the original (semaphore 4, 1 when throttled). */
 export const SEGMENT_CONCURRENCY = 4;
 export const THROTTLED_SEGMENT_CONCURRENCY = 1;
-/** Progress is pushed at most twice per second. */
-export const PROGRESS_INTERVAL_MS = 500;
 
 /** In-browser transcode budget: beyond this, VP8/x264 conversion is far slower than a download. */
 const MAX_TRANSCODE_SECONDS = 180;

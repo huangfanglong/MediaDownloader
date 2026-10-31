@@ -22,7 +22,7 @@ import type {
   TabMeta,
   TransferOutcome,
 } from "../core/types.js";
-import { httpFailureReason, otherFailureReason, userAbortReason } from "../core/types.js";
+import { PROGRESS_INTERVAL_MS, httpFailureReason, otherFailureReason, userAbortReason } from "../core/types.js";
 import { Channel } from "../protocol/channels.js";
 import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
@@ -209,6 +209,8 @@ export class MediaDownloaderService {
   private readonly tabHealing: TabHealing;
   /** Media hashes with a download in flight (review 4.1 duplicate downloads). */
   private readonly activeMediaHashes = new Set<string>();
+  /** Last accepted progress update per download (the 2 Hz contract in core/types.ts). */
+  private readonly lastProgressEmitAt = new Map<string, number>();
   /** Page-relay request id -> download id (review: protected CDNs). */
   private readonly relayRequests = new Map<string, { downloadId: string; seq: number }>();
   /** Keeps the MV3 worker alive while transfers run (review 4.2). */
@@ -1488,7 +1490,15 @@ export class MediaDownloaderService {
   private onProgress(downloadId: string, progress: DownloadProgress): void {
     const entry = this.session.downloading.get(downloadId);
     if (!entry) return;
-    applyDownloadProgress(entry, progress, this.now());
+    const now = this.now();
+    if (progress.status === "downloading") {
+      // Producers can emit at chunk rate (the browser-side ranged loop used to); the panel and the
+      // session only need the documented 2 Hz, so drop anything that arrives early.
+      const last = this.lastProgressEmitAt.get(downloadId);
+      if (last !== undefined && now - last < PROGRESS_INTERVAL_MS) return;
+      this.lastProgressEmitAt.set(downloadId, now);
+    }
+    applyDownloadProgress(entry, progress, now);
     void this.publish();
   }
 
@@ -1499,6 +1509,7 @@ export class MediaDownloaderService {
     outcome: Result<TransferOutcome, string>,
   ): Promise<void> {
     this.session.downloading.delete(plan.download_id);
+    this.lastProgressEmitAt.delete(plan.download_id);
     this.activeMediaHashes.delete(media.hash);
     if (isErr(outcome)) {
       console.warn("[media-downloader] download failed", outcome.error, composeFilename(plan));

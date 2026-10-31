@@ -240,6 +240,15 @@ export interface DownloadProgress {
   output_duration_s?: number;
 }
 
+/**
+ * Minimum gap between `downloading` progress updates: the 2 Hz budget promised above.
+ *
+ * Both ends use it: the worker filters its own emission, and the service filters again on receipt
+ * so a producer that ignores the contract (the browser-side ranged loop used to emit one update per
+ * 2 MiB chunk) cannot push the panel or persist the session at chunk rate.
+ */
+export const PROGRESS_INTERVAL_MS = 500;
+
 /** Output of one transfer, as returned by the worker to the service worker. */
 export interface TransferOutcome {
   /** Set when the transfer was cancelled before producing a file. */
