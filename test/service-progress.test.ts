@@ -8,12 +8,13 @@
 import { describe, expect, it } from "vitest";
 import type { DownloadPlan, DownloadProgress, MediaItem, TabMeta } from "../src/core/types.js";
 import type { WorkerClient } from "../src/extension/worker-client.js";
+import { REBUILD_MESSAGES } from "../src/protocol/rebuild-messages.js";
 import {
   MediaDownloaderService,
   type DownloadingEntry,
   type SessionState,
 } from "../src/extension/service-worker.js";
-import { createFakeGateway, flush } from "./helpers/service-harness.js";
+import { createFakeGateway, flush, type FakeGateway } from "./helpers/service-harness.js";
 
 function stubWorker(): WorkerClient {
   return {
@@ -60,6 +61,7 @@ function downloadingEntry(downloadId: string): DownloadingEntry {
 }
 
 function createService(nowRef: { value: number }): {
+  gateway: FakeGateway;
   service: MediaDownloaderService;
   session: SessionState;
   progress: (downloadId: string, progress: DownloadProgress) => void;
@@ -81,6 +83,7 @@ function createService(nowRef: { value: number }): {
   };
   (service as unknown as { session: SessionState }).session = session;
   return {
+    gateway,
     service,
     session,
     progress: (downloadId, progress) =>
@@ -140,6 +143,64 @@ describe("service-side progress rate limiting", () => {
     expect(session.downloading.get("download_a")?.fetched_bytes_count).toBe(1000);
     expect(session.downloading.get("download_b")?.fetched_bytes_count).toBe(5000);
     await flush();
+    service.stop();
+  });
+});
+
+describe("publication cost dedupe", () => {
+  it("skips badge API calls when the badge did not change", async () => {
+    const nowRef = { value: 4_000_000 };
+    const { gateway, service } = createService(nowRef);
+    let backgroundCalls = 0;
+    let textColorCalls = 0;
+    const originalBackground = gateway.action.setBadgeBackgroundColor;
+    gateway.action.setBadgeBackgroundColor = async (details) => {
+      backgroundCalls += 1;
+      await originalBackground(details);
+    };
+    const originalTextColor = gateway.action.setBadgeTextColor;
+    gateway.action.setBadgeTextColor = async (details) => {
+      textColorCalls += 1;
+      await originalTextColor(details);
+    };
+
+    await service.publish();
+    await service.publish();
+    expect(gateway.badgeTextLog).toEqual([""]);
+    expect(backgroundCalls).toBe(0);
+    expect(textColorCalls).toBe(0);
+
+    // A real change updates all three parts exactly once and is then cached again.
+    const session = (service as unknown as { session: SessionState }).session;
+    session.notifications.set("notification_1", { type: "download_error", message: "failed" });
+    await service.publish();
+    await service.publish();
+    expect(gateway.badgeTextLog).toEqual(["", "1"]);
+    expect(backgroundCalls).toBe(1);
+    expect(textColorCalls).toBe(1);
+    service.stop();
+  });
+
+  it("does not rebuild and push an unchanged snapshot inside the throttle window", async () => {
+    const nowRef = { value: 5_000_000 };
+    const { gateway, service } = createService(nowRef);
+    const pushes = (): number =>
+      gateway.contentSends.filter((envelope) => envelope.msg.name === REBUILD_MESSAGES.SessionSnapshot).length;
+
+    await service.publish();
+    expect(pushes()).toBe(1);
+    await service.publish(); // same signature, same clock → suppressed before building rows
+    expect(pushes()).toBe(1);
+
+    nowRef.value += 300; // window elapsed → repeated state may push again
+    await service.publish();
+    expect(pushes()).toBe(2);
+
+    nowRef.value += 10;
+    const session = (service as unknown as { session: SessionState }).session;
+    session.notifications.set("notification_2", { type: "download_error", message: "failed" });
+    await service.publish(); // structural change pushes immediately
+    expect(pushes()).toBe(3);
     service.stop();
   });
 });

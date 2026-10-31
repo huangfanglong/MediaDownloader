@@ -64,7 +64,7 @@ import {
   composeContextMenuItems,
   type ContextMenuItem,
 } from "./context-menu.js";
-import { computeBadge } from "./badge.js";
+import { computeBadge, type BadgeBackgroundColor } from "./badge.js";
 import { createWorkerChannel, WorkerClient } from "./worker-client.js";
 import { SessionPublisher } from "./session-publisher.js";
 import { openOpfsRoot, removeStagedFile, type OpfsRoot } from "./staging.js";
@@ -221,6 +221,10 @@ export class MediaDownloaderService {
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
   private readonly observedRequests = new Map<number, Set<string>>();
   private lastSnapshotSignature = "";
+  /** Last applied badge values; Chrome API calls are skipped when nothing changed. */
+  private lastBadgeText?: string;
+  private lastBadgeBackground?: string;
+  private lastBadgeTextColor?: string;
   private markReady!: () => void;
 
   constructor(options: ServiceWorkerOptions) {
@@ -388,12 +392,22 @@ export class MediaDownloaderService {
       downloadingCount: this.session.downloading.size,
       mediaCount,
     });
-    await this.gateway.action.setBadgeText({ text: badge.text }).catch(() => undefined);
-    if (badge.backgroundColor !== undefined) {
-      await this.gateway.action.setBadgeBackgroundColor({ color: badge.backgroundColor }).catch(() => undefined);
+    // These calls are IPC; a publish storm (or a progress tick) rarely changes the badge.
+    if (badge.text !== this.lastBadgeText) {
+      this.lastBadgeText = badge.text;
+      await this.gateway.action.setBadgeText({ text: badge.text }).catch(() => undefined);
     }
-    if (badge.text !== "") {
-      await this.gateway.action.setBadgeTextColor({ color: badge.textColor ?? "white" }).catch(() => undefined);
+    const background = badgeBackgroundKey(badge.backgroundColor);
+    if (background !== undefined && background !== this.lastBadgeBackground) {
+      this.lastBadgeBackground = background;
+      await this.gateway.action
+        .setBadgeBackgroundColor({ color: badge.backgroundColor as BadgeBackgroundColor })
+        .catch(() => undefined);
+    }
+    const textColor = badge.text === "" ? undefined : badge.textColor ?? "white";
+    if (textColor !== undefined && textColor !== this.lastBadgeTextColor) {
+      this.lastBadgeTextColor = textColor;
+      await this.gateway.action.setBadgeTextColor({ color: textColor }).catch(() => undefined);
     }
     this.refreshKeepAlive();
   }
@@ -414,22 +428,38 @@ export class MediaDownloaderService {
   /** Tell open panel pages about state changes. Push immediately when the observable state
    * changes; throttle plain progress updates to keep them cheap. */
   private pushPanelSnapshot(): void {
-    const snapshot = this.panelSnapshot();
-    const signature = [
-      snapshot.tab_id ?? -1,
-      snapshot.media.length,
-      snapshot.downloading.length,
-      snapshot.notifications.length,
-      snapshot.notifications[0]?.message ?? "",
-    ].join(":");
     const now = this.now();
-    if (signature === this.lastSnapshotSignature && now - this.lastSnapshotPushAt < 250) return;
+    const signature = this.panelSnapshotSignature();
+    if (signature === this.lastSnapshotSignature && now - this.lastSnapshotPushAt < SNAPSHOT_PUSH_INTERVAL_MS) {
+      return;
+    }
     this.lastSnapshotSignature = signature;
     this.lastSnapshotPushAt = now;
     this.sendToContent({
-      msg: { name: REBUILD_MESSAGES.SessionSnapshot, data: encode(snapshot) },
+      msg: { name: REBUILD_MESSAGES.SessionSnapshot, data: encode(this.panelSnapshot()) },
       channel: Channel.FromServiceToContent,
     });
+  }
+
+  /**
+   * Cheap duplicate of the snapshot guard: the signature only needs the values that decide a push,
+   * so a throttled update does not build rows, variant labels and preview URLs for nothing.
+   */
+  private panelSnapshotSignature(): string {
+    const tabId = this.session.current_win_tab.tab_id;
+    const visibleMedia = filterFocusedMedia(
+      tabId === undefined ? [] : [...this.engine.mediaForTab(tabId).values()],
+      tabId === undefined ? undefined : this.focusByTab.get(tabId),
+      this.now(),
+    );
+    const firstNotification = this.session.notifications.values().next().value;
+    return [
+      String(tabId ?? -1),
+      String(visibleMedia.length),
+      String(this.session.downloading.size),
+      String(this.session.notifications.size),
+      firstNotification?.message ?? firstNotification?.details ?? "",
+    ].join(":");
   }
 
   // -------------------------------------------------------------------------
@@ -1627,6 +1657,8 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
 }
 
 const MAX_CAPTURED_URL_LENGTH = 8192;
+/** Minimum spacing between panel pushes while only progress changed (existing 4 Hz UI budget). */
+const SNAPSHOT_PUSH_INTERVAL_MS = 250;
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
 
@@ -1635,6 +1667,12 @@ const ALLOWED_OUTPUT_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mp3", "m4a", "
 
 /** Credential-bearing request headers must never be written to storage (review round 2). */
 const SENSITIVE_HEADER = /^(cookie|set-cookie|authorization|x-auth)/iu;
+
+/** Compare badge colours by value: notification red arrives as a fresh array every publish. */
+function badgeBackgroundKey(color: BadgeBackgroundColor | undefined): string | undefined {
+  if (color === undefined) return undefined;
+  return Array.isArray(color) ? color.join(",") : color;
+}
 
 function redactHeaders(headers: Headers): Headers {
   const redacted = new Headers();
