@@ -31,10 +31,10 @@ import {
 import type { HlsInitSegment, HlsSegment as TransferSegment, SegmentDescriptor } from "../transfer/assemble.js";
 import type { HlsSegment as ParsedSegment } from "../manifests/hls.js";
 import { headersForPlan, fetchBytes, scopedHeadersFor, type FetchLike } from "../transfer/fetch.js";
-import { RANGE_CHUNK_BYTES, fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
+import { convertArgs, FfmpegInputTooLargeError, mergeArgs, mp3Args, type FfmpegJob, type FfmpegRunnerLike } from "../transfer/ffmpeg.js";
+import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
 import { muxFragmentedMp4 } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
-import { convertArgs, mergeArgs, mp3Args, type FfmpegRunnerLike } from "../transfer/ffmpeg.js";
 import { sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
 import { isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
@@ -54,8 +54,6 @@ export const PROGRESS_INTERVAL_MS = 500;
 
 /** In-browser transcode budget: beyond this, VP8/x264 conversion is far slower than a download. */
 const MAX_TRANSCODE_SECONDS = 180;
-/** ffmpeg.wasm single-thread has a 2 GiB heap; keep the combined MEMFS inputs well below it. */
-const MAX_FFMPEG_INPUT_BYTES = 600 * 1024 * 1024;
 
 function extensionForUrl(url: URL): string | undefined {
   const match = /\.(mp4|m4v|m4a|webm|mkv|mov|mp3|ogg|ts)(?:[?#]|$)/iu.exec(url.pathname);
@@ -75,6 +73,25 @@ export interface DownloadWorkerDeps {
 interface ActiveDownload {
   controller: AbortController;
   lastProgressAt: number;
+}
+
+/** A finished staged file plus the metadata the transfer paths need. */
+interface StagedTransfer {
+  filename: string;
+  blobUrl: string;
+  file: File;
+  extension: string;
+  totalBytes: number;
+}
+
+/** A staged source that will feed an FFmpeg conversion instead of being saved directly. */
+interface ConversionInput {
+  name: string;
+  file: File;
+  filename: string;
+  blobUrl: string;
+  totalBytes: number;
+  cleanup: () => Promise<void>;
 }
 
 export class DownloadWorker {
@@ -301,14 +318,28 @@ export class DownloadWorker {
     return ok(fetched.value.bytes);
   }
 
-  /** Stage a direct download without retaining a second complete copy in memory. */
-  private async streamDirect(
+  /** Revoke the blob URL and remove the OPFS entry of a staged intermediate. */
+  private async cleanupStagedTransfer(
+    root: OpfsRoot,
+    staged: Pick<StagedTransfer, "filename" | "blobUrl">,
+  ): Promise<void> {
+    URL.revokeObjectURL(staged.blobUrl);
+    await removeStagedFile(root, staged.filename).catch(() => undefined);
+  }
+
+  /**
+   * Stream a direct response into OPFS and return the finished file.
+   *
+   * Plain saves use {@link streamDirect}; conversions use the returned File as a WORKERFS input
+   * so the whole source never has to sit in memory (nor in FFmpeg's memory filesystem).
+   */
+  private async stageDirectTransfer(
     root: OpfsRoot,
     plan: DownloadPlan,
     headers: Headers,
     sourceExtension: string,
     signal?: AbortSignal,
-  ): Promise<Result<TransferOutcome, string>> {
+  ): Promise<Result<StagedTransfer, string>> {
     let extension = sourceExtension;
     let staged: StagedFile | undefined;
     let total = 0;
@@ -381,23 +412,92 @@ export class DownloadWorker {
         return err(`direct response too small (${total} bytes)`);
       }
       const finished = await staged.finish();
-      this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: total });
       console.info("[media-downloader] direct transfer ok", total, "bytes", plan.url.href);
-      return ok({
-        download_id: plan.download_id,
-        internal_filename: finished.filename,
-        internal_bloburl: finished.blobUrl,
-        output_extension: extension,
-        ending_reason: {
-          user_abort: false,
-          e4XX_5XX_failure: false,
-          percentage_incomplete: false,
-          other_failure: false,
-        },
-      } as TransferOutcome);
+      return ok({ ...finished, extension, totalBytes: total });
     } catch (error) {
       if (staged !== undefined) await staged.abort().catch(() => undefined);
       return err(String(error));
+    }
+  }
+
+  /** Stage a direct download without retaining a second complete copy in memory. */
+  private async streamDirect(
+    root: OpfsRoot,
+    plan: DownloadPlan,
+    headers: Headers,
+    sourceExtension: string,
+    signal?: AbortSignal,
+  ): Promise<Result<TransferOutcome, string>> {
+    const staged = await this.stageDirectTransfer(root, plan, headers, sourceExtension, signal);
+    if (staged.tag === "Err") return staged;
+    this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: staged.value.totalBytes });
+    return ok({
+      download_id: plan.download_id,
+      internal_filename: staged.value.filename,
+      internal_bloburl: staged.value.blobUrl,
+      output_extension: staged.value.extension,
+      ending_reason: {
+        user_abort: false,
+        e4XX_5XX_failure: false,
+        percentage_incomplete: false,
+        other_failure: false,
+      },
+    } as TransferOutcome);
+  }
+
+  /** Stream one adaptive track into OPFS; it becomes a WORKERFS input for the merge. */
+  private async stageSourceTrack(
+    root: OpfsRoot,
+    url: URL,
+    headers: Headers,
+    signal: AbortSignal | undefined,
+    nameBase: string,
+  ): Promise<Result<StagedTransfer, string>> {
+    const extension = extensionForUrl(url) ?? "bin";
+    let staged: StagedFile;
+    try {
+      staged = await createStagedFile(root, `${nameBase}.${extension}`);
+    } catch (error) {
+      return err(String(error));
+    }
+    let total = 0;
+    const onChunk = async (chunk: Uint8Array): Promise<void> => {
+      await staged.append(chunk);
+      total += chunk.byteLength;
+    };
+    try {
+      if (isRangeBoundCdn(url)) {
+        const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, { signal, onChunk });
+        if (ranged.tag === "Err") {
+          await staged.abort();
+          const status = ranged.error.status !== undefined ? ` ${ranged.error.status}` : "";
+          return err(`ranged ${ranged.error.kind}${status}: ${ranged.error.message ?? "download failed"}`);
+        }
+      } else {
+        const fetched = await fetchBytes(this.deps.fetchImpl, url.href, { headers }, { signal, onChunk });
+        if (fetched.tag === "Err") {
+          await staged.abort();
+          const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
+          return err(`${fetched.error.kind}${status}: ${fetched.error.message ?? "download failed"}`);
+        }
+      }
+      const finished = await staged.finish();
+      return ok({ ...finished, extension, totalBytes: total });
+    } catch (error) {
+      await staged.abort().catch(() => undefined);
+      return err(String(error));
+    }
+  }
+
+  /** Run an ffmpeg job, turning the byte-input budget into a normal download error. */
+  private async runFfmpeg(job: FfmpegJob): Promise<Result<Uint8Array, string>> {
+    const ffmpeg = this.deps.ffmpeg;
+    if (ffmpeg === undefined) return err("ffmpeg unavailable");
+    try {
+      return ok(await ffmpeg.run(job));
+    } catch (error) {
+      if (error instanceof FfmpegInputTooLargeError) return err(error.message);
+      throw error;
     }
   }
 
@@ -415,64 +515,103 @@ export class DownloadWorker {
     // Produced (source) extension; plan.extension is the *requested* target and may differ.
     let extension = plan.source_demuxer ?? extensionForUrl(plan.url) ?? plan.extension ?? "bin";
     let duration: number | undefined = typeof plan.duration === "number" ? plan.duration : undefined;
+    /** Staged source kept for the conversion step below instead of being saved as-is. */
+    let conversionInput: ConversionInput | undefined;
 
     if (plan.url_audio) {
+      const ffmpeg = this.deps.ffmpeg;
       if (!isHlsStrategy(plan.strategy)) {
-        // Direct adaptive tracks (YouTube): download both, then merge with ffmpeg when available.
+        // Direct adaptive tracks (YouTube and similar): stream both tracks to OPFS, then merge
+        // the mounted files. Byte arrays are copied through MEMFS and need roughly three times
+        // their size in memory, so staging is what lets large renditions merge at all.
         const target = plan.extension || "mp4";
-        const ffmpeg = this.deps.ffmpeg;
-        if (target === "mp3") {
-          const audioOnly = await this.fetchSourceBytes(plan.url_audio, headers, signal);
-          if (audioOnly.tag === "Err") return audioOnly;
-          if (!ffmpeg) return err("ffmpeg unavailable: audio extraction unsupported");
-          if (audioOnly.value.byteLength < MIN_OUTPUT_BYTES) {
-            return err(`audio track too small (${audioOnly.value.byteLength} bytes)`);
-          }
-          this.emitProgress(plan.download_id, { status: "finalizing" });
-          bytes = await ffmpeg.run({
-            inputs: [{ name: "audio.m4a", bytes: audioOnly.value }],
-            args: mp3Args("audio.m4a", "out.mp3"),
-            outputName: "out.mp3",
-          });
-          extension = "mp3";
-          console.info("[media-downloader] ffmpeg extracted mp3", bytes.byteLength, "bytes");
-        } else {
+        if (ffmpeg === undefined) {
+          if (target === "mp3") return err("ffmpeg unavailable: audio extraction unsupported");
+          // No FFmpeg: the in-memory fMP4 muxer is the only option (fragmented MP4 inputs only).
           const videoBytes = await this.fetchSourceBytes(plan.url, headers, signal);
           if (videoBytes.tag === "Err") return videoBytes;
           const audioBytes = await this.fetchSourceBytes(plan.url_audio, headers, signal);
           if (audioBytes.tag === "Err") return audioBytes;
-          if (!ffmpeg) {
-            const muxed = muxFragmentedMp4(videoBytes.value, audioBytes.value);
-            if (!muxed) return err("audio/video muxing: inputs are not fragmented MP4");
-            if (muxed.byteLength < MIN_OUTPUT_BYTES) return err(`muxed output too small (${muxed.byteLength} bytes)`);
-            bytes = muxed;
-            extension = "mp4";
-            console.info("[media-downloader] muxed adaptive tracks", bytes.byteLength, "bytes");
-          } else {
-            if (videoBytes.value.byteLength + audioBytes.value.byteLength > MAX_FFMPEG_INPUT_BYTES) {
-              return err("rendition is too large for in-browser FFmpeg (2 GiB heap); pick a lower quality");
+          const muxed = muxFragmentedMp4(videoBytes.value, audioBytes.value);
+          if (!muxed) return err("audio/video muxing: inputs are not fragmented MP4");
+          if (muxed.byteLength < MIN_OUTPUT_BYTES) return err(`muxed output too small (${muxed.byteLength} bytes)`);
+          bytes = muxed;
+          extension = "mp4";
+          console.info("[media-downloader] muxed adaptive tracks", bytes.byteLength, "bytes");
+        } else if (target === "mp3") {
+          const audioStaged = await this.stageSourceTrack(
+            root,
+            plan.url_audio,
+            headers,
+            signal,
+            `${plan.download_id}-audio`,
+          );
+          if (audioStaged.tag === "Err") return audioStaged;
+          try {
+            if (audioStaged.value.totalBytes < MIN_OUTPUT_BYTES) {
+              return err(`audio track too small (${audioStaged.value.totalBytes} bytes)`);
             }
+            this.emitProgress(plan.download_id, { status: "finalizing" });
+            const extracted = await this.runFfmpeg({
+              inputs: [{ name: audioStaged.value.filename, file: audioStaged.value.file }],
+              args: mp3Args(audioStaged.value.filename, "out.mp3"),
+              outputName: "out.mp3",
+            });
+            if (extracted.tag === "Err") return extracted;
+            bytes = extracted.value;
+            extension = "mp3";
+            console.info("[media-downloader] ffmpeg extracted mp3", bytes.byteLength, "bytes");
+          } finally {
+            await this.cleanupStagedTransfer(root, audioStaged.value);
+          }
+        } else {
+          const videoStaged = await this.stageSourceTrack(
+            root,
+            plan.url,
+            headers,
+            signal,
+            `${plan.download_id}-video`,
+          );
+          if (videoStaged.tag === "Err") return videoStaged;
+          const audioStaged = await this.stageSourceTrack(
+            root,
+            plan.url_audio,
+            headers,
+            signal,
+            `${plan.download_id}-audio`,
+          );
+          if (audioStaged.tag === "Err") {
+            await this.cleanupStagedTransfer(root, videoStaged.value);
+            return audioStaged;
+          }
+          try {
             const container = target === "webm" ? "webm" : target === "mkv" ? "mkv" : "mp4";
             const sourceIsWebm = (plan.source_demuxer ?? "") === "webm";
             if (container === "webm" && !sourceIsWebm) {
               return err("WebM output needs a WEBM quality; choose a WEBM rendition or keep Auto");
             }
             const outputName = `out.${container}`;
-            const runMerge = (transcode: boolean): Promise<Uint8Array> => {
-              const args = mergeArgs("video.bin", "audio.bin", outputName, container, transcode);
+            const runMerge = (transcode: boolean): Promise<Result<Uint8Array, string>> => {
+              const args = mergeArgs(
+                videoStaged.value.filename,
+                audioStaged.value.filename,
+                outputName,
+                container,
+                transcode,
+              );
               console.info(
                 "[media-downloader] ffmpeg merge",
                 container,
                 "video",
-                videoBytes.value.byteLength,
+                videoStaged.value.totalBytes,
                 "audio",
-                audioBytes.value.byteLength,
+                audioStaged.value.totalBytes,
                 args.join(" "),
               );
-              return ffmpeg.run({
+              return this.runFfmpeg({
                 inputs: [
-                  { name: "video.bin", bytes: videoBytes.value },
-                  { name: "audio.bin", bytes: audioBytes.value },
+                  { name: videoStaged.value.filename, file: videoStaged.value.file },
+                  { name: audioStaged.value.filename, file: audioStaged.value.file },
                 ],
                 args,
                 outputName,
@@ -482,77 +621,119 @@ export class DownloadWorker {
             if (container === "webm") {
               // Builder sends mixed WebM/AAC pairs to MKV; a WebM plan here should already be
               // VP8/VP9 + Opus/Vorbis, so copy both streams and never invoke libopus.
-              try {
-                bytes = await runMerge(false);
-              } catch (error) {
-                return err(`WebM mux failed; keep Auto to copy mixed audio into MKV: ${String(error)}`);
+              const merged = await runMerge(false);
+              if (merged.tag === "Err") {
+                return err(`WebM mux failed; keep Auto to copy mixed audio into MKV: ${merged.error}`);
               }
+              bytes = merged.value;
             } else {
-              try {
-                bytes = await runMerge(false);
-              } catch (error) {
+              const copied = await runMerge(false);
+              if (copied.tag === "Ok") {
+                bytes = copied.value;
+              } else {
                 // Copy can fail for mixed codec families; one transcode retry is cheaper than failing.
-                if (container === "mkv") return err(`ffmpeg merge failed: ${String(error)}`);
+                if (container === "mkv") return err(`ffmpeg merge failed: ${copied.error}`);
                 if ((duration ?? 0) > MAX_TRANSCODE_SECONDS) {
-                  return err(`ffmpeg merge failed and transcoding is limited to 3-minute clips: ${String(error)}`);
+                  return err(`ffmpeg merge failed and transcoding is limited to 3-minute clips: ${copied.error}`);
                 }
-                bytes = await runMerge(true);
+                const transcoded = await runMerge(true);
+                if (transcoded.tag === "Err") return transcoded;
+                bytes = transcoded.value;
               }
             }
             extension = container;
             console.info("[media-downloader] ffmpeg merged tracks", bytes.byteLength, "bytes", container);
+          } finally {
+            await this.cleanupStagedTransfer(root, videoStaged.value);
+            await this.cleanupStagedTransfer(root, audioStaged.value);
           }
         }
-      } else {
-      const videoAssembled = await this.assembleHls(plan, headers, signal);
-      if (videoAssembled.tag === "Err") return videoAssembled;
-      const audioPlan = { ...plan, url: plan.url_audio };
-      const audioAssembled = await this.assembleHls(audioPlan, headers, signal);
-      if (audioAssembled.tag === "Err") return audioAssembled;
-      const ffmpeg = this.deps.ffmpeg;
-      if (ffmpeg !== undefined) {
-        const container = plan.extension === "webm" ? "webm" : plan.extension === "mkv" ? "mkv" : "mp4";
-        const sourceDemuxer = plan.source_demuxer ?? videoAssembled.value.extension;
-        if (container === "webm" && sourceDemuxer !== "webm") {
-          return err("WebM output needs a WEBM HLS rendition; choose a WEBM quality or keep Auto");
-        }
-        const outputName = `out.${container}`;
-        this.emitProgress(plan.download_id, { status: "finalizing" });
-        bytes = await ffmpeg.run({
-          inputs: [
-            { name: "video.bin", bytes: videoAssembled.value.bytes },
-            { name: "audio.bin", bytes: audioAssembled.value.bytes },
-          ],
-          args: mergeArgs("video.bin", "audio.bin", outputName, container, false),
-          outputName,
-        });
-        extension = container;
-        console.info("[media-downloader] ffmpeg merged HLS tracks", bytes.byteLength, "bytes", container);
-      } else {
+      } else if (ffmpeg === undefined) {
+        // No FFmpeg: buffer both playlists and use the in-memory fMP4 muxer.
+        const videoAssembled = await this.assembleHls(plan, headers, signal);
+        if (videoAssembled.tag === "Err") return videoAssembled;
+        const audioPlan = { ...plan, url: plan.url_audio };
+        const audioAssembled = await this.assembleHls(audioPlan, headers, signal);
+        if (audioAssembled.tag === "Err") return audioAssembled;
         const muxed = muxFragmentedMp4(videoAssembled.value.bytes, audioAssembled.value.bytes);
         if (!muxed) return err("audio/video muxing: inputs are not fragmented MP4");
         bytes = muxed;
         extension = "mp4";
+        duration = videoAssembled.value.duration ?? duration;
         console.info("[media-downloader] muxed audio+video", bytes.byteLength, "bytes");
-      }
-      duration = videoAssembled.value.duration ?? duration;
+      } else {
+        // HLS with a separate audio rendition: stream both playlists into OPFS, then merge the
+        // staged files instead of buffering the complete video and audio first.
+        const streamBase = { root, downloadId: plan.download_id };
+        const videoAssembled = await this.assembleHls(plan, headers, signal, { ...streamBase, suffix: "-video" });
+        if (videoAssembled.tag === "Err") return videoAssembled;
+        const audioPlan = { ...plan, url: plan.url_audio };
+        const audioAssembled = await this.assembleHls(audioPlan, headers, signal, {
+          ...streamBase,
+          suffix: "-audio",
+        });
+        if (audioAssembled.tag === "Err") {
+          await videoAssembled.value.staged?.abort();
+          return audioAssembled;
+        }
+        const videoStaged = videoAssembled.value.staged;
+        const audioStaged = audioAssembled.value.staged;
+        if (videoStaged === undefined || audioStaged === undefined) {
+          await videoStaged?.abort();
+          await audioStaged?.abort();
+          return err("staging unavailable");
+        }
+        const videoFinished = await videoStaged.finish();
+        let audioFinished;
+        try {
+          audioFinished = await audioStaged.finish();
+        } catch (error) {
+          await this.cleanupStagedTransfer(root, videoFinished);
+          return err(String(error));
+        }
+        try {
+          const container = plan.extension === "webm" ? "webm" : plan.extension === "mkv" ? "mkv" : "mp4";
+          const sourceDemuxer = plan.source_demuxer ?? videoAssembled.value.extension;
+          if (container === "webm" && sourceDemuxer !== "webm") {
+            return err("WebM output needs a WEBM HLS rendition; choose a WEBM quality or keep Auto");
+          }
+          const outputName = `out.${container}`;
+          this.emitProgress(plan.download_id, { status: "finalizing" });
+          const merged = await this.runFfmpeg({
+            inputs: [
+              { name: videoFinished.filename, file: videoFinished.file },
+              { name: audioFinished.filename, file: audioFinished.file },
+            ],
+            args: mergeArgs(videoFinished.filename, audioFinished.filename, outputName, container, false),
+            outputName,
+          });
+          if (merged.tag === "Err") return merged;
+          bytes = merged.value;
+          extension = container;
+          console.info("[media-downloader] ffmpeg merged HLS tracks", bytes.byteLength, "bytes", container);
+        } finally {
+          await this.cleanupStagedTransfer(root, videoFinished);
+          await this.cleanupStagedTransfer(root, audioFinished);
+        }
+        duration = videoAssembled.value.duration ?? duration;
       }
     } else if (isHlsStrategy(plan.strategy)) {
-      const stream = plan.output_format === undefined || plan.output_format === "mp4"
-        ? { root, downloadId: plan.download_id }
-        : undefined;
-      const assembled = await this.assembleHls(plan, headers, signal, stream);
+      // Always stage the assembled playlist: plain saves hand the file on untouched, and the
+      // conversion/remux paths read a WORKERFS-mounted File instead of buffering the media.
+      const assembled = await this.assembleHls(plan, headers, signal, { root, downloadId: plan.download_id });
       if (assembled.tag === "Err") return assembled;
       duration = assembled.value.duration ?? duration;
       extension = assembled.value.extension;
       const staged = assembled.value.staged;
-      const shouldRemux = extension === "m2ts" && plan.output_format === "mp4";
+      const requestedFormat = plan.output_format;
+      const shouldRemux = extension === "m2ts" && requestedFormat === "mp4";
+      const needsConversion = requestedFormat !== undefined && extension !== requestedFormat;
       if (shouldRemux && this.deps.ffmpeg === undefined) {
         await staged?.abort();
         return err("MP4 conversion requires FFmpeg. Choose M2TS to keep the original stream.");
       }
       const finished = staged !== undefined ? await staged.finish() : undefined;
-      if (finished !== undefined && !shouldRemux) {
+      if (finished !== undefined && !shouldRemux && !needsConversion) {
         this.emitProgress(plan.download_id, {
           status: "finalizing",
           fetched_bytes_count: assembled.value.totalBytes,
@@ -570,146 +751,119 @@ export class DownloadWorker {
           },
         } as TransferOutcome);
       }
-
-      if (!shouldRemux || finished === undefined) {
-        bytes = finished !== undefined
-          ? new Uint8Array(await finished.file.arrayBuffer())
-          : assembled.value.bytes;
-      }
-      // WORKERFS reads a staged File directly, so large inputs do not fill FFmpeg's memory filesystem.
       if (shouldRemux) {
+        if (finished === undefined) bytes = assembled.value.bytes;
         try {
-          const remuxed = await this.deps.ffmpeg?.run({
-            inputs: [{ name: "input.m2ts", ...(finished !== undefined ? { file: finished.file } : { bytes }) }],
-            args: ["-hide_banner", "-y", "-i", "input.m2ts", "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
+          const inputName = finished !== undefined ? finished.filename : "input.m2ts";
+          const remuxed = await this.runFfmpeg({
+            inputs: [finished !== undefined ? { name: inputName, file: finished.file } : { name: inputName, bytes }],
+            args: ["-hide_banner", "-y", "-i", inputName, "-map", "0", "-c", "copy", "-movflags", "+faststart", "output.mp4"],
             outputName: "output.mp4",
           });
-          if (remuxed === undefined || remuxed.byteLength < MIN_OUTPUT_BYTES) {
-            throw new Error("FFmpeg produced an empty MP4");
-          }
-          bytes = remuxed;
+          if (remuxed.tag === "Err") throw new Error(remuxed.error);
+          if (remuxed.value.byteLength < MIN_OUTPUT_BYTES) throw new Error("FFmpeg produced an empty MP4");
+          bytes = remuxed.value;
           extension = "mp4";
           console.info("[media-downloader] remuxed HLS TS to mp4", bytes.byteLength, "bytes");
         } catch (error) {
-          if (finished !== undefined) {
-            URL.revokeObjectURL(finished.blobUrl);
-            await removeStagedFile(root, finished.filename).catch(() => undefined);
-          }
           return err(`MP4 remux failed: ${String(error)}`);
+        } finally {
+          if (finished !== undefined) await this.cleanupStagedTransfer(root, finished);
         }
+      } else if (needsConversion && finished !== undefined) {
+        // Keep the staged File for the conversion step; it is cleaned up after the job.
+        conversionInput = {
+          name: finished.filename,
+          file: finished.file,
+          filename: finished.filename,
+          blobUrl: finished.blobUrl,
+          totalBytes: assembled.value.totalBytes,
+          cleanup: () => this.cleanupStagedTransfer(root, finished),
+        };
+      } else {
+        if (finished !== undefined) await this.cleanupStagedTransfer(root, finished);
+        bytes = assembled.value.bytes;
       }
-      if (finished !== undefined) {
-        if (extension === "m2ts") {
-          return ok({
-            download_id: plan.download_id,
-            internal_filename: finished.filename,
-            internal_bloburl: finished.blobUrl,
-            output_extension: extension,
-            ending_reason: {
-              user_abort: false,
-              e4XX_5XX_failure: false,
-              percentage_incomplete: false,
-              other_failure: false,
-            },
-          } as TransferOutcome);
-        }
-        URL.revokeObjectURL(finished.blobUrl);
-        await removeStagedFile(root, finished.filename).catch(() => undefined);
-      }
-    } else if (plan.output_format === undefined) {
+    } else if (plan.output_format === undefined || plan.output_format === extension) {
       return this.streamDirect(root, plan, headers, extension, signal);
-    } else if (isRangeBoundCdn(plan.url)) {
-      // googlevideo rejects plain GETs and open-ended ranges; the player itself uses bounded
-      // byte ranges, so download the file as sequential 2 MiB chunks (live probe evidence).
-      const ranged = await fetchRanged(this.deps.fetchImpl, plan.url, headers, {
-        signal,
-        onBytes: (fetched) => {
-          this.emitProgress(plan.download_id, {
-            status: "downloading",
-            fetched_bytes_count: fetched,
-          });
-        },
-      });
-      if (ranged.tag === "Err") {
-        const status = ranged.error.status !== undefined ? ` ${ranged.error.status}` : "";
-        const detail = `ranged ${ranged.error.kind}${status}: ${ranged.error.message ?? "download failed"} headers=[${[...headers.keys()].join(",")}] chunk=${RANGE_CHUNK_BYTES} (${plan.url.href})`;
-        console.warn("[media-downloader] ranged transfer failed", detail);
-        return err(detail);
-      }
-      bytes = ranged.value.bytes;
-      if (bytes.byteLength < MIN_OUTPUT_BYTES) {
-        const detail = `direct response too small (${bytes.byteLength} bytes)`;
-        console.warn("[media-downloader] direct transfer failed", detail, plan.url.href);
-        return err(detail);
-      }
-      console.info("[media-downloader] ranged transfer ok", bytes.byteLength, "bytes", plan.url.href);
     } else {
-      const directUrl = plan.url.href;
-      let fetched = await fetchBytes(this.deps.fetchImpl, directUrl, { headers }, { signal });
-      // Some CDNs (notably googlevideo) reject plain GETs and expect a byte range.
-      if (
-        fetched.tag === "Err" &&
-        fetched.error.kind === "http" &&
-        [400, 401, 403, 416].includes(fetched.error.status ?? 0)
-      ) {
-        console.info("[media-downloader] retrying direct request with Range: bytes=0-", directUrl);
-        fetched = await fetchBytes(
-          this.deps.fetchImpl,
-          directUrl,
-          { headers, range: "bytes=0-" },
-          { signal },
-        );
+      // Conversion requested: stage the source, then hand FFmpeg the mounted File so the whole
+      // download never has to sit in memory as a byte array.
+      const staged = await this.stageDirectTransfer(root, plan, headers, extension, signal);
+      if (staged.tag === "Err") return staged;
+      extension = staged.value.extension;
+      if (plan.output_format === extension) {
+        this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: staged.value.totalBytes });
+        return ok({
+          download_id: plan.download_id,
+          internal_filename: staged.value.filename,
+          internal_bloburl: staged.value.blobUrl,
+          output_extension: extension,
+          ending_reason: {
+            user_abort: false,
+            e4XX_5XX_failure: false,
+            percentage_incomplete: false,
+            other_failure: false,
+          },
+        } as TransferOutcome);
       }
-      if (fetched.tag === "Err") {
-        const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
-        const detail = `${fetched.error.kind}${status}: ${fetched.error.message ?? "download failed"} (${plan.url.href})`;
-        console.warn("[media-downloader] direct transfer failed", detail);
-        return err(detail);
-      }
-      bytes = fetched.value.bytes;
-      // A tiny 200 response is an error page, not media (live: a 31-byte body was saved).
-      if (bytes.byteLength < MIN_OUTPUT_BYTES) {
-        const detail = `direct response too small (${bytes.byteLength} bytes)`;
-        console.warn("[media-downloader] direct transfer failed", detail, directUrl);
-        return err(detail);
-      }
-      console.info("[media-downloader] direct transfer ok", bytes.byteLength, "bytes", directUrl);
+      conversionInput = {
+        name: staged.value.filename,
+        file: staged.value.file,
+        filename: staged.value.filename,
+        blobUrl: staged.value.blobUrl,
+        totalBytes: staged.value.totalBytes,
+        cleanup: () => this.cleanupStagedTransfer(root, staged.value),
+      };
     }
 
     const requestedFormat = plan.output_format;
     if (requestedFormat !== undefined && extension !== requestedFormat) {
       const ffmpeg = this.deps.ffmpeg;
       if (ffmpeg === undefined) {
+        await conversionInput?.cleanup();
         return err(`ffmpeg unavailable: cannot convert ${extension} to ${requestedFormat}`);
       }
-      const inputName = `input.${extension.length > 0 ? extension : "bin"}`;
+      const inputName = conversionInput?.name ?? `input.${extension.length > 0 ? extension : "bin"}`;
       const outputName = `output.${requestedFormat}`;
+      const inputs = conversionInput !== undefined
+        ? [{ name: inputName, file: conversionInput.file }]
+        : [{ name: inputName, bytes }];
       this.emitProgress(plan.download_id, { status: "finalizing" });
-      if (requestedFormat === "mp3") {
-        bytes = await ffmpeg.run({
-          inputs: [{ name: inputName, bytes }],
-          args: mp3Args(inputName, outputName),
-          outputName,
-        });
-      } else {
-        const sourceIsWebm = (plan.source_demuxer ?? extension) === "webm";
-        if (requestedFormat === "webm" && !sourceIsWebm) {
-          return err("WebM output needs a WEBM source; choose a WEBM quality or keep Auto");
+      try {
+        if (requestedFormat === "mp3") {
+          const converted = await this.runFfmpeg({
+            inputs,
+            args: mp3Args(inputName, outputName),
+            outputName,
+          });
+          if (converted.tag === "Err") return converted;
+          bytes = converted.value;
+        } else {
+          const sourceIsWebm = (plan.source_demuxer ?? extension) === "webm";
+          if (requestedFormat === "webm" && !sourceIsWebm) {
+            return err("WebM output needs a WEBM source; choose a WEBM quality or keep Auto");
+          }
+          const transcode =
+            requestedFormat === "webm"
+              ? false
+              : requestedFormat === "mp4"
+                ? extension !== "mp4"
+                : false;
+          if (transcode && (duration ?? 0) > MAX_TRANSCODE_SECONDS) {
+            return err(`converting ${extension} to ${requestedFormat} is limited to 3-minute clips in the browser`);
+          }
+          const converted = await this.runFfmpeg({
+            inputs,
+            args: convertArgs(inputName, outputName, requestedFormat, transcode),
+            outputName,
+          });
+          if (converted.tag === "Err") return converted;
+          bytes = converted.value;
         }
-        const transcode =
-          requestedFormat === "webm"
-            ? false
-            : requestedFormat === "mp4"
-              ? extension !== "mp4"
-              : false;
-        if (transcode && (duration ?? 0) > MAX_TRANSCODE_SECONDS) {
-          return err(`converting ${extension} to ${requestedFormat} is limited to 3-minute clips in the browser`);
-        }
-        bytes = await ffmpeg.run({
-          inputs: [{ name: inputName, bytes }],
-          args: convertArgs(inputName, outputName, requestedFormat, transcode),
-          outputName,
-        });
+      } finally {
+        await conversionInput?.cleanup();
+        conversionInput = undefined;
       }
       extension = requestedFormat;
       console.info("[media-downloader] ffmpeg converted output", bytes.byteLength, "bytes", extension);
@@ -755,7 +909,7 @@ export class DownloadWorker {
     plan: DownloadPlan,
     headers: Headers,
     signal?: AbortSignal,
-    stream?: { root: OpfsRoot; downloadId: string },
+    stream?: { root: OpfsRoot; downloadId: string; suffix?: string },
   ): Promise<Result<{
     bytes: Uint8Array;
     extension: string;
@@ -829,7 +983,7 @@ export class DownloadWorker {
     const extension = initSegment ? plan.extension || "mp4" : "m2ts";
     const staged = stream === undefined
       ? undefined
-      : await createStagedFile(stream.root, `${stream.downloadId}.${extension}`);
+      : await createStagedFile(stream.root, `${stream.downloadId}${stream.suffix ?? ""}.${extension}`);
     const concurrency = plan.throttle ? THROTTLED_SEGMENT_CONCURRENCY : SEGMENT_CONCURRENCY;
     const chunks: Array<Uint8Array | null | undefined> = new Array(annotatedDescriptors.length);
     let fetchedBytes = 0;

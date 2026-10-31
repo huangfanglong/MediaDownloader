@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { convertArgs, FfmpegRunner, mergeArgs, mp3Args, type FfmpegJob } from "../src/transfer/ffmpeg.js";
+import {
+  convertArgs,
+  FfmpegInputTooLargeError,
+  FfmpegRunner,
+  MAX_FFMPEG_BYTE_INPUT_BYTES,
+  mergeArgs,
+  mp3Args,
+  type FfmpegJob,
+} from "../src/transfer/ffmpeg.js";
 
 const ffmpegState = vi.hoisted(() => ({
   active: 0,
@@ -138,6 +146,55 @@ describe("ffmpeg job scheduling", () => {
 
     await expect(runner.run(job)).rejects.toThrow("ffmpeg exited with 1");
     await expect(runner.run(job)).resolves.toEqual(new Uint8Array([1]));
+  });
+});
+
+describe("ffmpeg byte-input budget", () => {
+  it("rejects byte inputs above the configured budget before the core runs", async () => {
+    ffmpegState.writes.length = 0;
+    ffmpegState.mounts.length = 0;
+    ffmpegState.execArgs.length = 0;
+    const runner = new FfmpegRunner("https://extension.test/vendor/", undefined, 16);
+    const job: FfmpegJob = {
+      inputs: [{ name: "in.bin", bytes: new Uint8Array(17) }],
+      args: ["-i", "in.bin", "out.mp4"],
+      outputName: "out.mp4",
+    };
+
+    await expect(runner.run(job)).rejects.toBeInstanceOf(FfmpegInputTooLargeError);
+    expect(ffmpegState.writes).toHaveLength(0);
+    expect(ffmpegState.execArgs).toHaveLength(0);
+  });
+
+  it("accepts byte inputs exactly at the budget", async () => {
+    const runner = new FfmpegRunner("https://extension.test/vendor/", undefined, 16);
+    const job: FfmpegJob = {
+      inputs: [{ name: "in.bin", bytes: new Uint8Array(16) }],
+      args: ["-i", "in.bin", "out.mp4"],
+      outputName: "out.mp4",
+    };
+
+    await expect(runner.run(job)).resolves.toEqual(new Uint8Array([1]));
+  });
+
+  it("does not count WORKERFS file inputs against the byte budget", async () => {
+    ffmpegState.writes.length = 0;
+    ffmpegState.mounts.length = 0;
+    const runner = new FfmpegRunner("https://extension.test/vendor/", undefined, 1);
+    const file = new File([new Uint8Array(4096)], "big.m2ts");
+    const job: FfmpegJob = {
+      inputs: [{ name: "big.m2ts", file }],
+      args: ["-i", "big.m2ts", "out.mp4"],
+      outputName: "out.mp4",
+    };
+
+    await expect(runner.run(job)).resolves.toEqual(new Uint8Array([1]));
+    expect(ffmpegState.writes).toHaveLength(0);
+    expect(ffmpegState.mounts).toHaveLength(1);
+  });
+
+  it("keeps the default budget at 600 MiB for byte inputs", () => {
+    expect(MAX_FFMPEG_BYTE_INPUT_BYTES).toBe(600 * 1024 * 1024);
   });
 });
 

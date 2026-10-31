@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { muxFragmentedMp4, readBoxes } from "../src/transfer/mux-fmp4.js";
+import { FfmpegInputTooLargeError } from "../src/transfer/ffmpeg.js";
 import { DownloadWorker } from "../src/extension/download-worker.js";
 import type { DownloadPlan } from "../src/core/types.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
@@ -196,6 +197,14 @@ describe("worker ffmpeg outputs", () => {
     expect(ffmpeg.jobs).toHaveLength(1);
     expect(ffmpeg.jobs[0]?.outputName).toBe("out.mkv");
     expect(ffmpeg.jobs[0]?.args).toContain("-c");
+    // Root fix: both tracks are staged files mounted through WORKERFS, not byte arrays.
+    expect(ffmpeg.jobs[0]?.inputs).toHaveLength(2);
+    for (const input of ffmpeg.jobs[0]?.inputs ?? []) {
+      expect(input.file).toBeInstanceOf(File);
+      expect(input.bytes).toBeUndefined();
+    }
+    expect(files.has("download_mkv-video.bin")).toBe(false);
+    expect(files.has("download_mkv-audio.bin")).toBe(false);
     const staged = [...(files.get("download_mkv.mkv") ?? [])];
     expect(staged.reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(2048);
   });
@@ -242,6 +251,44 @@ describe("worker ffmpeg outputs", () => {
     expect(ffmpeg.jobs[0]?.args).toContain("libmp3lame");
     expect([...(files.get("download_mp3.mp3") ?? [])].reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(2048);
   });
+  it("reports audio extraction unsupported when ffmpeg is unavailable", async () => {
+    const { root } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      } as unknown as BroadcastChannelLike,
+      fetchImpl: (async () => {
+        throw new Error("audio extraction without ffmpeg must not fetch tracks");
+      }) as never,
+      openRoot: async () => root,
+    });
+    const plan = {
+      download_id: "download_mp3_no_ffmpeg",
+      headers: new Headers(),
+      good_basename: "mp3",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: true,
+      strategy: "http_audio_video_two_sources_jsfetch",
+      url: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=137"),
+      url_audio: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=140"),
+      carry_get_params: false,
+      extension: "mp3",
+      muxer: "mp3",
+      source_demuxer: "mp4",
+      is_youtube: true,
+      throttle: false,
+      cache: "default",
+    } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/ffmpeg unavailable: audio extraction/iu);
+  });
 });
 
 describe("single-source FFmpeg conversion", () => {
@@ -283,6 +330,9 @@ describe("single-source FFmpeg conversion", () => {
     if (result.tag === "Ok") expect(result.value.output_extension).toBe("mp3");
     expect(ffmpeg.jobs).toHaveLength(1);
     expect(ffmpeg.jobs[0]?.args).toContain("libmp3lame");
+    expect(ffmpeg.jobs[0]?.inputs[0]?.file).toBeInstanceOf(File);
+    expect(ffmpeg.jobs[0]?.inputs[0]?.bytes).toBeUndefined();
+    expect(files.has("download_convert.mp4")).toBe(false);
     const staged = [...(files.get("download_convert.mp3") ?? [])];
     expect(staged.reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(2048);
   });
@@ -366,8 +416,156 @@ describe("HLS TS output formats", () => {
   });
 });
 
-describe("webm copy merge", () => {
-  it("stream-copies VP9/Opus tracks into WebM without transcoding", async () => {
+describe("ffmpeg inputs are staged files", () => {
+  const channel = {
+    postMessage: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    close: () => undefined,
+  } as unknown as BroadcastChannelLike;
+  const hlsMedia = (prefix: string): string =>
+    `#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n${prefix}0.ts\n#EXTINF:4,\n${prefix}1.ts\n#EXT-X-ENDLIST\n`;
+
+  it("merges separate HLS audio and video renditions from mounted files", async () => {
+    const payloads = new Map<string, string | Uint8Array>([
+      ["https://cdn.test/video.m3u8", hlsMedia("v")],
+      ["https://cdn.test/audio.m3u8", hlsMedia("a")],
+      ["https://cdn.test/v0.ts", new Uint8Array(600).fill(1)],
+      ["https://cdn.test/v1.ts", new Uint8Array(600).fill(2)],
+      ["https://cdn.test/a0.ts", new Uint8Array(600).fill(3)],
+      ["https://cdn.test/a1.ts", new Uint8Array(600).fill(4)],
+    ]);
+    const { root, files } = createFakeOpfs();
+    const ffmpeg = fakeFfmpeg();
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+      ffmpeg: ffmpeg.runner,
+    });
+    const plan: DownloadPlan = {
+      download_id: "download_hls_two",
+      headers: new Headers(),
+      good_basename: "two",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: true,
+      strategy: "m3u8_audio_video_two_sources",
+      url: new URL("https://cdn.test/video.m3u8"),
+      url_audio: new URL("https://cdn.test/audio.m3u8"),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      source_demuxer: "mp4",
+      is_youtube: false,
+      throttle: false,
+      cache: "default",
+    };
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    if (result.tag === "Ok") expect(result.value.output_extension).toBe("mp4");
+    expect(ffmpeg.jobs).toHaveLength(1);
+    const inputs = ffmpeg.jobs[0]?.inputs ?? [];
+    expect(inputs).toHaveLength(2);
+    for (const input of inputs) {
+      expect(input.file).toBeInstanceOf(File);
+      expect(input.bytes).toBeUndefined();
+    }
+    // The two staged tracks are temporary; the merged output is what remains.
+    expect(files.has("download_hls_two-video.m2ts")).toBe(false);
+    expect(files.has("download_hls_two-audio.m2ts")).toBe(false);
+    const output = [...(files.get("download_hls_two.mp4") ?? [])];
+    expect(output.reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(2048);
+  });
+
+  it("converts an HLS stream from its mounted file instead of buffering it", async () => {
+    const payloads = new Map<string, string | Uint8Array>([
+      ["https://cdn.test/media.m3u8", hlsMedia("m")],
+      ["https://cdn.test/m0.ts", new Uint8Array(600).fill(1)],
+      ["https://cdn.test/m1.ts", new Uint8Array(600).fill(2)],
+    ]);
+    const { root, files } = createFakeOpfs();
+    const ffmpeg = fakeFfmpeg();
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+      ffmpeg: ffmpeg.runner,
+    });
+    const plan = {
+      download_id: "download_hls_convert",
+      headers: new Headers(),
+      good_basename: "convert",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: true,
+      strategy: "m3u8_audio_video_one_source",
+      url: new URL("https://cdn.test/media.m3u8"),
+      carry_get_params: false,
+      extension: "mp3",
+      muxer: "mp3",
+      output_format: "mp3",
+      is_youtube: false,
+      throttle: false,
+      cache: "default",
+    } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    if (result.tag === "Ok") expect(result.value.output_extension).toBe("mp3");
+    expect(ffmpeg.jobs).toHaveLength(1);
+    expect(ffmpeg.jobs[0]?.inputs[0]?.file).toBeInstanceOf(File);
+    expect(ffmpeg.jobs[0]?.inputs[0]?.bytes).toBeUndefined();
+    expect(files.has("download_hls_convert.m2ts")).toBe(false);
+    expect(files.has("download_hls_convert.mp3")).toBe(true);
+  });
+
+  it("surfaces the byte-input budget as a normal download error", async () => {
+    const source = new Uint8Array(4096).fill(7);
+    const { root, files } = createFakeOpfs();
+    const runner = {
+      run: async (): Promise<Uint8Array> => {
+        throw new FfmpegInputTooLargeError(700 * 1024 * 1024, 600 * 1024 * 1024);
+      },
+    };
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: (async () => new Response(source)) as never,
+      openRoot: async () => root,
+      ffmpeg: runner,
+    });
+    const plan = {
+      download_id: "download_budget",
+      headers: new Headers(),
+      good_basename: "budget",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "http_audio_video_one_source",
+      url: new URL("https://cdn.test/clip.mp4"),
+      carry_get_params: false,
+      extension: "mp3",
+      muxer: "mp3",
+      source_demuxer: "mp4",
+      output_format: "mp3",
+      is_youtube: false,
+      throttle: false,
+      cache: "default",
+    } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/too large to process in the browser/iu);
+    // The staged source is cleaned up even when the job is rejected.
+    expect(files.has("download_budget.mp4")).toBe(false);
+  });
+});
+
+describe("webm copy merge", () => {  it("stream-copies VP9/Opus tracks into WebM without transcoding", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);
     const audio = fragmentedTrack(1, [0, 1024, 2048]);
     const videoUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=248&clen=${video.byteLength}`;

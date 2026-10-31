@@ -26,6 +26,32 @@ export interface FfmpegRunnerLike {
   run(job: FfmpegJob): Promise<Uint8Array>;
 }
 
+/**
+ * Default budget for bytes that must be copied into FFmpeg's memory filesystem.
+ *
+ * Byte inputs are resident roughly twice while they cross the worker boundary and land in
+ * MEMFS, so a byte-input job peaks at roughly three times its combined input size (measured
+ * against the shipped core: 620 MiB in → ~1.9 GiB peak; 1241 MiB in → ~3.85 GiB peak).
+ * 600 MiB keeps that peak near 1.9 GiB, which a browser worker can still hold. File inputs
+ * are mounted through WORKERFS and are not counted. Tests inject a smaller budget.
+ *
+ * Staged inputs remove the input copy, but FFmpeg still writes its output to MEMFS and the
+ * wrapper copies that output back, so very large outputs remain output-memory bound. Streaming
+ * the output to OPFS is the next step; until then this budget stays the safety net.
+ */
+export const MAX_FFMPEG_BYTE_INPUT_BYTES = 600 * 1024 * 1024;
+
+/** Thrown before anything is handed to the wasm core when byte inputs exceed the budget. */
+export class FfmpegInputTooLargeError extends Error {
+  constructor(
+    readonly byteLength: number,
+    readonly limitBytes: number,
+  ) {
+    super("The downloaded media is too large to process in the browser; choose Auto or a lower quality");
+    this.name = "FfmpegInputTooLargeError";
+  }
+}
+
 /** ffmpeg args for merging a separate video + audio track into one container. */
 export function mergeArgs(
   videoName: string,
@@ -94,6 +120,7 @@ export class FfmpegRunner implements FfmpegRunnerLike {
   constructor(
     private readonly vendorBase: string = defaultVendorBase(),
     private readonly onLog?: (line: string) => void,
+    private readonly maxByteInputBytes: number = MAX_FFMPEG_BYTE_INPUT_BYTES,
   ) {}
 
   private async ensureLoaded(): Promise<FFmpeg> {
@@ -124,6 +151,13 @@ export class FfmpegRunner implements FfmpegRunnerLike {
   }
 
   private async runExclusive(job: FfmpegJob): Promise<Uint8Array> {
+    // Byte inputs are the only ones that occupy FFmpeg's memory filesystem; refuse an
+    // oversized job here so every caller gets the same budget, not just the paths that
+    // remembered to check.
+    const byteLength = job.inputs.reduce((total, input) => total + (input.bytes?.byteLength ?? 0), 0);
+    if (byteLength > this.maxByteInputBytes) {
+      throw new FfmpegInputTooLargeError(byteLength, this.maxByteInputBytes);
+    }
     const ffmpeg = await this.ensureLoaded();
     const fileInputs = job.inputs.filter(
       (input): input is Extract<FfmpegInput, { file: File }> => input.file !== undefined,
