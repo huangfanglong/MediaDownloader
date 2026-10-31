@@ -1272,7 +1272,11 @@ export class MediaDownloaderService {
       if (deadline !== undefined) clearTimeout(deadline);
       await this.headerReplay.remove(ruleIds);
     }
-    if (failure !== undefined) {
+
+    // detect user abort
+    const isUserAbort = failure === "user_abort" || outcome?.ending_reason?.user_abort === true;
+
+    if (failure !== undefined && !isUserAbort) {
       const retryThroughPage =
         meta.tab_id !== undefined &&
         (plan.is_youtube || /http (401|403|416)/u.test(failure));
@@ -1285,6 +1289,16 @@ export class MediaDownloaderService {
         return { tag: "Err", error: failure };
       }
     }
+
+    // user abort is not an error
+    if (isUserAbort) {
+      return { tag: "Ok", value: {
+        download_id: plan.download_id,
+        ending_reason: userAbortReason(),
+        aborted_no_partial: true,
+      } as TransferOutcome };
+    }
+
     if (outcome === undefined) return { tag: "Err", error: "transfer produced no outcome" };
     if (outcome.aborted_no_partial) return { tag: "Ok", value: outcome };
     if (!outcome.internal_bloburl) return { tag: "Err", error: "No blob provided" };

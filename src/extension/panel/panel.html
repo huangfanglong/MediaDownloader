@@ -122,6 +122,17 @@
         cursor: pointer;
       }
       button:disabled { opacity: 0.55; cursor: default; }
+      button.cancel-button {
+        margin-left: auto;
+        font-size: 11.5px;
+        padding: 4px 10px;
+        background: var(--border);
+        color: var(--text);
+      }
+      button.cancel-button:hover {
+        background: #e03131;
+        color: #fff;
+      }
       #empty { padding: 22px 14px; color: var(--muted); text-align: center; }
 
       /* Refined bottom status bar: phase label, detail and a slim progress track. */
@@ -205,6 +216,7 @@
         <span class="status-dot" aria-hidden="true"></span>
         <span class="status-label" id="status-label">Ready</span>
         <span class="status-detail" id="status-detail"></span>
+        <button type="button" id="cancel-button" class="cancel-button" hidden>Cancel</button>
       </div>
       <div class="status-track" id="status-track" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100" hidden>
         <div class="status-fill" id="status-fill"></div>

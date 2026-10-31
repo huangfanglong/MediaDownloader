@@ -58,6 +58,7 @@ const statusDetail = document.getElementById("status-detail");
 const statusTrack = document.getElementById("status-track");
 const statusFill = document.getElementById("status-fill");
 const pageTitle = document.getElementById("page-title");
+const cancelButton = document.getElementById("cancel-button") as HTMLButtonElement | null;
 
 /** Per-media select values survive a row rebuild (quality / format). */
 const SELECTIONS = new Map<string, { quality: string; format: string; source: string }>();
@@ -459,11 +460,16 @@ function renderRows(snapshot: PanelSnapshot): void {
 }
 
 function renderStatus(snapshot: PanelSnapshot): void {
-  if (!statusLine || !statusLabel || !statusDetail || !statusTrack || !statusFill) return;
+  if (!statusLine || !statusLabel || !statusDetail || !statusTrack || !statusFill || !cancelButton) return;
   const presentation = statusPresentation(snapshot.downloading, snapshot.notifications);
   statusLine.dataset.tone = presentation.tone;
   statusLabel.textContent = presentation.label;
   statusDetail.textContent = presentation.detail ?? "";
+
+  // show cancel button when downloads are in progress
+  const hasActiveDownloads = snapshot.downloading.length > 0;
+  cancelButton.hidden = !hasActiveDownloads;
+
   if (presentation.percent !== undefined) {
     statusTrack.hidden = false;
     statusTrack.setAttribute("aria-valuenow", String(presentation.percent));
@@ -616,6 +622,17 @@ function render(snapshot: PanelSnapshot): void {
 list?.addEventListener("focusout", () => {
   // Native dropdown closed: apply any snapshot that arrived while it was open.
   setTimeout(flushPending, 0);
+});
+
+// cancel button handler
+cancelButton?.addEventListener("click", () => {
+  if (!lastSnapshot) return;
+  // Cancel all active downloads
+  for (const download of lastSnapshot.downloading) {
+    send(MSG.contentToService.AbortDownload, { download_id: download.download_id });
+  }
+  // Immediately hide the button to prevent double-clicks
+  if (cancelButton) cancelButton.hidden = true;
 });
 
 runtime?.onMessage.addListener((message: unknown) => {

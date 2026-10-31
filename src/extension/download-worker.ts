@@ -764,7 +764,10 @@ export class DownloadWorker {
     totalBytes: number;
   }, string>> {
     const playlistResult = await this.fetchPlaylistText(plan.url.href, headers, signal);
-    if (playlistResult.tag === "Err") return playlistResult;
+    if (playlistResult.tag === "Err") {
+      // treat "aborted" as user_abort
+      return err(playlistResult.error === "aborted" ? "user_abort" : playlistResult.error);
+    }
     let parsed = parsePlaylist(playlistResult.value, plan.url);
     if (parsed.kind === "invalid") return err(parsed.reason);
 
@@ -850,6 +853,11 @@ export class DownloadWorker {
 
     const worker = async (): Promise<void> => {
       for (;;) {
+        // Check for abort before fetching next segment
+        if (signal?.aborted) {
+          return;
+        }
+
         const index = nextIndex();
         if (index === undefined) return;
         const descriptor = annotatedDescriptors[index];
@@ -896,7 +904,17 @@ export class DownloadWorker {
       await writeChain;
     } catch (error) {
       if (staged !== undefined) await staged.abort().catch(() => undefined);
+      // Check if error was due to abort
+      if (signal?.aborted) {
+        return err("user_abort");
+      }
       return err(String(error));
+    }
+
+    // Final abort check (detect late abort after loop completes)
+    if (signal?.aborted) {
+      if (staged !== undefined) await staged.abort().catch(() => undefined);
+      return err("user_abort");
     }
 
     if (isTooManyFailedSegments(failed, annotatedDescriptors.length) || fetchedBytes < 1_000) {
