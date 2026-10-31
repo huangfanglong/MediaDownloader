@@ -10,9 +10,12 @@
  *
  * A placeholder with no value is removed together with one preceding space, dash or underscore.
  * If the template ends up empty, the raw title / hostname is used. The result is sanitised, cut
- * to the rule's `max_length`, run through the rule's replacements, then sanitised and cut again.
+ * to the rule's `max_length`, run through the rule's replacements, then sanitised and cut again;
+ * the final basename is repaired into Chrome's portable filename rules (reserved device names)
+ * by `safe-path.ts`.
  */
 import { sanitizeName } from "./sanitize.js";
+import { repairBasename } from "./safe-path.js";
 import type { MaterializedRule } from "./rules.js";
 
 export interface NameMediaLike {
@@ -93,6 +96,10 @@ export function renderBasename(
   basename = sanitizeName(basename).substring(0, rule.max_length);
   for (const replacement of rule.replace) basename = basename.replaceAll(replacement.from, replacement.to);
   basename = sanitizeName(basename).substring(0, rule.max_length);
+  // Truncation and replacement rules can turn a fine title into a reserved device name,
+  // which Chrome refuses at download time even with the media extension appended. Repair
+  // after the last cut, before the plan stores the basename.
+  basename = repairBasename(basename);
 
   return { basename, subdir: rule.subdir };
 }

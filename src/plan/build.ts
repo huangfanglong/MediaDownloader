@@ -14,11 +14,13 @@
  *    headers (the shipped builder round-trips them through the serde, svc:7176-7178).
  *
  * Naming is NOT reimplemented here: `renderBasename` from naming/render.ts owns basename and
- * subdirectory rendering, exactly as the shipped `Ar` did.
+ * subdirectory rendering, exactly as the shipped `Ar` did. The configured directory is run
+ * through `normalizeSubdir` so a path Chrome would refuse cannot reach a plan.
  */
 import { err, ok, type Result } from "../core/option.js";
 import type { DownloadPlan, MediaItem, TabMeta } from "../core/types.js";
 import { renderBasename } from "../naming/render.js";
+import { normalizeSubdir } from "../naming/safe-path.js";
 import {
   VIDEO_DEMUXERS,
   chooseStrategy,
@@ -82,7 +84,7 @@ function planBase(input: BuildPlanInput, downloadIdFactory: () => string): PlanB
     headers: new Headers(input.media.sent_headers),
     headers_origin: input.media.master_url?.origin ?? input.media.url?.origin ?? "",
     good_basename: rendered.basename,
-    subdir: rendered.subdir !== "" ? rendered.subdir : input.downloadDirectory,
+    subdir: normalizeSubdir(rendered.subdir !== "" ? rendered.subdir : input.downloadDirectory),
     save_as: input.saveAs ?? false,
     is_youtube: input.media.is_youtube,
     throttle: input.media.is_youtube && (input.youtubeThrottle ?? false),

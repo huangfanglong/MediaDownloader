@@ -69,6 +69,7 @@ import { createWorkerChannel, WorkerClient } from "./worker-client.js";
 import { openOpfsRoot, removeStagedFile, type OpfsRoot } from "./staging.js";
 import { detectPlatform, type PlatformProfile } from "./platform.js";
 import { loadSmartnaming, materializeRule, selectRule } from "../naming/rules.js";
+import { isSafePathComponent } from "../naming/safe-path.js";
 import { HeaderReplay, normalizeHeaderReplayUrl } from "./header-replay.js";
 import { ManifestEnrichment } from "./manifest-enrichment.js";
 import { TabHealing } from "./tab-healing.js";
@@ -1666,6 +1667,17 @@ export function validateDownloadPlan(plan: DownloadPlan): string | undefined {
     return "Unsafe filename";
   }
   if (/[\r\n\0]/u.test(basename)) return "Unsafe filename";
+  // Chrome validates the composed relative path with its portable filename rules before the
+  // download starts (and refuses it with "Invalid filename"). Checking here fails the download
+  // before the transfer instead of after it; names are normally repaired upstream, so this
+  // guards plans built by anything that bypasses the naming layer.
+  const composed = composeFilename(plan);
+  const composedSegments = composed.split("/");
+  const composedBasename = composedSegments.pop() ?? "";
+  if (!isSafePathComponent(composedBasename)) return "Unsafe filename";
+  if (composedSegments.some((segment) => segment.length > 0 && !isSafePathComponent(segment))) {
+    return "Unsafe download directory";
+  }
   return undefined;
 }
 

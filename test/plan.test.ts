@@ -309,6 +309,23 @@ describe("buildPlan — (a) HLS master with separate audio", () => {
     expect(plan.good_basename).toBe("Example Video");
     expect(plan.subdir).toBe("Downloads/Clips/");
   });
+
+  it("repairs a reserved device name in the rendered basename", () => {
+    const plan = expectOk(buildPlan(baseInput({ ...hlsMediaItem(), title: "CON" })));
+    expect(plan.good_basename).toBe("_CON");
+  });
+
+  it("normalises configured and rendered download directories", () => {
+    const meta = { ...tabMeta(), smartnaming_rule: { ...tabMeta().smartnaming_rule, subdir: "" } };
+    const configured = expectOk(
+      buildPlan(baseInput(hlsMediaItem(), { downloadDirectory: "CON/foo./", meta })),
+    );
+    expect(configured.subdir).toBe("_CON/foo/");
+    const rendered = expectOk(
+      buildPlan(baseInput(hlsMediaItem(), { meta: tabMeta({ ruleSubdir: "CON/" }) })),
+    );
+    expect(rendered.subdir).toBe("Downloads/_CON/");
+  });
 });
 
 describe("buildPlan — (b) HLS media-only playlist", () => {
@@ -466,6 +483,11 @@ describe("buildPreviewPlan", () => {
   it("HLS preview respects carry_get_params", () => {
     const plan = expectOk(buildPreviewPlan(hlsMasterItem(), { ...settings, carryGetParams: true }));
     expect(plan.will_use_jsfetch).toBe(false);
+  });
+
+  it("normalises a configured download directory Chrome would refuse", () => {
+    const plan = expectOk(buildPreviewPlan(hlsMasterItem(), { ...settings, downloadDirectory: "CON/" }));
+    expect(plan.subdir).toBe("_CON/");
   });
 
   it("MPD preview points at the master URL with the default rendition entry", () => {

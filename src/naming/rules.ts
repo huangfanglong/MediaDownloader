@@ -12,6 +12,7 @@
  *                 "selector": "#title h1", "directory": "YouTube/" } ] }
  */
 import { err, ok, type Result } from "../core/option.js";
+import { repairPathComponent } from "./safe-path.js";
 import { sanitizeName } from "./sanitize.js";
 
 export interface SmartnamingDefault {
@@ -73,18 +74,21 @@ export function defaultSmartnaming(): CompiledSmartnaming {
 /**
  * Validate a user-supplied download subdirectory.
  * Returns the normalised directory (always trailing slash) or an error string shown to the user.
+ * Segments Chrome would refuse are repaired (reserved device names get `_`, trailing dots and
+ * spaces are stripped) instead of rejected: a failed save after a full transfer is worse.
  */
 export function validateDirectory(input: string): Result<string, string> {
   let directory = input;
   if (directory === "") return ok("");
   if (directory.startsWith("/")) directory = directory.slice(1);
   if (directory.endsWith("/")) directory = directory.slice(0, -1);
-  for (const segment of directory.split("/")) {
+  const segments = directory.split("/");
+  for (const segment of segments) {
     if (sanitizeSegment(segment) !== segment) {
       return err('This not a valid path. Avoid special characters. Use "/" between directories.');
     }
   }
-  const joined = `${directory.split("/").join("/")}/`;
+  const joined = `${segments.map((segment) => repairPathComponent(segment)).join("/")}/`;
   if (joined.length > MAX_DIRECTORY_LENGTH) return err("Path too long");
   return ok(joined);
 }

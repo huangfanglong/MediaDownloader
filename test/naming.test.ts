@@ -60,6 +60,15 @@ describe("download directory validation (original `Uv`)", () => {
     expect(validateDirectory(input)).toEqual({ tag: "Ok", value: expected });
   });
 
+  it.each([
+    ["CON", "_CON/"],
+    ["nul/", "_nul/"],
+    ["foo.", "foo/"],
+    ["Clips/CON", "Clips/_CON/"],
+  ])("repairs directory segments Chrome would refuse in %j to %j", (input, expected) => {
+    expect(validateDirectory(input)).toEqual({ tag: "Ok", value: expected });
+  });
+
   it("rejects segments with characters the sanitiser would change", () => {
     const result = validateDirectory("Videos/a:b");
     expect(result.tag).toBe("Err");

@@ -21,6 +21,7 @@ import {
   type SubtitleTrack,
 } from "../core/types.js";
 import { DEMUXER_ORDER } from "../manifests/hls.js";
+import { normalizeSubdir } from "../naming/safe-path.js";
 
 /** Audio-only demuxers (`er`, svc:7272-7274). */
 export const AUDIO_ONLY_DEMUXERS: ReadonlySet<string> = new Set(["mp3", "m4a", "ogg"]);
@@ -251,7 +252,7 @@ export function buildPreviewPlan(
     download_id: downloadIdFactory(),
     headers: new Headers(item.sent_headers),
     good_basename: "unused",
-    subdir: settings.downloadDirectory,
+    subdir: normalizeSubdir(settings.downloadDirectory),
     save_as: settings.saveAs ?? false,
     is_youtube: item.is_youtube,
     throttle: false,
