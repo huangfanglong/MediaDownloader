@@ -6,7 +6,8 @@ playlists can be downloaded. DASH manifests are detected and shown with quality 
 DASH downloads are disabled until segment resolution is implemented. Tested on Brave Browser on
 Windows.
 
-  This was a half a day project built for fun entirely with DeepSeek-V4.1-Flash-1017 to test its capabilities.
+  This was a half a day project built for fun entirely with DeepSeek-V4.1-Flash-1017 to test its capabilities. 
+  Everything after around 1.0.3 releases were done by Kimi K3.1.
 
 ## Quick start
 

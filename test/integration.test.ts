@@ -145,6 +145,84 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     harness.service.stop();
   });
 
+  it("releases playback after a direct 429, retries once, and restores it after saving", async () => {
+    const directUrl = "https://files.test/connection-release.mp4?download_token=test";
+    const entries = fetchMapFor({ [directUrl]: "x".repeat(1200) });
+    const baseFetch = createFetch(entries);
+    let directAttempts = 0;
+    const fetchImpl: ReturnType<typeof createFetch> = async (url, init) => {
+      if (url === directUrl) {
+        directAttempts += 1;
+        if (directAttempts === 1) return { status: 429, ok: false, body: null };
+      }
+      return baseFetch(url, init);
+    };
+    const gateway = createFakeGateway("https://site.test/watch", entries);
+    const scripting = vi.spyOn(gateway.scripting, "executeInTab").mockImplementation(
+      async (_tabId, _func, _args, options) =>
+        (options?.world === "MAIN" ? 1 : { title: "Test Page", thumbnail: undefined }) as never,
+    );
+    const fetchSpy = vi.fn(fetchImpl);
+    const hub = new FakeChannelHub();
+    const opfs = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel: hub.endpoint("worker"),
+      fetchImpl: fetchSpy,
+      openRoot: async () => opfs.root,
+    });
+    worker.start();
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:connection-release");
+    const service = new MediaDownloaderService({
+      gateway,
+      fetchImpl: fetchSpy,
+      opfsRoot: async () => opfs.root,
+      downloadIdFactory: () => "download_connection_release",
+      now: () => 1_700_000_000_000,
+      workerClient: new WorkerClient({
+        channel: hub.endpoint("service"),
+        offscreen: gateway.offscreen,
+        offscreenUrl: "chrome-extension://fake/factory/factory.html",
+        readyTimeoutMs: 200,
+      }),
+    });
+    await service.start();
+    const direct = itemFromHint(
+      { url: directUrl, source: "resource-entry", kind: "file", referer: "https://site.test/watch" },
+      "https://site.test/watch",
+    ) as MediaItem;
+    await gateway.deliverToService({
+      msg: { name: MSG.injectedToService.OnMedia, data: { media: encode(direct) } },
+      channel: Channel.FromInjectedToService,
+    } as Envelope);
+
+    await gateway.deliverToService({
+      msg: { name: MSG.contentToService.DoDownload, data: { tab_id: 7, media_hash: direct.hash } },
+      channel: Channel.FromContentToService,
+    } as Envelope);
+
+    await vi.waitFor(() => {
+      expect(service.getSession().downloading.size).toBe(0);
+    }, { timeout: 2_000, interval: 10 });
+    const coordinationCalls = scripting.mock.calls.filter(
+      ([, , args, options]) => options?.world === "MAIN" && args[0] === directUrl,
+    );
+    const directFetchOrders = fetchSpy.mock.calls
+      .map((_, index) => index)
+      .filter((index) => fetchSpy.mock.calls[index]?.[0] === directUrl)
+      .map((index) => fetchSpy.mock.invocationCallOrder[index] as number);
+    expect(directAttempts).toBe(2);
+    expect(coordinationCalls).toHaveLength(2);
+    expect(directFetchOrders).toHaveLength(2);
+    const releaseOrder = scripting.mock.invocationCallOrder[scripting.mock.calls.indexOf(coordinationCalls[0]!)];
+    const restoreOrder = scripting.mock.invocationCallOrder[scripting.mock.calls.indexOf(coordinationCalls[1]!)];
+    expect(directFetchOrders[0]).toBeLessThan(releaseOrder as number);
+    expect(releaseOrder).toBeLessThan(directFetchOrders[1] as number);
+    expect(restoreOrder).toBeGreaterThan(directFetchOrders[1] as number);
+    expect(gateway.downloadRequestsLog).toHaveLength(1);
+    expect(gateway.downloadRequestsLog[0]?.url).toBe("blob:connection-release");
+    service.stop();
+  });
+
   it("keeps one enriched HLS row when the same manifest response repeats", async () => {
     const harness = createHarness({
       masterUrl: "https://cdn.test/repeat/master.m3u8",

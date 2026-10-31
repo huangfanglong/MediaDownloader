@@ -5,7 +5,7 @@
  * worker `Dt` (pretty 9466-9472; original bytes 199,958) and the embedded default ruleset
  * (`hb`, pretty 20830-20879; bytes ~493k). The flags are NOT local user settings: they are a
  * remote ruleset of `behaviour_hash_<cyrb53(FLAG)>` → `domain_hash_<cyrb53(hostname SLD)>`
- * pairs, refreshed at most once per day from `files.downloadhelper.net`.
+ * pairs, refreshed at most once per day from the configured remote ruleset endpoint.
  *
  * The `cyrb53` import is the shared implementation from `protocol/channels.ts` (Lead verified the
  * shipped seed constants; see that file's doc comment). Do not re-implement it here.

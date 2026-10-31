@@ -261,6 +261,7 @@ export interface ByteStreamReader {
 export interface FetchResponseLike {
   status: number;
   ok: boolean;
+  headers?: { get(name: string): string | null };
   body: { getReader(): ByteStreamReader } | null;
 }
 
@@ -282,6 +283,16 @@ export interface FetchBytesResult {
   status: number;
 }
 
+function responseTotalBytes(response: FetchResponseLike): number | undefined {
+  const contentRange = response.headers?.get("content-range");
+  const rawSize = contentRange === undefined || contentRange === null
+    ? response.headers?.get("content-length")
+    : /\/(\d+)\s*$/u.exec(contentRange)?.[1];
+  if (rawSize === undefined || rawSize === null) return undefined;
+  const size = Number(rawSize);
+  return Number.isSafeInteger(size) && size > 0 ? size : undefined;
+}
+
 export interface FetchBytesOptions {
   /** Body-read deadline; defaults to `BODY_READ_TIMEOUT_MS` (30 s, E12). */
   timeoutMs?: number;
@@ -291,6 +302,8 @@ export interface FetchBytesOptions {
   signal?: AbortSignal;
   /** Write chunks to a consumer instead of retaining and concatenating the complete body. */
   onChunk?: (chunk: Uint8Array) => void | Promise<void>;
+  /** Full response size from Content-Range or Content-Length, before body streaming begins. */
+  onTotalSize?: (totalBytes: number) => void;
 }
 
 /** Combine two optional abort signals without relying on `AbortSignal.any` (Node/browser parity). */
@@ -373,6 +386,9 @@ export async function fetchBytes(
   if (!response.ok)
     return err(otherError(`Unkown failure - status ${response.status}`));
   if (response.body === null) return err(otherError("No body"));
+
+  const totalBytes = responseTotalBytes(response);
+  if (totalBytes !== undefined) options.onTotalSize?.(totalBytes);
 
   const timeoutMs = options.timeoutMs ?? BODY_READ_TIMEOUT_MS;
   const reader = response.body.getReader();

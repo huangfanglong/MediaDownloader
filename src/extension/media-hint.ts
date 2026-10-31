@@ -53,7 +53,7 @@ export interface PageMediaHint {
   durationSeconds?: number;
   title?: string;
   referer?: string;
-  /** Poster/og:image/link-rel thumbnail for the media (VDH shows one per item). */
+  /** Poster/og:image/link-rel thumbnail for the media. */
   thumbnail?: string;
   /** Direct video track URL used for a hover preview when the item itself is a manifest. */
   preview?: string;

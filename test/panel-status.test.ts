@@ -35,6 +35,21 @@ describe("panel status presentation", () => {
     expect(finishing.tone).toBe("progress");
   });
 
+  it("shows downloaded bytes and live speed when the total is unknown", () => {
+    const active = statusPresentation(
+      [{ ...download("downloading"), fetched_bytes_count: 1_500_000, bitrate: 22_400_000 }],
+      [],
+    );
+    expect(active.detail).toBe("1.5 MB downloaded · 2.8 MB/s");
+    expect(active.percent).toBeUndefined();
+  });
+
+  it("shows live speed alongside a known percentage", () => {
+    expect(
+      statusPresentation([{ ...download("downloading", 42.6), bitrate: 22_400_000 }], []).detail,
+    ).toBe("43% complete · 2.8 MB/s");
+  });
+
   it("humanizes unknown worker states", () => {
     expect(statusPresentation([download("waiting_for_network")], [])).toMatchObject({
       label: "Waiting for network",

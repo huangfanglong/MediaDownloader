@@ -817,6 +817,10 @@ describe("filename and download request (E28)", () => {
     expect(composeFilename({ subdir: "", good_basename: "clip", extension: "txt" })).toBe("clip.mp4");
   });
 
+  it("does not duplicate the planned media extension already present in the basename", () => {
+    expect(composeFilename({ subdir: "", good_basename: "movie.mp4", extension: "mp4" })).toBe("movie.mp4");
+  });
+
   it("builds the exact chrome.downloads.download options", () => {
     const request = buildDownloadRequest({
       blobUrl: "blob:chrome-extension://id/abc",

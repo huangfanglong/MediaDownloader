@@ -3,7 +3,7 @@
  *
  * The two systems are deliberately separate (evidence E19-E23): local settings are user
  * preferences written through `mut-settings`; behaviour flags are remote per-host feature flags
- * fetched from `files.downloadhelper.net`. Re-exported together for the shell, but never merged.
+ * fetched from the remote ruleset endpoint. Re-exported together for the shell, but never merged.
  */
 
 export * from "./flags.js";

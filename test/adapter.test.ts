@@ -236,7 +236,9 @@ describe("panel snapshot (UI contract)", () => {
       tabId: 3,
       meta,
       media: new Map([[item().hash, item()]]),
-      downloading: new Map([["download_1", { status: "downloading", percent: 42.5, bitrate: 1200 }]]),
+      downloading: new Map([
+        ["download_1", { status: "downloading", percent: 42.5, fetched_bytes_count: 1_500_000, bitrate: 1200 }],
+      ]),
       notifications: new Map([["n1", { type: "download_error", details: "boom" }]]),
     });
     expect(snapshot).toEqual({
@@ -258,7 +260,15 @@ describe("panel snapshot (UI contract)", () => {
           has_drm: false,
         },
       ],
-      downloading: [{ download_id: "download_1", status: "downloading", percent: 42.5, bitrate: 1200 }],
+      downloading: [
+        {
+          download_id: "download_1",
+          status: "downloading",
+          percent: 42.5,
+          fetched_bytes_count: 1_500_000,
+          bitrate: 1200,
+        },
+      ],
       notifications: [{ type: "download_error", message: "boom" }],
     });
     // Must survive the message bus unchanged (no Map/URL/Headers values).

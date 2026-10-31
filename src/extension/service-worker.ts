@@ -28,7 +28,8 @@ import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
 import { buildPanelSnapshot, type PanelSnapshot } from "./panel-snapshot.js";
 import { debugInfo } from "./log.js";
-import { filterFocusedMedia, type MediaFocusState } from "./focus.js";
+import { filterFocusedMedia, focusKey, type MediaFocusState } from "./focus.js";
+import { releaseMatchingMedia, restoreMatchingMedia } from "./playback-coordination.js";
 import { REBUILD_MESSAGES, RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
 import type { Result } from "../core/option.js";
 import { isErr } from "../core/option.js";
@@ -87,6 +88,34 @@ export interface DownloadingEntry {
   percent?: number;
   fetched_bytes_count?: number;
   output_duration_s?: number;
+  /** Timestamp of the last byte sample; used only for interval download speed. */
+  progress_sample_at?: number;
+}
+
+export function applyDownloadProgress(entry: DownloadingEntry, progress: DownloadProgress, now: number): void {
+  if (progress.status === "finalizing") {
+    entry.status = "finalizing";
+    return;
+  }
+  if (progress.status !== "downloading") return;
+  entry.status = "downloading";
+  if (progress.percent !== undefined && progress.percent.is_known) entry.percent = progress.percent.value;
+  if (progress.output_duration_s !== undefined) entry.output_duration_s = progress.output_duration_s;
+  const fetched = progress.fetched_bytes_count;
+  if (fetched === undefined || !Number.isFinite(fetched) || fetched < 0) return;
+  const previousBytes = entry.fetched_bytes_count;
+  const previousAt = entry.progress_sample_at;
+  if (previousBytes !== undefined && fetched < previousBytes) entry.bitrate = 0;
+  if (
+    previousBytes !== undefined &&
+    previousAt !== undefined &&
+    fetched >= previousBytes &&
+    now > previousAt
+  ) {
+    entry.bitrate = (fetched - previousBytes) * 8 * 1000 / (now - previousAt);
+  }
+  entry.fetched_bytes_count = fetched;
+  entry.progress_sample_at = now;
 }
 
 export interface NotificationRecord {
@@ -1122,10 +1151,16 @@ export class MediaDownloaderService {
       meta,
     });
     await this.publish();
+    const connectionKey =
+      plan.strategy === "http_audio_video_one_source" ||
+      plan.strategy === "http_audio_video_one_source_jsfetch"
+        ? focusKey(plan.url.href)
+        : undefined;
     const outcome = await this.queue.queueTask(
       () => this.executeDownload(plan as DownloadPlan, downloadMedia, meta),
       plan.download_id,
       plan.is_youtube,
+      connectionKey,
     );
     await this.finishDownload(plan, downloadMedia, meta, outcome);
   }
@@ -1137,7 +1172,59 @@ export class MediaDownloaderService {
     void this.publish();
   }
 
+  /** Release or restore matching page playback around a coordinated direct retry. */
+  private async coordinateDirectPlayback(
+    plan: DownloadPlan,
+    action: "release" | "restore",
+  ): Promise<number> {
+    if (
+      plan.strategy !== "http_audio_video_one_source" &&
+      plan.strategy !== "http_audio_video_one_source_jsfetch"
+    ) {
+      return 0;
+    }
+    const operation = action === "release" ? releaseMatchingMedia : restoreMatchingMedia;
+    const tabs = await this.gateway.tabs.query({}).catch(() => []);
+    let affected = 0;
+    await Promise.all(
+      tabs.map(async (tab) => {
+        if (tab.id === undefined || tab.id < 0) return;
+        const count = await this.gateway.scripting
+          .executeInTab(tab.id, operation, [plan.url.href], { world: "MAIN" })
+          .catch(() => 0);
+        if (typeof count === "number" && Number.isFinite(count)) affected += count;
+      }),
+    );
+    console.info(
+      `[media-downloader] playback coordination ${action}d ${affected} matching media element(s)`,
+    );
+    if (action === "release" && affected > 0) {
+      // Let the load() abort settle before the worker opens its competing request.
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
+    return affected;
+  }
+
   private async executeDownload(
+    plan: DownloadPlan,
+    media: MediaItem,
+    meta: TabMeta,
+  ): Promise<Result<TransferOutcome, string>> {
+    const first = await this.executeDownloadAttempt(plan, media, meta);
+    if (first.tag === "Ok" || !/\bhttp 429\b/u.test(first.error)) return first;
+
+    // A direct 429 can mean that page playback already holds the server's sole connection.
+    // Retry once only after an actual matching element has been unloaded; never add blind retries.
+    const released = await this.coordinateDirectPlayback(plan, "release");
+    if (released === 0) return first;
+    try {
+      return await this.executeDownloadAttempt(plan, media, meta);
+    } finally {
+      await this.coordinateDirectPlayback(plan, "restore");
+    }
+  }
+
+  private async executeDownloadAttempt(
     plan: DownloadPlan,
     media: MediaItem,
     meta: TabMeta,
@@ -1386,14 +1473,7 @@ export class MediaDownloaderService {
   private onProgress(downloadId: string, progress: DownloadProgress): void {
     const entry = this.session.downloading.get(downloadId);
     if (!entry) return;
-    if (progress.status === "finalizing") {
-      entry.status = "finalizing";
-    } else if (progress.status === "downloading") {
-      entry.status = "downloading";
-      if (progress.percent !== undefined && progress.percent.is_known) entry.percent = progress.percent.value;
-      if (progress.fetched_bytes_count !== undefined) entry.fetched_bytes_count = progress.fetched_bytes_count;
-      if (progress.output_duration_s !== undefined) entry.output_duration_s = progress.output_duration_s;
-    }
+    applyDownloadProgress(entry, progress, this.now());
     void this.publish();
   }
 

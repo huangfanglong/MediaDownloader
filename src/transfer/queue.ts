@@ -13,6 +13,8 @@ import { userAbortReason, type TransferOutcome } from "../core/types.js";
 export interface QueuedTask {
   readonly id: string;
   readonly isYoutube: boolean;
+  /** Optional asset identity used to prevent overlapping connections to the same resource. */
+  readonly connectionKey?: string;
   readonly resolve: (value: Result<TransferOutcome, string>) => void;
   readonly reject: (reason: unknown) => void;
   readonly task: () => Promise<Result<TransferOutcome, string>>;
@@ -33,6 +35,7 @@ export class DownloadQueue {
   private running = 0;
   private ytRunning = 0;
   private readonly queue: QueuedTask[] = [];
+  private readonly runningConnectionKeys = new Set<string>();
   private totalCapacity: number;
   private ytCapacity: number;
   private readonly ytDelay: number;
@@ -64,14 +67,15 @@ export class DownloadQueue {
     };
   }
 
-  /** Queue one transfer. FIFO, but a throttled task may be skipped in favour of later work. */
+  /** Queue one transfer. Throttled or same-asset work may be skipped in favour of later work. */
   queueTask(
     task: () => Promise<Result<TransferOutcome, string>>,
     id: string,
     isYoutube: boolean,
+    connectionKey?: string,
   ): Promise<Result<TransferOutcome, string>> {
     return new Promise<Result<TransferOutcome, string>>((resolve, reject) => {
-      this.queue.push({ id, isYoutube, reject, resolve, task });
+      this.queue.push({ id, isYoutube, connectionKey, reject, resolve, task });
       this.schedule();
     });
   }
@@ -123,10 +127,20 @@ export class DownloadQueue {
       const delayElapsed = this.ytCapacity > 1 || sinceLastYoutube > this.ytDelay;
       const youtubeMayRun = this.ytRunning < this.ytCapacity && delayElapsed;
 
-      const index = this.queue.findIndex((task) => !task.isYoutube || youtubeMayRun);
+      const index = this.queue.findIndex(
+        (task) =>
+          (!task.isYoutube || youtubeMayRun) &&
+          (task.connectionKey === undefined || !this.runningConnectionKeys.has(task.connectionKey)),
+      );
       if (index < 0) {
-        // Only throttled work remains: wake up later and try again.
-        if (this.queue.some((task) => task.isYoutube) && !this.schedulePending) {
+        // A connection key is released by the active task's finally handler, so only throttled
+        // work needs a timer to become eligible.
+        const youtubeBlocked = this.queue.some(
+          (task) =>
+            task.isYoutube &&
+            (task.connectionKey === undefined || !this.runningConnectionKeys.has(task.connectionKey)),
+        );
+        if (youtubeBlocked && !this.schedulePending) {
           this.schedulePending = true;
           setTimeout(() => {
             this.schedulePending = false;
@@ -140,6 +154,7 @@ export class DownloadQueue {
       if (!task) return;
       this.running += 1;
       if (task.isYoutube) this.ytRunning += 1;
+      if (task.connectionKey !== undefined) this.runningConnectionKeys.add(task.connectionKey);
 
       task
         .task()
@@ -152,6 +167,7 @@ export class DownloadQueue {
             this.lastYoutubeSettledAt = Date.now();
             this.ytRunning -= 1;
           }
+          if (task.connectionKey !== undefined) this.runningConnectionKeys.delete(task.connectionKey);
           this.schedule();
         });
     }

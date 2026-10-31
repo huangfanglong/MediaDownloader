@@ -43,13 +43,15 @@ const MEDIA_EXTENSIONS: ReadonlySet<string> = new Set([
 ]);
 
 export function composeFilename(plan: FilenamePlan): string {
-  // A page/title can end in .txt (or a CDN can claim text/plain) even when the worker sniffed
-  // real media. Never let that become the final extension; strip the misleading suffix first.
-  const basename = plan.good_basename
-    .replace(/\.(?:txt|html?|json|xml|php|aspx?|jsp|bin)(?=$|[\s._-])/giu, "")
-    .trim();
   const extension = plan.extension.toLowerCase();
   const safeExtension = MEDIA_EXTENSIONS.has(extension) ? extension : "mp4";
+  // A page/title can end in .txt (or a CDN can claim text/plain) even when the worker sniffed
+  // real media. Never let that become the final extension; strip the misleading suffix first.
+  // Direct-file titles can also include the planned extension already; do not append it twice.
+  const basename = plan.good_basename
+    .replace(/\.(?:txt|html?|json|xml|php|aspx?|jsp|bin)(?=$|[\s._-])/giu, "")
+    .replace(new RegExp(`\\.${safeExtension}$`, "iu"), "")
+    .trim();
   return `${plan.subdir}${basename.length > 0 ? basename : "video"}.${safeExtension}`;
 }
 

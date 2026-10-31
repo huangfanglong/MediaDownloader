@@ -46,18 +46,46 @@ const validPercent = (value: number | undefined): number | undefined => {
   return Math.max(0, Math.min(100, Math.round(value)));
 };
 
+const formatBytes = (value: number | undefined): string | undefined => {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let scaled = value;
+  let unit = 0;
+  while (scaled >= 1000 && unit < units.length - 1) {
+    scaled /= 1000;
+    unit += 1;
+  }
+  const digits = unit === 0 || scaled >= 100 ? 0 : 1;
+  return `${scaled.toFixed(digits)} ${units[unit]}`;
+};
+
+const formatSpeed = (bitrate: number | undefined): string | undefined => {
+  if (bitrate === undefined || !Number.isFinite(bitrate) || bitrate <= 0) return undefined;
+  const bytesPerSecond = formatBytes(bitrate / 8);
+  return bytesPerSecond === undefined ? undefined : `${bytesPerSecond}/s`;
+};
+
 const downloadPresentation = (downloads: readonly PanelDownloadRow[]): StatusPresentation => {
   const first = downloads[0];
   if (first === undefined) return { tone: "idle", label: "Ready" };
 
   const progressEntry = downloads.find((entry) => entry.status !== "queuing" && validPercent(entry.percent) !== undefined);
   const percent = validPercent(progressEntry?.percent);
+  const bytesEntry = downloads.find(
+    (entry) => entry.status === "downloading" && formatBytes(entry.fetched_bytes_count) !== undefined,
+  );
+  const bytes = formatBytes(bytesEntry?.fetched_bytes_count);
+  const speed = formatSpeed(downloads.find((entry) => entry.status === "downloading")?.bitrate);
   const known = DOWNLOAD_LABELS[first.status];
   const label = downloads.length > 1 ? `Downloading ${downloads.length} items` : known?.label ?? humanize(first.status);
-  const detail =
-    percent !== undefined
-      ? `${percent}% complete`
-      : known?.detail ?? (downloads.length > 1 ? "Transfers in progress..." : "In progress...");
+  const activity = percent !== undefined
+    ? `${percent}% complete`
+    : bytes !== undefined
+      ? `${bytes} downloaded`
+      : undefined;
+  const detail = activity !== undefined
+    ? `${activity}${speed !== undefined ? ` · ${speed}` : ""}`
+    : speed ?? known?.detail ?? (downloads.length > 1 ? "Transfers in progress..." : "In progress...");
   return {
     tone: "progress",
     label,

@@ -86,6 +86,59 @@ describe("DownloadQueue scheduling", () => {
     expect(queue.getStats()).toMatchObject({ running: 0, pending: 0 });
   });
 
+  it("serializes transfers with the same connection key despite spare capacity", async () => {
+    const queue = new DownloadQueue(3, 3, 6000);
+    const first = deferred<Result<TransferOutcome, string>>();
+    const second = deferred<Result<TransferOutcome, string>>();
+    const started: string[] = [];
+
+    const p1 = queue.queueTask(async () => {
+      started.push("first");
+      return first.promise;
+    }, "first", false, "https://cdn.test/movie.mp4");
+    const p2 = queue.queueTask(async () => {
+      started.push("second");
+      return second.promise;
+    }, "second", false, "https://cdn.test/movie.mp4");
+
+    await flush();
+    expect(started).toEqual(["first"]);
+    expect(queue.getStats()).toMatchObject({ running: 1, pending: 1 });
+
+    first.resolve(outcome("first"));
+    await p1;
+    await flush();
+    expect(started).toEqual(["first", "second"]);
+
+    second.resolve(outcome("second"));
+    await p2;
+    await flush();
+    expect(queue.getStats()).toMatchObject({ running: 0, pending: 0 });
+  });
+
+  it("runs transfers with different connection keys concurrently", async () => {
+    const queue = new DownloadQueue(2, 2, 6000);
+    const first = deferred<Result<TransferOutcome, string>>();
+    const second = deferred<Result<TransferOutcome, string>>();
+    const started: string[] = [];
+
+    const p1 = queue.queueTask(async () => {
+      started.push("first");
+      return first.promise;
+    }, "first", false, "https://cdn.test/first.mp4");
+    const p2 = queue.queueTask(async () => {
+      started.push("second");
+      return second.promise;
+    }, "second", false, "https://cdn.test/second.mp4");
+
+    await flush();
+    expect(started).toEqual(["first", "second"]);
+
+    first.resolve(outcome("first"));
+    second.resolve(outcome("second"));
+    await Promise.all([p1, p2]);
+  });
+
   it("rejects a task promise when the task throws, and frees the slot", async () => {
     const queue = new DownloadQueue(1, 1, 0);
     const failing = queue.queueTask(async () => {

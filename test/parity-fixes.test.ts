@@ -205,6 +205,56 @@ describe("direct CDN transfers (live YouTube regression)", () => {
     expect(result.tag).toBe("Err");
     if (result.tag === "Err") expect(result.error).toContain("403");
   });
+
+  it.each([
+    { label: "plan size", planSize: 4000, responseHeaders: undefined },
+    { label: "Content-Length", planSize: undefined, responseHeaders: new Headers({ "content-length": "4000" }) },
+    {
+      label: "Content-Range total",
+      planSize: undefined,
+      responseHeaders: new Headers({ "content-length": "2000", "content-range": "bytes 0-1999/4000" }),
+    },
+  ])("reports direct-download percentage from $label", async ({ planSize, responseHeaders }) => {
+    const progress: Array<Record<string, unknown>> = [];
+    const channel: BroadcastChannelLike = {
+      ...noopChannel(),
+      postMessage: (message) => {
+        const value = (message as { msg?: { data?: { progress?: Record<string, unknown> } } }).msg?.data?.progress;
+        if (value !== undefined) progress.push(value);
+      },
+    };
+    const data = new TextEncoder().encode("x".repeat(2000));
+    let sent = false;
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: (async () => ({
+        status: 200,
+        ok: true,
+        ...(responseHeaders !== undefined ? { headers: responseHeaders } : {}),
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (sent) return { done: true };
+              sent = true;
+              return { done: false, value: data };
+            },
+          }),
+        },
+      })) as FetchLike,
+      openRoot: async () => createFakeOpfs().root,
+    });
+    const result = await worker.runPlan({
+      ...planFor("http_audio_video_one_source"),
+      url: new URL("https://cdn.test/progress.mp4"),
+      ...(planSize !== undefined ? { size: planSize } : {}),
+    });
+    expect(result.tag).toBe("Ok");
+    expect(progress).toContainEqual({
+      status: "downloading",
+      fetched_bytes_count: 2000,
+      percent: { is_known: true, value: 50 },
+    });
+  });
 });
 
 describe("minimum output size for direct transfers (live 31-byte regression)", () => {

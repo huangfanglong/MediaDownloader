@@ -311,6 +311,16 @@ export class DownloadWorker {
     let extension = sourceExtension;
     let staged: StagedFile | undefined;
     let total = 0;
+    let totalSize = plan.size !== undefined && Number.isFinite(plan.size) && plan.size > 0
+      ? plan.size
+      : undefined;
+    const downloadingProgress = (fetchedBytes: number): DownloadProgress => ({
+      status: "downloading",
+      fetched_bytes_count: fetchedBytes,
+      ...(totalSize !== undefined
+        ? { percent: { is_known: true, value: Math.min(100, fetchedBytes / totalSize * 100) } }
+        : {}),
+    });
     const onChunk = async (chunk: Uint8Array): Promise<void> => {
       if (staged === undefined) {
         extension = normalizeMediaOutputExtension(extension, chunk, true);
@@ -318,7 +328,10 @@ export class DownloadWorker {
       }
       await staged.append(chunk);
       total += chunk.byteLength;
-      this.emitProgress(plan.download_id, { status: "downloading", fetched_bytes_count: total });
+      this.emitProgress(plan.download_id, downloadingProgress(total));
+    };
+    const onTotalSize = (size: number): void => {
+      totalSize = size;
     };
     try {
       if (isRangeBoundCdn(plan.url)) {
@@ -326,10 +339,7 @@ export class DownloadWorker {
           signal,
           onChunk,
           onBytes: (fetched) => {
-            this.emitProgress(plan.download_id, {
-              status: "downloading",
-              fetched_bytes_count: fetched,
-            });
+            this.emitProgress(plan.download_id, downloadingProgress(fetched));
           },
         });
         if (ranged.tag === "Err") {
@@ -339,7 +349,12 @@ export class DownloadWorker {
         }
       } else {
         const directUrl = plan.url.href;
-        let fetched = await fetchBytes(this.deps.fetchImpl, directUrl, { headers }, { signal, onChunk });
+        let fetched = await fetchBytes(
+          this.deps.fetchImpl,
+          directUrl,
+          { headers },
+          { signal, onChunk, onTotalSize },
+        );
         if (
           fetched.tag === "Err" &&
           total === 0 &&
@@ -351,7 +366,7 @@ export class DownloadWorker {
             this.deps.fetchImpl,
             directUrl,
             { headers, range: "bytes=0-" },
-            { signal, onChunk },
+            { signal, onChunk, onTotalSize },
           );
         }
         if (fetched.tag === "Err") {

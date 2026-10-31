@@ -35,6 +35,7 @@ export interface PanelDownloadRow {
   download_id: string;
   status: string;
   percent?: number;
+  fetched_bytes_count?: number;
   bitrate?: number;
 }
 
@@ -57,7 +58,10 @@ export interface PanelSnapshotInput {
   tabId?: number;
   meta?: TabMeta;
   media: ReadonlyMap<string, MediaItem> | readonly MediaItem[];
-  downloading: ReadonlyMap<string, { status: string; percent?: number; bitrate: number }>;
+  downloading: ReadonlyMap<
+    string,
+    { status: string; percent?: number; fetched_bytes_count?: number; bitrate: number }
+  >;
   notifications: ReadonlyMap<string, { type: string; message?: string; details?: string }>;
 }
 
@@ -246,6 +250,7 @@ export function buildPanelSnapshot(input: PanelSnapshotInput): PanelSnapshot {
       download_id: downloadId,
       status: entry.status,
       ...(entry.percent !== undefined ? { percent: entry.percent } : {}),
+      ...(entry.fetched_bytes_count !== undefined ? { fetched_bytes_count: entry.fetched_bytes_count } : {}),
       ...(entry.bitrate !== undefined ? { bitrate: entry.bitrate } : {}),
     })),
     notifications: [...input.notifications.values()].map((notification) => ({
