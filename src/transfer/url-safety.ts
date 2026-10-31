@@ -117,6 +117,21 @@ export function isSafeManifestUrl(url: URL): boolean {
 }
 
 /**
+ * Whether a segment URL resolved from a manifest is safe to fetch.
+ *
+ * Enforces: http(s) only, no userinfo, and either public network OR same-origin with the manifest
+ * (same-origin private network hosts are allowed — the page captured credentials from that origin).
+ */
+export function isSafeSegmentUrl(segmentUrl: URL, manifestUrl: URL): boolean {
+  if (segmentUrl.protocol !== "http:" && segmentUrl.protocol !== "https:") return false;
+  if (segmentUrl.username !== "" || segmentUrl.password !== "") return false;
+  if (isPrivateNetworkHost(segmentUrl.hostname)) {
+    return segmentUrl.origin === manifestUrl.origin;
+  }
+  return true;
+}
+
+/**
  * Auto-enrichment policy: a page-supplied manifest is fetched only when it is safe, and either the
  * browser observed that URL in the same tab or it is same-origin with the page that supplied it.
  */

@@ -198,6 +198,8 @@ export interface DownloadPlan {
   /** `download_<uuid>`; correlates all worker/progress messages. */
   download_id: string;
   headers: Headers;
+  /** Origin from which headers were captured; used to scope credential replay. Optional for backward compatibility with test fixtures, but always set in production. */
+  headers_origin?: string;
   good_basename: string;
   subdir: string;
   duration?: MediaDuration;

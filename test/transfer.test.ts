@@ -516,7 +516,7 @@ describe("fetchBytes (E12)", () => {
 describe("buildSegmentRequests (E15/E16)", () => {
   const master = "https://cdn.example/path/master.m3u8?token=abc";
 
-  it("resolves relative URLs and carries the master query string", () => {
+  it("resolves relative URLs and carries the master query to same-origin segments only", () => {
     const segments: HlsSegment[] = [
       { url: "seg-0.ts" },
       { url: "https://other.example/seg-1.ts" },
@@ -526,8 +526,8 @@ describe("buildSegmentRequests (E15/E16)", () => {
       carryGetParams: true,
     });
     expect(descriptors.map((descriptor) => descriptor.url)).toEqual([
-      "https://cdn.example/path/seg-0.ts?token=abc",
-      "https://other.example/seg-1.ts?token=abc",
+      "https://cdn.example/path/seg-0.ts?token=abc", // same-origin: carry applies
+      "https://other.example/seg-1.ts", // cross-origin: NO carry (token exfil guard)
     ]);
   });
 

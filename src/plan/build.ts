@@ -60,6 +60,7 @@ const VIDEO_CONTAINERS: ReadonlySet<string> = VIDEO_DEMUXERS;
 interface PlanBase {
   download_id: string;
   headers: Headers;
+  headers_origin: string;
   good_basename: string;
   subdir: string;
   save_as: boolean;
@@ -79,6 +80,7 @@ function planBase(input: BuildPlanInput, downloadIdFactory: () => string): PlanB
     download_id: downloadIdFactory(),
     // Clone, never share: the execution step strips browser-managed headers from the plan (F2).
     headers: new Headers(input.media.sent_headers),
+    headers_origin: input.media.master_url?.origin ?? input.media.url?.origin ?? "",
     good_basename: rendered.basename,
     subdir: rendered.subdir !== "" ? rendered.subdir : input.downloadDirectory,
     save_as: input.saveAs ?? false,

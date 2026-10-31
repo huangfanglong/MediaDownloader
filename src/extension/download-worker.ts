@@ -28,14 +28,15 @@ import {
   concatenate,
   isTooManyFailedSegments,
 } from "../transfer/assemble.js";
-import type { HlsInitSegment, HlsSegment as TransferSegment } from "../transfer/assemble.js";
+import type { HlsInitSegment, HlsSegment as TransferSegment, SegmentDescriptor } from "../transfer/assemble.js";
 import type { HlsSegment as ParsedSegment } from "../manifests/hls.js";
-import { headersForPlan, fetchBytes, type FetchLike } from "../transfer/fetch.js";
+import { headersForPlan, fetchBytes, scopedHeadersFor, type FetchLike } from "../transfer/fetch.js";
 import { RANGE_CHUNK_BYTES, fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
 import { muxFragmentedMp4 } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
 import { convertArgs, mergeArgs, mp3Args, type FfmpegRunnerLike } from "../transfer/ffmpeg.js";
 import { sleepWithAbort } from "../transfer/retry.js";
+import { isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
   createStagedFile,
   openOpfsRoot,
@@ -800,6 +801,26 @@ export class DownloadWorker {
       mediaSequence: parsed.mediaSequence,
     });
 
+    // Reject private-network segments unless same-origin with manifest.
+    // Fail fast with a clear error showing only the refused host (not the full URL with tokens).
+    const captureOrigin = plan.headers_origin ?? plan.url.origin;
+    for (const descriptor of descriptors) {
+      const segmentUrl = new URL(descriptor.url);
+      if (!isSafeSegmentUrl(segmentUrl, plan.url)) {
+        return err(`Segment host ${segmentUrl.hostname} refused by URL-safety gate`);
+      }
+    }
+
+    // Scope credential-bearing headers by origin: same-origin segments get captured headers,
+    // cross-origin segments (legitimate CDN pattern) get empty headers. Precompute once, reuse in loop.
+    interface AnnotatedDescriptor extends SegmentDescriptor {
+      requestHeaders: Headers;
+    }
+    const annotatedDescriptors: AnnotatedDescriptor[] = descriptors.map((d) => ({
+      ...d,
+      requestHeaders: scopedHeadersFor(d.url, captureOrigin, headers),
+    }));
+
     // fMP4 HLS keeps the planned container. Raw MPEG-TS uses m2ts because .ts is also a
     // TypeScript/Qt source extension and browsers may treat it as text.
     const extension = initSegment ? plan.extension || "mp4" : "m2ts";
@@ -807,7 +828,7 @@ export class DownloadWorker {
       ? undefined
       : await createStagedFile(stream.root, `${stream.downloadId}.${extension}`);
     const concurrency = plan.throttle ? THROTTLED_SEGMENT_CONCURRENCY : SEGMENT_CONCURRENCY;
-    const chunks: Array<Uint8Array | null | undefined> = new Array(descriptors.length);
+    const chunks: Array<Uint8Array | null | undefined> = new Array(annotatedDescriptors.length);
     let fetchedBytes = 0;
     let failed = 0;
     let nextWrite = 0;
@@ -831,7 +852,7 @@ export class DownloadWorker {
       for (;;) {
         const index = nextIndex();
         if (index === undefined) return;
-        const descriptor = descriptors[index];
+        const descriptor = annotatedDescriptors[index];
         if (!descriptor) return;
         if (descriptor.aes128) {
           throw new Error("Encrypted HLS is not supported by this rebuild");
@@ -839,7 +860,7 @@ export class DownloadWorker {
         const response = await fetchBytes(
           this.deps.fetchImpl,
           descriptor.url,
-          { headers, ...(descriptor.range ? { range: descriptor.range } : {}) },
+          { headers: descriptor.requestHeaders, ...(descriptor.range ? { range: descriptor.range } : {}) },
           { signal },
         );
         if (response.tag === "Err") {
@@ -859,7 +880,7 @@ export class DownloadWorker {
             ? {
                 percent: {
                   is_known: true,
-                  value: Math.min(100, (index + 1) / descriptors.length * 100),
+                  value: Math.min(100, (index + 1) / annotatedDescriptors.length * 100),
                 },
               }
             : { percent: { is_known: false, value: 0 } }),
@@ -868,7 +889,7 @@ export class DownloadWorker {
     };
 
     let cursor = 0;
-    const nextIndex = (): number | undefined => (cursor < descriptors.length ? cursor++ : undefined);
+    const nextIndex = (): number | undefined => (cursor < annotatedDescriptors.length ? cursor++ : undefined);
 
     try {
       await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
@@ -878,7 +899,7 @@ export class DownloadWorker {
       return err(String(error));
     }
 
-    if (isTooManyFailedSegments(failed, descriptors.length) || fetchedBytes < 1_000) {
+    if (isTooManyFailedSegments(failed, annotatedDescriptors.length) || fetchedBytes < 1_000) {
       if (staged !== undefined) await staged.abort().catch(() => undefined);
       return err(fetchedBytes < 1_000 ? "Downloaded content is too small" : "Too many invalid segments, aborting download.");
     }

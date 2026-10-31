@@ -155,6 +155,19 @@ export function headersForPlan(source: HeaderSource): Headers {
   );
 }
 
+/**
+ * Scope credential-bearing headers by origin: same-origin requests get the captured headers,
+ * cross-origin requests get an empty set.
+ *
+ * Rationale: captured headers are credentials for the origin they were observed on. Cross-origin
+ * segment URLs (legitimate CDN pattern) must not carry those credentials. Signed CDN tokens live
+ * in query params, not custom headers, so empty headers preserve functionality.
+ */
+export function scopedHeadersFor(segmentUrl: string, captureOrigin: string, headers: Headers): Headers {
+  const segmentOrigin = new URL(segmentUrl).origin;
+  return segmentOrigin === captureOrigin ? headers : new Headers();
+}
+
 // ---------------------------------------------------------------------------
 // declarativeNetRequest session-rule model
 // ---------------------------------------------------------------------------

@@ -117,6 +117,8 @@ function applyCarry(
 ): string {
   if (!carryGetParams || masterUrl.search === "") return url;
   const resolved = new URL(url);
+  // Never carry signed params to foreign origins (token exfiltration).
+  if (resolved.origin !== masterUrl.origin) return url;
   resolved.search = masterUrl.search;
   return resolved.href;
 }

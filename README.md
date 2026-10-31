@@ -7,7 +7,7 @@ DASH downloads are disabled until segment resolution is implemented. Tested on B
 Windows.
 
   This was a half a day project built for fun entirely with DeepSeek-V4.1-Flash-1017 to test its capabilities. 
-  Everything after around 1.0.3 releases were done by Kimi K3.1.
+  Everything after around 1.0.3 releases were done by Kimi K3.1 & other open weight models as I test them all.
 
 ## Quick start
 
