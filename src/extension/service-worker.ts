@@ -66,6 +66,7 @@ import {
 } from "./context-menu.js";
 import { computeBadge } from "./badge.js";
 import { createWorkerChannel, WorkerClient } from "./worker-client.js";
+import { SessionPublisher } from "./session-publisher.js";
 import { openOpfsRoot, removeStagedFile, type OpfsRoot } from "./staging.js";
 import { detectPlatform, type PlatformProfile } from "./platform.js";
 import { loadSmartnaming, materializeRule, selectRule } from "../naming/rules.js";
@@ -209,6 +210,8 @@ export class MediaDownloaderService {
   private readonly tabHealing: TabHealing;
   /** Media hashes with a download in flight (review 4.1 duplicate downloads). */
   private readonly activeMediaHashes = new Set<string>();
+  /** Decides when state reaches the panel and when the session is written. */
+  private readonly publisher: SessionPublisher;
   /** Last accepted progress update per download (the 2 Hz contract in core/types.ts). */
   private readonly lastProgressEmitAt = new Map<string, number>();
   /** Page-relay request id -> download id (review: protected CDNs). */
@@ -263,6 +266,11 @@ export class MediaDownloaderService {
 
     this.ready = new Promise<void>((resolve) => {
       this.markReady = resolve;
+    });
+    this.publisher = new SessionPublisher({
+      now: () => this.now(),
+      pushUi: () => this.pushPanelSnapshot(),
+      persist: () => this.persistSession(),
     });
     // MV3 wakes the service worker for events only when listeners were added synchronously in
     // the first task. Register them here; every handler awaits `ready` before touching state.
@@ -365,10 +373,9 @@ export class MediaDownloaderService {
       .catch(() => undefined);
   }
 
-  /** Push observable state (badge, icon, session snapshot) to the browser UI. */
+  /** Push observable state (badge, icon, session snapshot) to the browser UI and persist it. */
   async publish(): Promise<void> {
-    this.pushPanelSnapshot();
-    await this.persistSession();
+    await this.publisher.structural();
     const currentTab = this.session.current_win_tab.tab_id;
     const visibleMedia = filterFocusedMedia(
       currentTab === undefined ? [] : [...(this.engine.mediaForTab(currentTab)?.values() ?? [])],
@@ -1499,7 +1506,7 @@ export class MediaDownloaderService {
       this.lastProgressEmitAt.set(downloadId, now);
     }
     applyDownloadProgress(entry, progress, now);
-    void this.publish();
+    this.publisher.progress();
   }
 
   private async finishDownload(
