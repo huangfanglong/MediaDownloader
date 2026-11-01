@@ -43,15 +43,6 @@ interface InstagramMediaInfo {
   carousel_media?: InstagramMediaInfo[];
 }
 
-function decodeXmlEntities(value: string): string {
-  return value
-    .replace(/&amp;/gu, "&")
-    .replace(/&quot;/gu, '"')
-    .replace(/&#39;|&apos;/gu, "'")
-    .replace(/&lt;/gu, "<")
-    .replace(/&gt;/gu, ">");
-}
-
 function dashVariantsFromXml(xml: string, pageUrl: string): HintVariant[] {
   const parsed = parseMpd(xml, new URL(pageUrl));
   if (parsed.tag !== "Ok") return [];
@@ -60,8 +51,8 @@ function dashVariantsFromXml(xml: string, pageUrl: string): HintVariant[] {
   const variants: HintVariant[] = [];
   for (const entry of parsed.value.video.slice(0, 20)) {
     variants.push({
-      url: decodeXmlEntities(entry.url.href),
-      audio_url: decodeXmlEntities(audio.href),
+      url: entry.url.href,
+      audio_url: audio.href,
       ...(entry.width !== undefined ? { width: entry.width } : {}),
       ...(entry.height !== undefined ? { height: entry.height } : {}),
       ...(entry.bandwidth !== undefined ? { bitrate: entry.bandwidth } : {}),

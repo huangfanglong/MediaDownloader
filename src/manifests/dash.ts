@@ -1,24 +1,12 @@
 /**
  * Minimal, original MPD (DASH) parser for the rebuild.
  *
- * Evidence: analysis/evidence/03-manifest-resolution.md
- *  - F25: MPD resolution IS implemented in JavaScript (the shipped bundle vendors mpd-parser
- *    1.3.1, banner svc:23240-23241). Representations become playlist entries with
- *    `{quality:{bitrate,size}, demuxer, index, audio_id, audio_language}`; representations
- *    without CODECS are skipped; unknown codecs are skipped; entries sorted by height then
- *    bandwidth (svc:11212-11255).
- *  - F25/F37: DRM = a ContentProtection scheme in the Widevine / PlayReady / FairPlay key set
- *    (`kv` svc:8339-8342). The schemeIdUri→name map used by the bundled parser is at
- *    svc:10973-10979; clear-key / mp4protection are not treated as DRM by the shipped code.
- *  - F26: the download itself is delegated to libav's FFmpeg dash demuxer (`-mpd_video_idx
- *    <entry>`), so this parser only needs the manifest's *resolution* facts — no segment
- *    template expansion, no SegmentBase/SegmentList math, no timeline.
- *  - F28: subtitles are in-manifest renditions referenced by id (`type:"id"`); wvtt is skipped
- *    (svc:11257-11279).
  *
  * Deliberately small: a hand-written XML scanner (no DOM, works in Node and an MV3 worker),
  * ISO-8601 duration parsing, adaptation/base-URL inheritance, and typed errors for anything the
- * proven semantics do not cover. Text content is only captured for BaseURL.
+ * proven semantics do not cover. Text content is only captured for BaseURL. Character references
+ * in character data and attribute values are decoded (CDATA is kept literal), so callers see the
+ * text the document actually represents.
  */
 import { err, ok, type Result } from "../core/option.js";
 import type { MediaDuration, SubtitleTrack } from "../core/types.js";
@@ -172,6 +160,46 @@ function findTagEnd(xml: string, from: number): number {
   return -1;
 }
 
+/**
+ * Replace XML character references the way a real parser would: the five predefined entities
+ * plus decimal and hexadecimal numeric references. Replacement happens in a single pass and the
+ * substituted text is not rescanned, so `&amp;lt;` becomes the literal text `&lt;` rather than
+ * an accidental second decode. Unknown or malformed references are left untouched.
+ */
+function decodeXmlEntities(value: string): string {
+  return value.replace(
+    /&(?:amp|lt|gt|quot|apos|#(\d+)|#x([0-9a-fA-F]+));/gu,
+    (reference: string, decimal?: string, hexadecimal?: string) => {
+      if (decimal !== undefined) {
+        const codePoint = Number.parseInt(decimal, 10);
+        return Number.isInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : reference;
+      }
+      if (hexadecimal !== undefined) {
+        const codePoint = Number.parseInt(hexadecimal, 16);
+        return Number.isInteger(codePoint) && codePoint > 0 && codePoint <= 0x10ffff
+          ? String.fromCodePoint(codePoint)
+          : reference;
+      }
+      switch (reference) {
+        case "&amp;":
+          return "&";
+        case "&lt;":
+          return "<";
+        case "&gt;":
+          return ">";
+        case "&quot;":
+          return '"';
+        case "&apos;":
+          return "'";
+        default:
+          return reference;
+      }
+    },
+  );
+}
+
 /** XML attributes are whitespace-separated `name="value"` pairs (no commas, unlike HLS). */
 function parseXmlAttributes(input: string): Record<string, string> {
   const result: Record<string, string> = {};
@@ -193,7 +221,7 @@ function parseXmlAttributes(input: string): Record<string, string> {
     const end = input.indexOf(quote, index);
     const value = end === -1 ? input.slice(index) : input.slice(index, end);
     index = end === -1 ? input.length : end + 1;
-    if (key !== "") result[key] = value;
+    if (key !== "") result[key] = decodeXmlEntities(value);
   }
   return result;
 }
@@ -208,7 +236,7 @@ function parseXml(xml: string): XmlNode | undefined {
     const chunk = xml.slice(index, upTo);
     if (chunk.trim().length > 0) {
       const top = stack[stack.length - 1];
-      if (top !== undefined) top.text += chunk;
+      if (top !== undefined) top.text += decodeXmlEntities(chunk);
     }
     index = upTo;
   };

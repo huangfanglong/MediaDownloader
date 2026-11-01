@@ -790,6 +790,34 @@ describe("Instagram current-post API adapter", () => {
     const item = itemFromHint(hints[0]!, pageUrl);
     expect(item?.playlist?.[0]?.av?.audio).toBeInstanceOf(URL);
   });
+
+  it("decodes numeric character references in an inline DASH BaseURL", async () => {
+    const pageUrl = "https://www.instagram.com/p/EntityNumeric1/";
+    const mpd = `<MPD type="static" mediaPresentationDuration="PT9S"><Period>
+      <AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v" codecs="vp09.00.10.08" width="1280" height="718" bandwidth="448000"><BaseURL>https://scontent.cdninstagram.com/v/1080.mp4?oe=1&#38;efg=abc</BaseURL></Representation></AdaptationSet>
+      <AdaptationSet contentType="audio" mimeType="audio/mp4"><Representation id="a" codecs="mp4a.40.2" bandwidth="72000"><BaseURL>https://scontent.cdninstagram.com/v/audio.m4a?oe=1</BaseURL></Representation></AdaptationSet>
+    </Period></MPD>`;
+    document.head.innerHTML = "";
+    document.body.innerHTML = `<script>window.__data=${JSON.stringify({ video_dash_manifest: mpd })};</script>`;
+    const fetchImpl = (async () => ({ ok: false, status: 401, json: async () => ({}) })) as unknown as typeof fetch;
+    const hints = await collectHintsForPage(pageUrl, document, [], fetchImpl);
+    expect(hints[0]?.variants?.[0]?.url).toBe("https://scontent.cdninstagram.com/v/1080.mp4?oe=1&efg=abc");
+  });
+
+  it("does not double-decode entity-looking text in an inline DASH BaseURL", async () => {
+    const pageUrl = "https://www.instagram.com/p/EntityNested1/";
+    const mpd = `<MPD type="static" mediaPresentationDuration="PT9S"><Period>
+      <AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="v" codecs="vp09.00.10.08" width="1280" height="718" bandwidth="448000"><BaseURL>https://scontent.cdninstagram.com/v/1080.mp4?x=&amp;lt;</BaseURL></Representation></AdaptationSet>
+      <AdaptationSet contentType="audio" mimeType="audio/mp4"><Representation id="a" codecs="mp4a.40.2" bandwidth="72000"><BaseURL>https://scontent.cdninstagram.com/v/audio.m4a?oe=1</BaseURL></Representation></AdaptationSet>
+    </Period></MPD>`;
+    document.head.innerHTML = "";
+    document.body.innerHTML = `<script>window.__data=${JSON.stringify({ video_dash_manifest: mpd })};</script>`;
+    const fetchImpl = (async () => ({ ok: false, status: 401, json: async () => ({}) })) as unknown as typeof fetch;
+    const hints = await collectHintsForPage(pageUrl, document, [], fetchImpl);
+    expect(hints[0]?.variants?.[0]?.url).toContain("&lt;");
+    expect(hints[0]?.variants?.[0]?.url).not.toContain("<");
+  });
+
   it("uses only the current post renditions and exposes real quality options", async () => {
     const pageUrl = "https://www.instagram.com/p/DensBSLoHNE/";
     document.head.innerHTML = "<title>Foyege24 Instagram photos and videos</title>";
