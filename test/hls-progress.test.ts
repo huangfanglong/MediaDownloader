@@ -132,6 +132,12 @@ async function runHls(options: RunOptions): Promise<RunResult> {
     cache: "default",
   };
 
+  // Production runs go through `onDownload`, which registers the active download before the
+  // transfer; that registration is what enables the 2 Hz emission throttle.
+  (worker as unknown as {
+    active: Map<string, { controller: AbortController; lastProgressAt: number }>;
+  }).active.set(plan.download_id, { controller: new AbortController(), lastProgressAt: 0 });
+
   const run = worker.runPlan(plan);
   await settle(); // workers hold their first segments (or the failing segment resolves at once)
   for (const index of options.releaseOrder) {
@@ -169,5 +175,31 @@ describe("HLS segment progress under concurrent workers", () => {
     expect(percents.map((value) => Math.round(value))).toEqual([25, 50, 75, 99]);
     expect(percents.every((value, index) => index === 0 || value >= (percents[index - 1] as number))).toBe(true);
     expect(percents).not.toContain(100);
+  });
+
+  it("reports the same sequence when the plan is throttled to one segment at a time", async () => {
+    const { percents, result } = await runHls({
+      count: 6,
+      releaseOrder: [0, 1, 2, 3, 4, 5],
+      throttle: true,
+    });
+
+    expect(result.tag).toBe("Ok");
+    expect(percents.map((value) => Math.round(value))).toEqual([17, 33, 50, 67, 83, 99]);
+    expect(percents.every((value, index) => index === 0 || value >= (percents[index - 1] as number))).toBe(true);
+  });
+
+  it("cannot jump forward when intermediate events are dropped by the emission throttle", async () => {
+    const { percents, result } = await runHls({
+      count: 3,
+      releaseOrder: [2, 0, 1],
+      clockStep: 100, // all but the first update fall inside the 2 Hz window
+    });
+
+    expect(result.tag).toBe("Ok");
+    // Dropped events may hide intermediate steps, but the reported value is settled work and is
+    // far below completion: the old assignment-index formula would have emitted 100 here.
+    expect(percents.map((value) => Math.round(value))).toEqual([33]);
+    expect(percents.every((value) => value < 100)).toBe(true);
   });
 });
