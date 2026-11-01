@@ -451,9 +451,15 @@ export function parsePlaylist(text: string, baseUrl: URL): HlsResult {
     if (overLimit()) break;
     const line = rawLine.trim();
     if (line.length === 0) continue;
-    if (line.startsWith("#EXT-X-I-FRAME-STREAM-INF")) continue; // I-frame playlists are separate (F12)
-    if (line.startsWith("#EXT-X-STREAM-INF:")) {
-      const attributes = parseAttributes(line.slice("#EXT-X-STREAM-INF:".length));
+    const colon = line.indexOf(":");
+    // Classify tags by their exact name instead of by prefix. HLS tag names include prefix pairs
+    // (DISCONTINUITY / DISCONTINUITY-SEQUENCE, MEDIA / MEDIA-SEQUENCE, KEY / SESSION-KEY), so a
+    // prefix match can hand a metadata tag to the wrong branch depending on order.
+    const tag = colon === -1 ? line : line.slice(0, colon);
+    const value = colon === -1 ? undefined : line.slice(colon + 1);
+    if (tag === "#EXT-X-I-FRAME-STREAM-INF") continue; // I-frame playlists are separate (F12)
+    if (tag === "#EXT-X-STREAM-INF" && value !== undefined) {
+      const attributes = parseAttributes(value);
       const width = parseInteger(attributes.RESOLUTION?.split("x")[0]);
       const height = parseInteger(attributes.RESOLUTION?.split("x")[1]);
       pendingVariant = {
@@ -469,8 +475,8 @@ export function parsePlaylist(text: string, baseUrl: URL): HlsResult {
       sawStreamInf = true;
       continue;
     }
-    if (line.startsWith("#EXT-X-MEDIA:")) {
-      const attributes = parseAttributes(line.slice("#EXT-X-MEDIA:".length));
+    if (tag === "#EXT-X-MEDIA" && value !== undefined) {
+      const attributes = parseAttributes(value);
       const group = attributes["GROUP-ID"] ?? "";
       const name = attributes.NAME ?? "";
       const language = attributes.LANGUAGE;
@@ -495,22 +501,22 @@ export function parsePlaylist(text: string, baseUrl: URL): HlsResult {
       }
       continue;
     }
-    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
-      const sequence = parseInteger(line.slice("#EXT-X-MEDIA-SEQUENCE:".length));
+    if (tag === "#EXT-X-MEDIA-SEQUENCE" && value !== undefined) {
+      const sequence = parseInteger(value);
       if (sequence !== undefined) mediaSequence = sequence;
       continue;
     }
-    if (line.startsWith("#EXTINF:")) {
-      const value = line.slice("#EXTINF:".length).split(",")[0] ?? "";
-      pendingDuration = parseNumber(value.trim());
+    if (tag === "#EXTINF" && value !== undefined) {
+      const duration = value.split(",")[0] ?? "";
+      pendingDuration = parseNumber(duration.trim());
       continue;
     }
-    if (line.startsWith("#EXT-X-BYTERANGE:")) {
-      pendingByteRange = parseByteRange(line.slice("#EXT-X-BYTERANGE:".length).trim(), lastByteRangeEnd);
+    if (tag === "#EXT-X-BYTERANGE" && value !== undefined) {
+      pendingByteRange = parseByteRange(value.trim(), lastByteRangeEnd);
       continue;
     }
-    if (line.startsWith("#EXT-X-MAP:")) {
-      const attributes = parseAttributes(line.slice("#EXT-X-MAP:".length));
+    if (tag === "#EXT-X-MAP" && value !== undefined) {
+      const attributes = parseAttributes(value);
       const uri = attributes.URI === undefined ? undefined : resolveUrl(attributes.URI, baseUrl);
       if (uri === undefined) return { kind: "invalid", reason: HLS_PARSE_ERROR };
       const range = attributes.BYTERANGE === undefined ? undefined : parseByteRange(attributes.BYTERANGE, 0);
@@ -521,29 +527,32 @@ export function parsePlaylist(text: string, baseUrl: URL): HlsResult {
       };
       continue;
     }
-    if (line.startsWith("#EXT-X-KEY:")) {
-      const key = parseKey(parseAttributes(line.slice("#EXT-X-KEY:".length)), baseUrl);
+    if (tag === "#EXT-X-KEY" && value !== undefined) {
+      const key = parseKey(parseAttributes(value), baseUrl);
       currentKey = key;
       if (key !== undefined) noteDrm(key);
       continue;
     }
-    if (line.startsWith("#EXT-X-SESSION-KEY:")) {
-      const key = parseKey(parseAttributes(line.slice("#EXT-X-SESSION-KEY:".length)), baseUrl);
+    if (tag === "#EXT-X-SESSION-KEY" && value !== undefined) {
+      const key = parseKey(parseAttributes(value), baseUrl);
       if (key !== undefined) noteDrm(key);
       continue;
     }
-    if (line.startsWith("#EXT-X-SESSION-DATA:")) {
-      const attributes = parseAttributes(line.slice("#EXT-X-SESSION-DATA:".length));
+    if (tag === "#EXT-X-SESSION-DATA" && value !== undefined) {
+      const attributes = parseAttributes(value);
       const id = attributes["DATA-ID"] ?? "";
       if (DRM_SESSION_DATA.test(id)) contentProtection.add(id);
       continue;
     }
-    if (line.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
-      const timestamp = Date.parse(line.slice("#EXT-X-PROGRAM-DATE-TIME:".length).trim());
+    if (tag === "#EXT-X-PROGRAM-DATE-TIME" && value !== undefined) {
+      const timestamp = Date.parse(value.trim());
       pendingProgramDateTime = Number.isNaN(timestamp) ? undefined : timestamp;
       continue;
     }
-    if (line.startsWith("#EXT-X-DISCONTINUITY")) {
+    // Playlist metadata: the discontinuity sequence number of the first segment. It is not a
+    // boundary between segments and it is not the media sequence, so it changes no parser state.
+    if (tag === "#EXT-X-DISCONTINUITY-SEQUENCE") continue;
+    if (tag === "#EXT-X-DISCONTINUITY") {
       pendingDiscontinuity = true;
       continue;
     }

@@ -134,6 +134,125 @@ describe("parsePlaylist — media playlist semantics (F11/F17)", () => {
   });
 });
 
+describe("tag classification uses exact tag names", () => {
+  const MEDIA_BASE = new URL("https://cdn.example.com/hls/media/index.m3u8");
+  const HEADER = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:41
+`;
+  const parseMedia = (body: string) => {
+    const parsed = parsePlaylist(HEADER + body, MEDIA_BASE);
+    if (parsed.kind !== "media") throw new Error(`expected a media playlist, got ${parsed.kind}`);
+    return parsed;
+  };
+
+  it("does not turn a discontinuity-sequence header into a segment boundary", () => {
+    const parsed = parseMedia(`#EXT-X-DISCONTINUITY-SEQUENCE:7
+#EXTINF:6,
+seg0.ts
+#EXTINF:6,
+seg1.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.segments.map((segment) => segment.discontinuity)).toEqual([undefined, undefined]);
+    expect(parsed.mediaSequence).toBe(41);
+  });
+
+  it("does not turn a mid-playlist discontinuity-sequence tag into a boundary", () => {
+    const parsed = parseMedia(`#EXTINF:6,
+seg0.ts
+#EXT-X-DISCONTINUITY-SEQUENCE:8
+#EXTINF:6,
+seg1.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.segments.map((segment) => segment.discontinuity)).toEqual([undefined, undefined]);
+  });
+
+  it("keeps a real discontinuity boundary and resets it after the next segment", () => {
+    const parsed = parseMedia(`#EXTINF:6,
+seg0.ts
+#EXT-X-DISCONTINUITY
+#EXTINF:6,
+seg1.ts
+#EXTINF:6,
+seg2.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.segments.map((segment) => segment.discontinuity)).toEqual([undefined, true, undefined]);
+  });
+
+  it("does not clear a pending real boundary when a sequence tag follows it", () => {
+    const parsed = parseMedia(`#EXTINF:6,
+seg0.ts
+#EXT-X-DISCONTINUITY
+#EXT-X-DISCONTINUITY-SEQUENCE:9
+#EXTINF:6,
+seg1.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.segments.map((segment) => segment.discontinuity)).toEqual([undefined, true]);
+  });
+
+  it("still parses segments and durations when both sequence tags are present", () => {
+    const parsed = parseMedia(`#EXT-X-DISCONTINUITY-SEQUENCE:0
+#EXTINF:5,
+a.ts
+#EXTINF:7,
+b.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.duration).toBe(12);
+    expect(parsed.segments.map((segment) => segment.uri.href)).toEqual([
+      "https://cdn.example.com/hls/media/a.ts",
+      "https://cdn.example.com/hls/media/b.ts",
+    ]);
+  });
+
+  it("routes media renditions and media-sequence as separate tags", () => {
+    const parsed = parseMedia(`#EXT-X-MEDIA-SEQUENCE:100
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English"
+#EXTINF:6,
+seg0.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.mediaSequence).toBe(100);
+    expect(parsed.segments).toHaveLength(1);
+  });
+
+  it("still parses a media rendition when a media-sequence tag is present", () => {
+    const parsed = parsePlaylist(`#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:100
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",URI="audio/en.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1000000
+v1.m3u8
+`, MEDIA_BASE);
+    expect(parsed.kind).toBe("master");
+    if (parsed.kind !== "master") return;
+    expect(parsed.audioRenditions).toHaveLength(1);
+    expect(parsed.audioRenditions[0]?.language).toBe("en");
+  });
+
+  it("treats an I-frame stream tag as a separate tag, not a normal variant", () => {
+    const parsed = parsePlaylist(`#EXTM3U
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=200000,URI="iframes.m3u8",CODECS="avc1.4d401f"
+seg.ts
+`, MEDIA_BASE);
+    expect(parsed.kind).toBe("media");
+  });
+
+  it("does not let a session key replace the active key", () => {
+    const parsed = parseMedia(`#EXT-X-KEY:METHOD=AES-128,URI="key.bin"
+#EXT-X-SESSION-KEY:METHOD=AES-128,URI="session.bin"
+#EXTINF:6,
+seg0.ts
+#EXT-X-ENDLIST
+`);
+    expect(parsed.segments[0]?.key?.uri?.href).toBe("https://cdn.example.com/hls/media/key.bin");
+  });
+});
+
 describe("durationOf — unknown / live / sum (F11)", () => {
   it("is 'unknown' for an empty or partially-unparsable playlist", () => {
     expect(durationOf([], 0)).toBe("unknown");
