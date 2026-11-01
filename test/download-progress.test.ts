@@ -20,4 +20,18 @@ describe("download progress sampling", () => {
     applyDownloadProgress(entry, { status: "downloading", fetched_bytes_count: 1_000_000 }, 2000);
     expect(entry.bitrate).toBe(0);
   });
+
+  it("keeps stored percentages on the 0..100 scale the panel renders", () => {
+    const entry = downloadingEntry();
+    applyDownloadProgress(entry, { status: "downloading", percent: { is_known: true, value: 42.5 } }, 1000);
+    expect(entry.percent).toBe(42.5);
+    applyDownloadProgress(entry, { status: "downloading", percent: { is_known: true, value: 150 } }, 2000);
+    expect(entry.percent).toBe(100);
+    applyDownloadProgress(entry, { status: "downloading", percent: { is_known: true, value: -5 } }, 3000);
+    expect(entry.percent).toBe(0);
+    applyDownloadProgress(entry, { status: "downloading", percent: { is_known: true, value: Number.NaN } }, 4000);
+    expect(entry.percent).toBe(0);
+    applyDownloadProgress(entry, { status: "downloading", percent: { is_known: false, value: 20 } }, 5000);
+    expect(entry.percent).toBe(0);
+  });
 });

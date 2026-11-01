@@ -23,6 +23,11 @@ import type {
   TransferOutcome,
 } from "../core/types.js";
 import { PROGRESS_INTERVAL_MS, httpFailureReason, otherFailureReason, userAbortReason } from "../core/types.js";
+import {
+  IN_PROGRESS_PERCENT_MAX,
+  clampPercent,
+  percentFromBytes,
+} from "../core/progress.js";
 import { Channel } from "../protocol/channels.js";
 import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
@@ -101,7 +106,11 @@ export function applyDownloadProgress(entry: DownloadingEntry, progress: Downloa
   }
   if (progress.status !== "downloading") return;
   entry.status = "downloading";
-  if (progress.percent !== undefined && progress.percent.is_known) entry.percent = progress.percent.value;
+  if (progress.percent !== undefined && progress.percent.is_known) {
+    // Receiving boundary: the wire unit is 0..100 (core/progress.ts), so never persist a wild value.
+    const percent = clampPercent(progress.percent.value);
+    if (percent !== undefined) entry.percent = percent;
+  }
   if (progress.output_duration_s !== undefined) entry.output_duration_s = progress.output_duration_s;
   const fetched = progress.fetched_bytes_count;
   if (fetched === undefined || !Number.isFinite(fetched) || fetched < 0) return;
@@ -1427,10 +1436,13 @@ export class MediaDownloaderService {
         this.worker.sendRelayChunk(plan.download_id, bytes);
         offset += bytes.byteLength;
         if (total !== undefined) {
+          // The panel renders 0..100; keep the last chunk at 99 so it cannot claim completion
+          // before the file is saved (core/progress.ts documents the unit).
+          const percent = percentFromBytes(offset, total, IN_PROGRESS_PERCENT_MAX);
           this.onProgress(plan.download_id, {
             status: "downloading",
             fetched_bytes_count: offset,
-            percent: { is_known: true, value: Math.min(0.99, offset / total) },
+            ...(percent !== undefined ? { percent: { is_known: true, value: percent } } : {}),
           });
         }
         if (bytes.byteLength < chunkSize) break;
