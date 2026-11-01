@@ -22,7 +22,7 @@ import {
   isHlsStrategy,
   otherFailureReason,
 } from "../core/types.js";
-import { percentFromBytes, percentFromRatio } from "../core/progress.js";
+import { IN_PROGRESS_PERCENT_MAX, percentFromBytes, percentFromRatio } from "../core/progress.js";
 import { err, ok, type Result } from "../core/option.js";
 import { MAX_HLS_MANIFEST_BYTES, parsePlaylist } from "../manifests/hls.js";
 import {
@@ -1122,6 +1122,7 @@ export class DownloadWorker {
     const chunks: Array<Uint8Array | null | undefined> = new Array(annotatedDescriptors.length);
     let fetchedBytes = 0;
     let failed = 0;
+    let settledSegments = 0;
     let nextWrite = 0;
     let writeChain: Promise<void> = Promise.resolve();
     const flushReady = async (): Promise<void> => {
@@ -1137,6 +1138,27 @@ export class DownloadWorker {
     const queueFlush = (): Promise<void> => {
       writeChain = writeChain.then(flushReady);
       return writeChain;
+    };
+
+    // Segment workers finish out of order, so progress must count completed attempts instead of
+    // the worker's assigned index; otherwise the reported percentage can jump and fall back.
+    const reportSegmentProgress = (): void => {
+      settledSegments += 1;
+      this.emitProgress(plan.download_id, {
+        status: "downloading",
+        fetched_bytes_count: fetchedBytes,
+        ...(typeof parsed.duration === "number"
+          ? {
+              percent: {
+                is_known: true,
+                value: percentFromRatio(
+                  settledSegments / annotatedDescriptors.length,
+                  IN_PROGRESS_PERCENT_MAX,
+                ),
+              },
+            }
+          : { percent: { is_known: false, value: 0 } }),
+      });
     };
 
     const worker = async (): Promise<void> => {
@@ -1167,23 +1189,13 @@ export class DownloadWorker {
           if (index === 0) throw new Error("Required segment was invalid, aborting download.");
           chunks[index] = null;
           if (staged !== undefined) await queueFlush();
+          reportSegmentProgress();
           continue;
         }
         chunks[index] = response.value.bytes;
         fetchedBytes += response.value.bytes.byteLength;
         if (staged !== undefined) await queueFlush();
-        this.emitProgress(plan.download_id, {
-          status: "downloading",
-          fetched_bytes_count: fetchedBytes,
-          ...(typeof parsed.duration === "number"
-            ? {
-                percent: {
-                  is_known: true,
-                  value: percentFromRatio((index + 1) / annotatedDescriptors.length),
-                },
-              }
-            : { percent: { is_known: false, value: 0 } }),
-        });
+        reportSegmentProgress();
       }
     };
 
