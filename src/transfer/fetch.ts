@@ -360,10 +360,6 @@ const isAbortError = (error: unknown): boolean =>
 
 /**
  * One HTTP attempt: fetch + read the whole body into memory with a deadline.
- *
- * This is the rebuilt `ne`+`pe` pair (E12) without a retry loop; wrap it with `withRetry`.
- * Error mapping keeps the original taxonomy so `save.mapWorkerErrorToReason` can round-trip the
- * proven user-visible strings.
  */
 export async function fetchBytes(
   fetchImpl: FetchLike,
@@ -401,34 +397,38 @@ export async function fetchBytes(
   if (response.body === null) return err(otherError("No body"));
 
   const totalBytes = responseTotalBytes(response);
-  if (totalBytes !== undefined) options.onTotalSize?.(totalBytes);
-
   const timeoutMs = options.timeoutMs ?? BODY_READ_TIMEOUT_MS;
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  let completed = false;
+  // Every early exit - abort, read timeout, byte cap, a failing chunk consumer or size callback,
+  // a failed read - releases the response body here. Otherwise the error path leaves the stream
+  // (and the network request behind it) live after the transfer already stopped using it.
+  const release = async (): Promise<void> => {
+    await reader.cancel?.().catch(() => undefined);
+  };
 
-  for (;;) {
-    if (signal?.aborted) {
-      await reader.cancel?.().catch(() => undefined);
-      return err(abortedError());
-    }
-    const read = await withDeadline(reader.read(), timeoutMs);
-    if (read === TIMED_OUT) {
-      await reader.cancel?.().catch(() => undefined);
-      return err(timeoutError("Timeout"));
-    }
-    if (read.done) break;
-    const value = read.value;
-    if (value !== undefined) {
-      total += value.length;
-      if (options.maxBytes !== undefined && total > options.maxBytes) {
-        await reader.cancel?.().catch(() => undefined);
-        return err(otherError(`Response exceeds ${options.maxBytes} bytes`));
+  try {
+    if (totalBytes !== undefined) options.onTotalSize?.(totalBytes);
+    for (;;) {
+      if (signal?.aborted) return err(abortedError());
+      const read = await withDeadline(reader.read(), timeoutMs);
+      if (read === TIMED_OUT) return err(timeoutError("Timeout"));
+      if (read.done) break;
+      const value = read.value;
+      if (value !== undefined) {
+        total += value.length;
+        if (options.maxBytes !== undefined && total > options.maxBytes) {
+          return err(otherError(`Response exceeds ${options.maxBytes} bytes`));
+        }
+        if (options.onChunk !== undefined) await options.onChunk(value);
+        else chunks.push(value);
       }
-      if (options.onChunk !== undefined) await options.onChunk(value);
-      else chunks.push(value);
     }
+    completed = true;
+  } finally {
+    if (!completed) await release();
   }
 
   return ok({
