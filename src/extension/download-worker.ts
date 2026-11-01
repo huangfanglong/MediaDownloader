@@ -22,6 +22,7 @@ import {
   isHlsStrategy,
   otherFailureReason,
 } from "../core/types.js";
+import { percentFromBytes, percentFromRatio } from "../core/progress.js";
 import { err, ok, type Result } from "../core/option.js";
 import { MAX_HLS_MANIFEST_BYTES, parsePlaylist } from "../manifests/hls.js";
 import {
@@ -359,13 +360,14 @@ export class DownloadWorker {
     let totalSize = plan.size !== undefined && Number.isFinite(plan.size) && plan.size > 0
       ? plan.size
       : undefined;
-    const downloadingProgress = (fetchedBytes: number): DownloadProgress => ({
-      status: "downloading",
-      fetched_bytes_count: fetchedBytes,
-      ...(totalSize !== undefined
-        ? { percent: { is_known: true, value: Math.min(100, fetchedBytes / totalSize * 100) } }
-        : {}),
-    });
+    const downloadingProgress = (fetchedBytes: number): DownloadProgress => {
+      const percent = percentFromBytes(fetchedBytes, totalSize);
+      return {
+        status: "downloading",
+        fetched_bytes_count: fetchedBytes,
+        ...(percent !== undefined ? { percent: { is_known: true, value: percent } } : {}),
+      };
+    };
     const onChunk = async (chunk: Uint8Array): Promise<void> => {
       if (staged === undefined) {
         extension = normalizeMediaOutputExtension(extension, chunk, true);
@@ -1177,7 +1179,7 @@ export class DownloadWorker {
             ? {
                 percent: {
                   is_known: true,
-                  value: Math.min(100, (index + 1) / annotatedDescriptors.length * 100),
+                  value: percentFromRatio((index + 1) / annotatedDescriptors.length),
                 },
               }
             : { percent: { is_known: false, value: 0 } }),
