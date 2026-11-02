@@ -173,8 +173,12 @@ export function scopedHeadersFor(segmentUrl: string, captureOrigin: string, head
 // declarativeNetRequest session-rule model
 // ---------------------------------------------------------------------------
 
-/** Rule budget for one HLS download (`Tv = 750`, E28 lines 8732/8777). */
-export const MAX_DNR_RULES = 750;
+/**
+ * The shipped build capped header rules per download (`Tv = 750`, E28) and chunked
+ * `updateSessionRules` calls. The rebuild replays one exact-URL rule per download and removes it
+ * after saving (see `header-replay.ts`), so the per-download chunking machinery has no caller and
+ * was removed with this comment as the evidence pointer.
+ */
 
 /** Resource type used by every recovered rule (`resourceTypes:["xmlhttprequest"]`). */
 export const DNR_RESOURCE_TYPES = ["xmlhttprequest"] as const;
@@ -241,26 +245,6 @@ export function buildDnrRule(input: BuildDnrRuleInput): DnrRule {
     action: { type: "modifyHeaders", requestHeaders },
     condition,
   };
-}
-
-/**
- * Split rules into `updateSessionRules` batches. The original caps an HLS download's header
- * rules at `Tv = 750`; batching large lists keeps each update under Chrome's per-call limits.
- */
-export function chunkRules<T>(rules: readonly T[], max = MAX_DNR_RULES): T[][] {
-  if (max <= 0) throw new Error("max must be a positive number");
-  const chunks: T[][] = [];
-  for (let index = 0; index < rules.length; index += max)
-    chunks.push(rules.slice(index, index + max));
-  return chunks;
-}
-
-/** Deterministic-enough rule ids for tests; runtime callers inject their own generator. */
-export function allocateRuleIds(
-  count: number,
-  next: () => number = () => Math.ceil(Math.random() * 1e8),
-): number[] {
-  return Array.from({ length: Math.max(0, count) }, () => next());
 }
 
 // ---------------------------------------------------------------------------

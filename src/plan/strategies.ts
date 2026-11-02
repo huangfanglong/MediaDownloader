@@ -35,7 +35,13 @@ export const VIDEO_DEMUXERS: ReadonlySet<string> = new Set(["mp4", "webm", "mkv"
 
 /**
  * Extension/muxer for a demuxer (`it`, F24): mp4 keeps the user's preferred container,
- * webm/mkv become mkv (libav cannot write webm through this mux path).
+ * webm/mkv become mkv.
+ *
+ * Evidence E25 truth table (now owned here; the removed `transfer/remux.ts` mirror had drifted):
+ * audio-only → mp3 transcode; the progressive single-request strategy → source bytes verbatim;
+ * mp4 → preferred muxer; webm/mkv → mkv. `build.ts` refines the WebM half for the js-fetch route:
+ * a video-only WebM stays WebM, while a WebM video with a separate (AAC) audio track becomes MKV
+ * so both streams can be copied without an Opus re-encode.
  */
 export function extensionForDemuxer(demuxer: string, preferredAvMuxer: "mp4" | "mkv"): string {
   if (demuxer === "mp4") return preferredAvMuxer;

@@ -6,6 +6,12 @@
  * ranged path used to emit `offset / total` (0..1), which the panel rounded to 0/1% for the whole
  * transfer. Keeping the formula here makes the unit explicit and gives every producer
  * a single function to call.
+ *
+ * The shipped worker preferred the muxed output duration (`ffmpeg_get_out_time_ms`) over bytes when
+ * both were known (`U`, E19). The rebuilt ffmpeg.wasm runner does not surface a per-job
+ * out-duration, so every producer here reports bytes against a known total (native/ranged/runtime
+ * relay) or settled segments against the planned segment count (HLS). The duration-based variant
+ * was removed with that data source: keeping a second unused formula would only invite drift.
  */
 
 /** The scale the panel renders: 0..100. */

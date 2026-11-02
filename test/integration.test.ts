@@ -108,7 +108,9 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
       mediaPlaylistUrl: "https://cdn.test/1080/index.m3u8",
       mediaPlaylist: fmp4MediaPlaylist,
       segmentPrefix: "https://cdn.test/1080/",
-      segments: 2,
+      // The fixture playlist lists three segments; all of them must be served or the output
+      // completeness gate refuses the (correctly) incomplete result.
+      segments: 3,
       initBytes: "INIT",
     });
     vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:source-hls");

@@ -8,7 +8,7 @@
  *  - `limits.ts`  — in-memory body ceilings for what the worker will buffer (segments, tracks).
  *  - `assemble.ts`— HLS segment descriptors, init/AES boundary, concatenation, progress gates
  *                   (E15-E17, E19).
- *  - `remux.ts`   — container/codec decision table and remux boundary (E21, E24-E25).
+ *  - `remux.ts`   — staged-output MIME type (E24).
  *  - `save.ts`    — filename, `chrome.downloads` request, terminal-state and error mapping
  *                   (E28, E29, E32).
  *

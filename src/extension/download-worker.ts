@@ -26,11 +26,10 @@ import { IN_PROGRESS_PERCENT_MAX, percentFromBytes, percentFromRatio } from "../
 import { err, ok, type Result } from "../core/option.js";
 import { MAX_HLS_MANIFEST_BYTES, parsePlaylist } from "../manifests/hls.js";
 import {
-  MAX_FAILED_SEGMENT_RATIO,
   MIN_OUTPUT_BYTES,
   buildSegmentRequests,
+  checkOutputCompleteness,
   classifySegmentFailure,
-  computePercent,
   concatenate,
   isTooManyFailedSegments,
 } from "../transfer/assemble.js";
@@ -48,6 +47,7 @@ import {
   type FfmpegRunnerLike,
 } from "../transfer/ffmpeg.js";
 import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
+import { endingReasonToMessage } from "../transfer/save.js";
 import { muxFragmentedMp4ToSink } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
 import { sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
@@ -1187,6 +1187,16 @@ export class DownloadWorker {
     let fetchedBytes = 0;
     let failed = 0;
     let settledSegments = 0;
+    /**
+     * Planned vs fetched segment duration, used by the E19 completeness gate. Init sections have
+     * no duration and drop out of both sums; streams whose playlist has unknown durations keep
+     * `totalDurationS = 0` and skip the duration gate instead of guessing.
+     */
+    const totalDurationS = annotatedDescriptors.reduce(
+      (sum, descriptor) => sum + (typeof descriptor.duration_s === "number" ? descriptor.duration_s : 0),
+      0,
+    );
+    let fetchedDurationS = 0;
     let nextWrite = 0;
     /** Bytes of completed segments waiting for the ordered write head. */
     let retainedBytes = 0;
@@ -1299,13 +1309,26 @@ export class DownloadWorker {
             throw new Error(fatal);
           }
           failed += 1;
-          if (index === 0) throw new Error("Required segment was invalid, aborting download.");
+          // The shared policy decides whether this failure is tolerable: the first segment is
+          // mandatory, and too many failures abort instead of being skipped into a short file.
+          const failure = classifySegmentFailure({
+            failedSegments: failed,
+            totalSegments: annotatedDescriptors.length,
+            isFirst: index === 0,
+          });
+          if (failure.tag === "Err") {
+            // Report the recovered message verbatim: the service maps it back to the original
+            // ending-reason taxonomy, so an "Error:" prefix would break the match.
+            fatal = failure.error.message ?? "segment failure";
+            throw new Error(fatal);
+          }
           chunks[index] = null;
           if (staged !== undefined) await queueFlush();
           reportSegmentProgress();
           continue;
         }
         chunks[index] = response.value.bytes;
+        if (typeof descriptor.duration_s === "number") fetchedDurationS += descriptor.duration_s;
         retainedBytes += response.value.bytes.byteLength;
         fetchedBytes += response.value.bytes.byteLength;
         if (staged !== undefined) {
@@ -1341,9 +1364,20 @@ export class DownloadWorker {
       return err("user_abort");
     }
 
-    if (isTooManyFailedSegments(failed, annotatedDescriptors.length) || fetchedBytes < 1_000) {
+    if (isTooManyFailedSegments(failed, annotatedDescriptors.length)) {
       if (staged !== undefined) await staged.abort().catch(() => undefined);
-      return err(fetchedBytes < 1_000 ? "Downloaded content is too small" : "Too many invalid segments, aborting download.");
+      return err("Too many invalid segments, aborting download.");
+    }
+    // Output acceptance gates (E19): a completed download whose fetched duration covers less than
+    // 95 % of the planned one (with at least 5 % progress) is reported as incomplete instead of
+    // being saved as a silently short file; under 1000 bytes is a hard failure.
+    const completeness = checkOutputCompleteness({
+      outputBytes: fetchedBytes,
+      ...(totalDurationS > 0 ? { durationS: totalDurationS, outputDurationMs: fetchedDurationS * 1000 } : {}),
+    });
+    if (completeness.tag === "Err") {
+      if (staged !== undefined) await staged.abort().catch(() => undefined);
+      return err(endingReasonToMessage(completeness.error));
     }
 
     const available = chunks.filter((chunk): chunk is Uint8Array => chunk instanceof Uint8Array);
@@ -1480,5 +1514,5 @@ export function bootDownloadWorker(
   return worker;
 }
 
-export { removeStagedFile, computePercent, classifySegmentFailure, MAX_FAILED_SEGMENT_RATIO, httpFailureReason, otherFailureReason };
+export { removeStagedFile, httpFailureReason, otherFailureReason };
 

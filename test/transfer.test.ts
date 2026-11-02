@@ -24,11 +24,9 @@ import {
 } from "../src/transfer/retry.js";
 import {
   FORBIDDEN_HEADERS,
-  MAX_DNR_RULES,
   SAFE_HEADERS,
   buildDnrRule,
   escapeDnrRegex,
-  chunkRules,
   fetchBytes,
   headersForJsFetch,
   headersForNativeRequest,
@@ -43,7 +41,6 @@ import {
   buildSegmentRequests,
   checkOutputCompleteness,
   classifySegmentFailure,
-  computePercent,
   concatenate,
   defaultIv,
   isTooManyFailedSegments,
@@ -370,18 +367,6 @@ describe("declarativeNetRequest rules (E28)", () => {
     expect(urlFilterFor("https://cdn.example/")).toBe("|https://cdn.example/*");
     expect(urlFilterFor("https://cdn.example/*")).toBe("https://cdn.example/*");
     expect(urlFilterFor("media-segment")).toBe("media-segment*");
-  });
-
-  it("chunks rules at the proven 750-rule budget", () => {
-    expect(MAX_DNR_RULES).toBe(750);
-    const rules = Array.from({ length: 751 }, (_, index) => index);
-    const chunks = chunkRules(rules);
-    expect(chunks).toHaveLength(2);
-    expect(chunks[0]).toHaveLength(750);
-    expect(chunks[1]).toEqual([750]);
-    expect(chunkRules(rules.slice(0, 750))).toHaveLength(1);
-    expect(chunkRules([])).toEqual([]);
-    expect(() => chunkRules(rules, 0)).toThrow("max must be a positive number");
   });
 });
 
@@ -777,36 +762,6 @@ describe("failure policy and completion gates (E17/E19)", () => {
         isFirst: false,
       }),
     ).toEqual(ok("skip"));
-  });
-
-  it("computePercent prefers output duration, then output size, else unknown", () => {
-    expect(computePercent({ duration: 100 }, 0, 50_000)).toEqual({
-      is_known: true,
-      value: 50,
-    });
-    expect(computePercent({ size: 2000 }, 500, undefined)).toEqual({
-      is_known: true,
-      value: 25,
-    });
-    expect(computePercent({}, 500, undefined)).toEqual({
-      is_known: false,
-      value: 0,
-    });
-    expect(computePercent({ duration: "live", size: 1000 }, 250)).toEqual({
-      is_known: true,
-      value: 25,
-    });
-    // The strip-audio strategy never trusts percentages in the original (E19).
-    expect(
-      computePercent(
-        { duration: 10, strategy: "http_strip_audio_jsfetch" },
-        0,
-        5000,
-      ),
-    ).toEqual({
-      is_known: false,
-      value: 0,
-    });
   });
 
   it("rejects output under 1000 bytes with the verbatim message", () => {

@@ -61,6 +61,7 @@ interface RunOptions {
   count: number;
   releaseOrder: number[];
   failingIndex?: number;
+  failingIndices?: number[];
   throttle?: boolean;
   /** Wall-clock added before each release; controls which events pass the 2 Hz emission throttle. */
   clockStep?: number;
@@ -99,11 +100,12 @@ async function runHls(options: RunOptions): Promise<RunResult> {
       if (typeof progress?.fetched_bytes_count === "number") byteSamples.push(progress.fetched_bytes_count);
     },
   };
+  const failing = new Set(options.failingIndices ?? (options.failingIndex === undefined ? [] : [options.failingIndex]));
   const fetchImpl: FetchLike = async (url) => {
     if (url === MANIFEST_URL) return bytesResponse(new TextEncoder().encode(playlistFor(options.count)));
     const index = Number(/seg-(\d+)\.ts/u.exec(url)?.[1] ?? -1);
     if (index < 0) return { status: 404, ok: false, body: null };
-    if (index === options.failingIndex) return { status: 404, ok: false, body: null };
+    if (failing.has(index)) return { status: 404, ok: false, body: null };
     await gates.get(index)?.gate;
     return bytesResponse(new Uint8Array(SEGMENT_BYTES).fill(index + 1));
   };
@@ -170,11 +172,27 @@ describe("HLS segment progress under concurrent workers", () => {
       failingIndex: 2,
     });
 
-    expect(result.tag).toBe("Ok");
     // Four planned segments: the failure and the three successes each advance one step.
     expect(percents.map((value) => Math.round(value))).toEqual([25, 50, 75, 99]);
     expect(percents.every((value, index) => index === 0 || value >= (percents[index - 1] as number))).toBe(true);
     expect(percents).not.toContain(100);
+    // A quarter of the stream duration is missing, so the output completeness gate (E19) refuses
+    // to save the short file as a finished download.
+    expect(result).toEqual({ tag: "Err", error: "Incomplete percentage." });
+  });
+
+  it("accepts a failure that costs little of the stream duration", async () => {
+    const { result } = await runHls({ count: 40, releaseOrder: [0], failingIndex: 1 });
+    expect(result.tag).toBe("Ok");
+  });
+
+  it("aborts when too many segments fail", async () => {
+    const { result } = await runHls({
+      count: 4,
+      releaseOrder: [0],
+      failingIndices: [1, 2],
+    });
+    expect(result).toEqual({ tag: "Err", error: "Too many invalid segments, aborting download." });
   });
 
   it("reports the same sequence when the plan is throttled to one segment at a time", async () => {

@@ -67,6 +67,12 @@ export interface SegmentDescriptor {
   url: string;
   /** Value for the `Range` request header, e.g. `bytes=0-1023`. */
   range?: string;
+  /**
+   * Playlist duration of this media segment, when the manifest declared it. The worker sums these
+   * for the output completeness gate (E19); init sections have none, so they cancel out of both
+   * sides of the comparison.
+   */
+  duration_s?: number;
   /** When present the downloaded bytes must be AES-128 decrypted before demux/assembly. */
   aes128?: Aes128Reference;
   /** Marks the `#EXT-X-MAP` request so callers can cache/dedupe it. */
@@ -203,6 +209,7 @@ export function buildSegmentRequests(
       options.carryGetParams,
     );
     const descriptor: SegmentDescriptor = { url };
+    if (typeof segment.duration_s === "number") descriptor.duration_s = segment.duration_s;
     if (segment.byte_range)
       descriptor.range = byteRangeHeader(segment.byte_range);
     const aes128 = encryptionOf(segment.encryption, master, sequenceNumber);
@@ -286,47 +293,6 @@ export const MIN_DURATION_COMPLETION_RATIO = 0.95;
 export const MIN_SIZE_COMPLETION_RATIO = 0.9;
 /** Percent gates are only trusted from 5 % upward (E19). */
 export const MIN_TRUSTED_PERCENT = 5;
-
-export interface PercentPlan {
-  duration?: MediaDuration;
-  size?: number;
-  /** Needed only to disable the percent for `http_strip_audio_jsfetch` (E19). */
-  strategy?: string;
-}
-
-export interface PercentResult {
-  is_known: boolean;
-  value: number;
-}
-
-/**
- * The worker's percent rule (E19, `U` lines 2192-2209): prefer the muxed output duration when the
- * plan knows a finite duration, else output bytes against the known total size, else unknown.
- * `outputDurationMs` is the value of `ffmpeg_get_out_time_ms`; `fetchedBytes` is the running
- * output size. The strip-audio strategy never trusts percentages in the original.
- */
-export function computePercent(
-  plan: PercentPlan,
-  fetchedBytes: number,
-  outputDurationMs?: number,
-): PercentResult {
-  if (plan.strategy === "http_strip_audio_jsfetch")
-    return { is_known: false, value: 0 };
-  if (
-    typeof plan.duration === "number" &&
-    plan.duration > 0 &&
-    outputDurationMs !== undefined
-  ) {
-    return {
-      is_known: true,
-      value: (100 * outputDurationMs) / (plan.duration * 1000),
-    };
-  }
-  if (typeof plan.size === "number" && plan.size > 0) {
-    return { is_known: true, value: (100 * fetchedBytes) / plan.size };
-  }
-  return { is_known: false, value: 0 };
-}
 
 /** `true` when the invalid-segment fraction exceeds the proven 0.35 cap (E17). */
 export function isTooManyFailedSegments(
