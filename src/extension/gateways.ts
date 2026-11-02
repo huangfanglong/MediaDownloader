@@ -20,11 +20,16 @@ export interface MessageSender {
   url?: string;
 }
 
+/** Answers a runtime message; valid only when its handler returned `true` to respond later. */
+export type MessageResponder = (response: unknown) => void;
+
 export interface RuntimeGateway {
   /** chrome.runtime.sendMessage — used from pages/scripts to reach the service worker. */
   sendToService(envelope: Envelope): Promise<unknown>;
-  /** chrome.runtime.onMessage */
-  onMessage(handler: (envelope: Envelope, sender: MessageSender) => void): () => void;
+  /** chrome.runtime.onMessage. Return `true` to answer asynchronously through `respond`. */
+  onMessage(
+    handler: (envelope: Envelope, sender: MessageSender, respond: MessageResponder) => boolean | void,
+  ): () => void;
   /** chrome.tabs.sendMessage — service worker → a tab's isolated content script. */
   sendToTab(tabId: number, envelope: Envelope): Promise<void>;
   /** chrome.runtime.getURL */

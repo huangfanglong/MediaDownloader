@@ -14,7 +14,7 @@
  */
 import { Channel, cyrb53 } from "../protocol/channels.js";
 import { MSG } from "../protocol/messages.js";
-import { REBUILD_MESSAGES, RELAY_MESSAGES } from "../protocol/rebuild-messages.js";
+import { REBUILD_MESSAGES, RELAY_MESSAGES, type MediaStreamAck } from "../protocol/rebuild-messages.js";
 import { encode } from "../protocol/serde.js";
 import type { MediaItem, PlaylistEntry } from "../core/types.js";
 import {
@@ -278,18 +278,21 @@ export async function handleMediaStreamRequest(
   /** Bounded ranges: googlevideo rejects plain GETs and open-ended ranges. */
   const RANGE_BYTES = 2 * 1024 * 1024;
   const MESSAGE_CHUNK_BYTES = 512 * 1024;
-  /** Relays must stop cleanly when the extension was reloaded mid-transfer. */
+  /**
+   * Every chunk needs the consumer's explicit verdict. A resolved `sendMessage` only means the
+   * message reached some extension context, not that the bytes were consumed: the relay must stop
+   * when the service worker no longer owns the request (restart, timeout, failure, cancellation).
+   */
   const sendRelay = async (message: Envelope): Promise<boolean> => {
     try {
-      await runtime.sendMessage(message);
-      return true;
+      const response = (await runtime.sendMessage(message)) as MediaStreamAck | undefined;
+      return response?.accepted === true;
     } catch {
       return false;
     }
   };
   try {
     let offset = 0;
-    let seq = 0;
     let total = 0;
     for (let attempt = 0; attempt < 20000; attempt += 1) {
       const end = offset + RANGE_BYTES - 1;
@@ -308,7 +311,7 @@ export async function handleMediaStreamRequest(
         const sent = await sendRelay({
           msg: {
             name: RELAY_MESSAGES.MediaStreamChunk,
-            data: { request_id: data.request_id, seq: seq++, data: bytesToBase64(slice) },
+            data: { request_id: data.request_id, data: bytesToBase64(slice) },
           },
           channel: Channel.FromInjectedToService,
         });

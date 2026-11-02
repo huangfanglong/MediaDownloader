@@ -39,8 +39,12 @@ describe("page-context relay (content script)", () => {
     const runtime = {
       sendMessage: async (message: { msg: { name: string; data: unknown }; channel: number }) => {
         sent.push(message);
+        return { accepted: true };
       },
-      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+      onMessage: {
+        addListener: () => undefined,
+        removeListener: () => undefined,
+      },
     };
     await handleMediaStreamRequest(runtime as never, { request_id: "r1", url: "https://cdn.test/v.mp4" });
     const chunks = sent.filter((message) => message.msg.name === RELAY_MESSAGES.MediaStreamChunk);
@@ -58,11 +62,79 @@ describe("page-context relay (content script)", () => {
     const runtime = {
       sendMessage: async (message: { msg: { name: string } }) => {
         sent.push(message);
+        return { accepted: true };
       },
       onMessage: { addListener: () => undefined, removeListener: () => undefined },
     };
     await handleMediaStreamRequest(runtime as never, { request_id: "r2", url: "https://cdn.test/v.mp4" });
     expect(sent.at(-1)?.msg.name).toBe(RELAY_MESSAGES.MediaStreamError);
+  });
+
+  it("stops fetching when the service worker rejects a chunk", async () => {
+    const body = new Uint8Array(3 * 1024 * 1024).fill(3);
+    let fetches = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { headers?: HeadersInit }) => {
+        fetches += 1;
+        const match = /^bytes=(\d+)-(\d+)$/u.exec(new Headers(init?.headers).get("range") ?? "");
+        const start = match ? Number(match[1]) : 0;
+        const end = match ? Math.min(Number(match[2]), body.length - 1) : body.length - 1;
+        const slice = body.slice(start, end + 1);
+        return {
+          ok: true,
+          status: 206,
+          arrayBuffer: async () => slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength),
+        };
+      }),
+    );
+    const sent: string[] = [];
+    const runtime = {
+      sendMessage: async (message: { msg: { name: string } }) => {
+        sent.push(message.msg.name);
+        return message.msg.name === RELAY_MESSAGES.MediaStreamChunk
+          ? { accepted: false }
+          : { accepted: true };
+      },
+      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+    };
+    await handleMediaStreamRequest(runtime as never, { request_id: "r3", url: "https://cdn.test/v.mp4" });
+    // The first rejected chunk ends the relay: one range fetch, one chunk message, no End.
+    expect(fetches).toBe(1);
+    expect(sent.filter((name) => name === RELAY_MESSAGES.MediaStreamChunk)).toHaveLength(1);
+    expect(sent).not.toContain(RELAY_MESSAGES.MediaStreamEnd);
+  });
+
+  it("stops fetching when the service worker never answers", async () => {
+    const body = new Uint8Array(3 * 1024 * 1024).fill(4);
+    let fetches = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: { headers?: HeadersInit }) => {
+        fetches += 1;
+        const match = /^bytes=(\d+)-(\d+)$/u.exec(new Headers(init?.headers).get("range") ?? "");
+        const start = match ? Number(match[1]) : 0;
+        const end = match ? Math.min(Number(match[2]), body.length - 1) : body.length - 1;
+        const slice = body.slice(start, end + 1);
+        return {
+          ok: true,
+          status: 206,
+          arrayBuffer: async () => slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength),
+        };
+      }),
+    );
+    const sent: string[] = [];
+    const runtime = {
+      sendMessage: async (message: { msg: { name: string } }) => {
+        sent.push(message.msg.name);
+        return undefined;
+      },
+      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+    };
+    await handleMediaStreamRequest(runtime as never, { request_id: "r4", url: "https://cdn.test/v.mp4" });
+    expect(fetches).toBe(1);
+    expect(sent.filter((name) => name === RELAY_MESSAGES.MediaStreamChunk)).toHaveLength(1);
+    expect(sent).not.toContain(RELAY_MESSAGES.MediaStreamEnd);
   });
 });
 

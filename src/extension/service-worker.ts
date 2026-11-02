@@ -224,7 +224,9 @@ export class MediaDownloaderService {
   /** Last accepted progress update per download (the 2 Hz contract in core/types.ts). */
   private readonly lastProgressEmitAt = new Map<string, number>();
   /** Page-relay request id -> download id (review: protected CDNs). */
-  private readonly relayRequests = new Map<string, { downloadId: string; seq: number }>();
+  private readonly relayRequests = new Map<string, { downloadId: string }>();
+  /** Downloads the user cancelled; their relay teardown is not a transfer failure. */
+  private readonly userCancelled = new Set<string>();
   /** Keeps the MV3 worker alive while transfers run (review 4.2). */
   private keepAliveTimer?: ReturnType<typeof setInterval>;
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
@@ -575,10 +577,51 @@ export class MediaDownloaderService {
 
   private subscribeMessages(): void {
     this.disposers.push(
-      this.gateway.runtime.onMessage((envelope, sender) => {
+      this.gateway.runtime.onMessage((envelope, sender, respond) => {
+        if (envelope.channel === Channel.FromInjectedToService && isRelayStreamMessage(envelope.msg?.name)) {
+          // The producer needs a verdict per message, so this branch answers asynchronously.
+          void this.handleRelayMessage(envelope, respond);
+          return true;
+        }
         void this.handleMessage(envelope, sender.tab?.id);
       }),
     );
+  }
+
+  /**
+   * Handle one page-relay message and answer it. `accepted` is the producer's only signal that
+   * its bytes were consumed, so it is true only after the chunk reached the worker.
+   */
+  private async handleRelayMessage(envelope: Envelope, respond: (response: unknown) => void): Promise<void> {
+    let accepted = false;
+    try {
+      await this.ready;
+      const payload = envelope.msg.data as { request_id?: unknown; data?: unknown; error?: unknown } | undefined;
+      const requestId = typeof payload?.request_id === "string" ? payload.request_id : undefined;
+      if (requestId !== undefined) {
+        const entry = this.relayRequests.get(requestId);
+        if (entry !== undefined) {
+          if (envelope.msg.name === RELAY_MESSAGES.MediaStreamChunk) {
+            if (typeof payload?.data === "string") {
+              this.worker.sendRelayChunk(entry.downloadId, base64ToBytes(payload.data));
+              accepted = true;
+            }
+          } else if (envelope.msg.name === RELAY_MESSAGES.MediaStreamEnd) {
+            this.worker.endRelay(entry.downloadId);
+            accepted = true;
+          } else if (envelope.msg.name === RELAY_MESSAGES.MediaStreamError) {
+            console.warn("[media-downloader] page relay failed", payload?.error);
+            this.relayRequests.delete(requestId);
+            this.worker.abortRelay(entry.downloadId);
+            accepted = true;
+          }
+        }
+      }
+    } catch (error) {
+      console.warn("[media-downloader] page relay message failed", error);
+    } finally {
+      respond({ accepted });
+    }
   }
 
   /**
@@ -970,30 +1013,6 @@ export class MediaDownloaderService {
       }
     }
     if (envelope.channel === Channel.FromInjectedToService) {
-      if (name === RELAY_MESSAGES.MediaStreamChunk) {
-        const payload = data as { request_id?: string; data?: string };
-        const entry = payload.request_id !== undefined ? this.relayRequests.get(payload.request_id) : undefined;
-        if (entry && typeof payload.data === "string") {
-          this.worker.sendRelayChunk(entry.downloadId, base64ToBytes(payload.data));
-        }
-        return;
-      }
-      if (name === RELAY_MESSAGES.MediaStreamEnd) {
-        const payload = data as { request_id?: string };
-        const entry = payload.request_id !== undefined ? this.relayRequests.get(payload.request_id) : undefined;
-        if (entry) this.worker.endRelay(entry.downloadId);
-        return;
-      }
-      if (name === RELAY_MESSAGES.MediaStreamError) {
-        const payload = data as { request_id?: string; error?: string };
-        const entry = payload.request_id !== undefined ? this.relayRequests.get(payload.request_id) : undefined;
-        if (entry) {
-          console.warn("[media-downloader] page relay failed", payload.error);
-          this.relayRequests.delete(payload.request_id as string);
-          this.worker.abortRelay(entry.downloadId);
-        }
-        return;
-      }
       if (name === MSG.injectedToService.OnMedia) {
         // Reference adapter path: a content script reported a page-world media hint.
         const raw = (data as { media?: unknown }).media;
@@ -1223,9 +1242,23 @@ export class MediaDownloaderService {
 
   private abortDownload(downloadId: string): void {
     const entry = this.session.downloading.get(downloadId);
-    if (entry) entry.status = "finalizing";
+    if (entry) {
+      entry.status = "finalizing";
+      this.userCancelled.add(downloadId);
+      // The page may currently be feeding the relay; close it so its next chunk is rejected.
+      this.stopRelay(downloadId);
+    }
     if (!this.queue.cancelPendingTask(downloadId)) this.worker.abort(downloadId);
     void this.publish();
+  }
+
+  /** Close every page relay feeding this download; the producer is rejected on its next chunk. */
+  private stopRelay(downloadId: string): void {
+    for (const [requestId, entry] of [...this.relayRequests]) {
+      if (entry.downloadId !== downloadId) continue;
+      this.relayRequests.delete(requestId);
+      this.worker.abortRelay(downloadId);
+    }
   }
 
   /** Release or restore matching page playback around a coordinated direct retry. */
@@ -1329,17 +1362,33 @@ export class MediaDownloaderService {
       await this.headerReplay.remove(ruleIds);
     }
 
-    // detect user abort
-    const isUserAbort = failure === "user_abort" || outcome?.ending_reason?.user_abort === true;
+    // A user cancel is not a transfer failure: the queue, the worker, or a relay teardown can
+    // report it as an error.
+    const userAborted = (): boolean =>
+      this.userCancelled.has(plan.download_id) ||
+      failure === "user_abort" ||
+      outcome?.ending_reason?.user_abort === true;
+    const abortedOutcome = (): Result<TransferOutcome, string> => ({
+      tag: "Ok",
+      value: {
+        download_id: plan.download_id,
+        ending_reason: userAbortReason(),
+        aborted_no_partial: true,
+      } as TransferOutcome,
+    });
 
-    if (failure !== undefined && !isUserAbort) {
+    if (failure !== undefined && !userAborted()) {
       const retryThroughPage =
         meta.tab_id !== undefined &&
         (plan.is_youtube || /http (401|403|416)/u.test(failure));
       if (retryThroughPage) {
         console.info("[media-downloader] relaying transfer through the page context", failure);
         const relayed = await this.relayDownload(plan, meta.tab_id as number);
-        if (isErr(relayed)) return { tag: "Err", error: relayed.error };
+        if (isErr(relayed)) {
+          // A cancel tears the relay down with an error; it is still the user's abort.
+          if (this.userCancelled.has(plan.download_id)) return abortedOutcome();
+          return { tag: "Err", error: relayed.error };
+        }
         outcome = relayed.value;
       } else {
         return { tag: "Err", error: failure };
@@ -1347,12 +1396,15 @@ export class MediaDownloaderService {
     }
 
     // user abort is not an error
-    if (isUserAbort) {
-      return { tag: "Ok", value: {
-        download_id: plan.download_id,
-        ending_reason: userAbortReason(),
-        aborted_no_partial: true,
-      } as TransferOutcome };
+    if (userAborted()) {
+      if (outcome?.internal_bloburl !== undefined) {
+        this.worker.revokeBlobUrl(outcome.internal_bloburl);
+        if (outcome.internal_filename !== undefined) {
+          const root = await this.opfsRoot().catch(() => undefined);
+          if (root) await removeStagedFile(root, outcome.internal_filename).catch(() => undefined);
+        }
+      }
+      return abortedOutcome();
     }
 
     if (outcome === undefined) return { tag: "Err", error: "transfer produced no outcome" };
@@ -1374,7 +1426,7 @@ export class MediaDownloaderService {
    */
   private async relayDownload(plan: DownloadPlan, tabId: number): Promise<Result<TransferOutcome, string>> {
     const requestId = crypto.randomUUID();
-    this.relayRequests.set(requestId, { downloadId: plan.download_id, seq: 0 });
+    this.relayRequests.set(requestId, { downloadId: plan.download_id });
     const completion = this.worker.streamDownload(plan);
     completion.catch(() => undefined);
     const timer = setTimeout(() => {
@@ -1567,6 +1619,7 @@ export class MediaDownloaderService {
     this.session.downloading.delete(plan.download_id);
     this.lastProgressEmitAt.delete(plan.download_id);
     this.activeMediaHashes.delete(media.hash);
+    this.userCancelled.delete(plan.download_id);
     if (isErr(outcome)) {
       console.warn("[media-downloader] download failed", outcome.error, composeFilename(plan));
       this.addNotification({
@@ -1698,6 +1751,16 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
 }
 
 const MAX_CAPTURED_URL_LENGTH = 8192;
+/** Relay messages are answered per message: the producer stops when the verdict is not accepted. */
+const RELAY_STREAM_MESSAGES: ReadonlySet<string> = new Set([
+  RELAY_MESSAGES.MediaStreamChunk,
+  RELAY_MESSAGES.MediaStreamEnd,
+  RELAY_MESSAGES.MediaStreamError,
+]);
+
+const isRelayStreamMessage = (name: string | undefined): boolean =>
+  name !== undefined && RELAY_STREAM_MESSAGES.has(name);
+
 /** Minimum spacing between panel pushes while only progress changed (existing 4 Hz UI budget). */
 const SNAPSHOT_PUSH_INTERVAL_MS = 250;
 /** Overall transfer deadline (direct + relay staging). */

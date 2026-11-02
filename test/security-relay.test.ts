@@ -150,10 +150,11 @@ describe("page-context relay (live YouTube 403 regression)", () => {
     await gateway.deliverToService({
       msg: {
         name: RELAY_MESSAGES.MediaStreamChunk,
-        data: { request_id: relayRequest?.request_id, seq: 0, data: Buffer.from(body).toString("base64") },
+        data: { request_id: relayRequest?.request_id, data: Buffer.from(body).toString("base64") },
       },
       channel: Channel.FromInjectedToService,
     } as Envelope);
+    expect(gateway.lastServiceResponse()).toEqual({ accepted: true });
     await gateway.deliverToService({
       msg: { name: RELAY_MESSAGES.MediaStreamEnd, data: { request_id: relayRequest?.request_id, total: body.length } },
       channel: Channel.FromInjectedToService,

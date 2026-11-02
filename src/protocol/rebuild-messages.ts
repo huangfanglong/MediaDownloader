@@ -51,8 +51,12 @@ export interface MediaStreamRequestData {
 
 export interface MediaStreamChunkData {
   request_id: string;
-  seq: number;
   data: string;
+}
+
+/** Verdict the service returns for a relayed chunk; false stops the page fetch. */
+export interface MediaStreamAck {
+  accepted: boolean;
 }
 
 export interface MediaStreamEndData {

@@ -58,13 +58,17 @@ const runtimeGateway = (): RuntimeGateway => {
   return {
     sendToService: (envelope) => api.runtime.sendMessage(envelope) as Promise<unknown>,
     onMessage: (handler) => {
-      const listener = (message: unknown, sender: ChromeNamespace): void => {
+      const listener = (
+        message: unknown,
+        sender: ChromeNamespace,
+        sendResponse: (response?: unknown) => void,
+      ): boolean | void => {
         const mapped: MessageSender = {
           ...(sender?.tab?.id !== undefined ? { tab: { id: sender.tab.id } } : {}),
           ...(sender?.frameId !== undefined ? { frameId: sender.frameId } : {}),
           ...(sender?.url ? { url: sender.url } : {}),
         };
-        handler(message as Envelope, mapped);
+        return handler(message as Envelope, mapped, (response) => sendResponse(response));
       };
       api.runtime.onMessage.addListener(listener);
       return () => api.runtime.onMessage.removeListener(listener);

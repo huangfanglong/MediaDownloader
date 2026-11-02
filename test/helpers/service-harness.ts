@@ -31,6 +31,8 @@ export interface FakeGateway extends BrowserGateway {
   triggerResponseStarted(details: Record<string, unknown>): Promise<void>;
   triggerSendHeaders(details: Record<string, unknown>): void;
   deliverToService(envelope: Envelope): Promise<void>;
+  /** Verdict the service returned through `respond` during the last delivery, if any. */
+  lastServiceResponse(): unknown;
   downloadRequestsLog: DownloadRequest[];
   notificationLog: Array<{ id: string; title: string; message: string }>;
   badgeTextLog: string[];
@@ -49,7 +51,10 @@ export interface FakeGateway extends BrowserGateway {
 export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Array | string>): FakeGateway {
   const local = new Map<string, unknown>();
   const session = new Map<string, unknown>();
-  const runtimeHandlers = new Set<(envelope: Envelope, sender: { tab?: { id?: number } }) => void>();
+  const runtimeHandlers = new Set<
+    (envelope: Envelope, sender: { tab?: { id?: number } }, respond: (response: unknown) => void) => boolean | void
+  >();
+  let lastServiceResponse: unknown;
   const activatedHandlers = new Set<(info: { tabId: number; windowId: number }) => void>();
   let sendHeadersHandler: ((details: Record<string, unknown>) => void) | undefined;
   let responseStartedHandler: ((details: Record<string, unknown>) => void) | undefined;
@@ -208,9 +213,19 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
       sendHeadersHandler?.(details);
     },
     deliverToService: async (envelope) => {
-      for (const handler of runtimeHandlers) handler(envelope, { tab: { id: 7 } });
+      lastServiceResponse = undefined;
+      let deferred = false;
+      for (const handler of runtimeHandlers) {
+        if (handler(envelope, { tab: { id: 7 } }, (response) => {
+          lastServiceResponse = response;
+        }) === true) {
+          deferred = true;
+        }
+      }
       await flush();
+      if (deferred) await flush();
     },
+    lastServiceResponse: () => lastServiceResponse,
     downloadRequestsLog: downloadsRequests,
     notificationLog: notifications,
     badgeTextLog: badgeTexts,
