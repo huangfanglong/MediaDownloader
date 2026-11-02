@@ -318,7 +318,10 @@ export class MediaDownloaderService {
     return this.engine;
   }
 
-  /** Boot: restore state, purge staging, publish. Listeners are already registered. */
+  /**
+   * Boot: restore state, report downloads interrupted by the previous worker, publish.
+   * Listeners are already registered.
+   */
   async start(): Promise<void> {
     try {
       await this.restoreState();
@@ -357,7 +360,9 @@ export class MediaDownloaderService {
       unknown
     >;
     if (sessionStored[SESSION_KEY] !== undefined) {
-      this.session = decode(sessionStored[SESSION_KEY]) as SessionState;
+      const restored = reconcileRestoredSession(decode(sessionStored[SESSION_KEY]) as SessionState);
+      this.session = restored.session;
+      this.reportInterruptedDownloads(restored.interrupted);
     }
     if (pruneDownloadHistory(this.settings, this.now())) await this.persistSettings();
   }
@@ -423,6 +428,8 @@ export class MediaDownloaderService {
 
   /** Keep the MV3 worker alive while transfers are in flight (review 4.2). */
   private refreshKeepAlive(): void {
+    // Boot detaches rows left over from a previous worker, so every entry here is a transfer this
+    // worker instance owns and can still finish.
     const active = this.session.downloading.size > 0;
     if (active && this.keepAliveTimer === undefined) {
       this.keepAliveTimer = setInterval(() => {
@@ -1624,6 +1631,28 @@ export class MediaDownloaderService {
     this.session.notifications.set(id, record);
   }
 
+  /**
+   * Report downloads whose owning worker lifetime is gone. They are no longer in the active map,
+   * so the panel learns about them through notifications instead of a live progress line.
+   */
+  private reportInterruptedDownloads(entries: readonly DownloadingEntry[]): void {
+    for (const entry of entries) {
+      this.addNotification({
+        type: "download_interrupted",
+        timestamp: this.now(),
+        message: interruptedDownloadName(entry),
+        ...(entry.media?.type !== undefined ? { media_type: entry.media.type } : {}),
+      });
+    }
+    if (entries.length > 0) {
+      console.info(
+        "[media-downloader] reported",
+        entries.length,
+        "download(s) interrupted by a worker restart",
+      );
+    }
+  }
+
   private sendToContent(envelope: Envelope): void {
     void this.gateway.runtime.sendToService(envelope).catch(() => undefined);
   }
@@ -1692,6 +1721,35 @@ function redactHeaders(headers: Headers): Headers {
     if (!SENSITIVE_HEADER.test(name)) redacted.set(name, value);
   }
   return redacted;
+}
+
+export interface ReconciledSession {
+  session: SessionState;
+  /** Downloads that belonged to the previous worker lifetime and cannot be resumed. */
+  interrupted: DownloadingEntry[];
+}
+
+/**
+ * A stored session was written by a service-worker lifetime that no longer exists. Its
+ * `downloading` rows describe work this worker cannot own: the queue task and the worker
+ * correlation that drove them died with that lifetime. Detach them so they are reported as
+ * interrupted instead of being shown as active transfers.
+ */
+export function reconcileRestoredSession(session: SessionState): ReconciledSession {
+  if (session.downloading.size === 0) return { session, interrupted: [] };
+  return {
+    session: { ...session, downloading: new Map<string, DownloadingEntry>() },
+    interrupted: [...session.downloading.values()],
+  };
+}
+
+/** Best-effort filename for an interruption notice; stored entries may predate the current schema. */
+function interruptedDownloadName(entry: DownloadingEntry): string {
+  try {
+    return composeFilename(entry.download_args);
+  } catch {
+    return "Download";
+  }
 }
 
 /** Session copy safe to persist (no cookies/authorization in plans or media items). */
