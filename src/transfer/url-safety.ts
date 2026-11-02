@@ -1,10 +1,12 @@
 /**
- * URL trust checks shared by the manifest-enrichment path and the panel.
+ * URL trust checks shared by the manifest-enrichment path, the transfer worker and the plan
+ * boundary.
  *
  * The extension sees URLs supplied by arbitrary page JavaScript (through the page-world hint
- * bridge). Anything fetched automatically without a user gesture must not be able to reach
- * loopback/private/link-local services, and cross-origin manifests should only be fetched when the
- * browser actually observed them in that tab.
+ * bridge). Anything fetched out of a page-supplied manifest — automatically or after the user
+ * starts a download — must not be able to reach loopback/private/link-local services that the page
+ * itself cannot read, and cross-origin manifests should only be fetched when the browser actually
+ * observed them in that tab.
  */
 
 /** Parse an IPv6 hostname (without brackets/zone) into 16 bytes. */
@@ -117,18 +119,24 @@ export function isSafeManifestUrl(url: URL): boolean {
 }
 
 /**
- * Whether a segment URL resolved from a manifest is safe to fetch.
+ * Whether a URL a playlist points at is safe to fetch.
  *
- * Enforces: http(s) only, no userinfo, and either public network OR same-origin with the manifest
- * (same-origin private network hosts are allowed — the page captured credentials from that origin).
+ * Applies to every URL the transfer resolves out of a playlist, not only media segments: the
+ * variant or audio rendition a master playlist selects is fetched the same way. Enforces: http(s)
+ * only, no userinfo, and either a public network host OR the same origin whose captured credentials
+ * are being replayed (a LAN page may legitimately fetch its own resources, but a public manifest
+ * must not steer the fetch at loopback or another private host).
  */
-export function isSafeSegmentUrl(segmentUrl: URL, manifestUrl: URL): boolean {
-  if (segmentUrl.protocol !== "http:" && segmentUrl.protocol !== "https:") return false;
-  if (segmentUrl.username !== "" || segmentUrl.password !== "") return false;
-  if (isPrivateNetworkHost(segmentUrl.hostname)) {
-    return segmentUrl.origin === manifestUrl.origin;
-  }
+export function isSafeManifestChildUrl(url: URL, captureOrigin: string): boolean {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  if (url.username !== "" || url.password !== "") return false;
+  if (isPrivateNetworkHost(url.hostname)) return url.origin === captureOrigin;
   return true;
+}
+
+/** Whether a segment URL resolved from a manifest is safe to fetch. */
+export function isSafeSegmentUrl(segmentUrl: URL, manifestUrl: URL): boolean {
+  return isSafeManifestChildUrl(segmentUrl, manifestUrl.origin);
 }
 
 /**

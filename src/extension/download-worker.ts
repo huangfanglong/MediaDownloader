@@ -51,7 +51,7 @@ import { endingReasonToMessage } from "../transfer/save.js";
 import { muxFragmentedMp4ToSink } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
 import { DEFAULT_SEGMENT_CONCURRENCY, sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
-import { isSafeSegmentUrl } from "../transfer/url-safety.js";
+import { isSafeManifestChildUrl, isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
   createStagedFile,
   openOpfsRoot,
@@ -1109,7 +1109,14 @@ export class DownloadWorker {
     staged?: StagedFile;
     totalBytes: number;
   }, string>> {
-    const playlistResult = await this.fetchPlaylistText(plan.url.href, headers, signal);
+    // Credentials were captured for the URL that produced this plan (or for its master). Playlist
+    // URLs resolved from that manifest may only replay them to the same origin, and a plan URL
+    // that came from a master is itself manifest-resolved, so it obeys the same gate.
+    const captureOrigin =
+      plan.headers_origin !== undefined && plan.headers_origin !== ""
+        ? plan.headers_origin
+        : plan.url.origin;
+    const playlistResult = await this.fetchPlaylistText(plan.url, captureOrigin, headers, signal);
     if (playlistResult.tag === "Err") {
       // fetchPlaylistText now returns "user_abort" for aborted requests
       return err(playlistResult.error);
@@ -1121,7 +1128,7 @@ export class DownloadWorker {
     if (parsed.kind === "master") {
       const variant = parsed.variants[0];
       if (!variant) return err("empty master playlist");
-      const media = await this.fetchPlaylistText(variant.uri.href, headers, signal);
+      const media = await this.fetchPlaylistText(variant.uri, captureOrigin, headers, signal);
       if (media.tag === "Err") return media;
       parsed = parsePlaylist(media.value, variant.uri);
       if (parsed.kind === "invalid") return err(parsed.reason);
@@ -1155,13 +1162,13 @@ export class DownloadWorker {
       mediaSequence: parsed.mediaSequence,
     });
 
-    // Reject private-network segments unless same-origin with manifest.
-    // Fail fast with a clear error showing only the refused host (not the full URL with tokens).
-    const captureOrigin = plan.headers_origin ?? plan.url.origin;
+    // Reject segments that leave http(s) or reach a private host without being same-origin with
+    // the manifest. Fail fast with a clear error showing only the refused target (not the full URL
+    // with tokens).
     for (const descriptor of descriptors) {
       const segmentUrl = new URL(descriptor.url);
       if (!isSafeSegmentUrl(segmentUrl, plan.url)) {
-        return err(`Segment host ${segmentUrl.hostname} refused by URL-safety gate`);
+        return err(`Segment ${refusedTarget(segmentUrl)} refused by URL-safety gate`);
       }
     }
 
@@ -1390,16 +1397,23 @@ export class DownloadWorker {
   }
 
   private async fetchPlaylistText(
-    url: string,
+    url: URL,
+    captureOrigin: string,
     headers: Headers,
     signal?: AbortSignal,
   ): Promise<Result<string, string>> {
+    // A playlist this transfer was pointed at obeys the segment policy: unsafe URLs are refused
+    // before any request, and captured credentials never leave the origin they were captured for.
+    if (!isSafeManifestChildUrl(url, captureOrigin)) {
+      return err(`Playlist ${refusedTarget(url)} refused by URL-safety gate`);
+    }
+    const scoped = scopedHeadersFor(url.href, captureOrigin, headers);
     // use tested withManifestRetry instead of hand-rolled loop
     const response = await withManifestRetry(async () => {
       return fetchBytes(
         this.deps.fetchImpl,
-        url,
-        { headers },
+        url.href,
+        { headers: scoped },
         { signal, maxBytes: MAX_HLS_MANIFEST_BYTES },
       );
     }, signal);
@@ -1432,6 +1446,11 @@ export class DownloadWorker {
   private post(name: string, data: unknown, channel: number): void {
     this.deps.channel.postMessage({ msg: { name, data }, channel });
   }
+}
+
+/** Name a refused URL in an error: the host when it has one, otherwise the scheme. */
+function refusedTarget(url: URL): string {
+  return url.hostname === "" ? `scheme ${url.protocol}` : `host ${url.hostname}`;
 }
 
 /**
