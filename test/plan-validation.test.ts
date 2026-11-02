@@ -48,4 +48,22 @@ describe("download-plan filename validation", () => {
     expect(validateDownloadPlan(planWithBasename("clip", "foo./"))).toBe("Unsafe download directory");
     expect(validateDownloadPlan(planWithBasename("clip", "Downloads/_CON/"))).toBeUndefined();
   });
+
+  it("only rejects real traversal components, not folder names containing two dots", () => {
+    expect(validateDownloadPlan(planWithBasename("clip", "Season 1..2/"))).toBeUndefined();
+    expect(validateDownloadPlan(planWithBasename("clip", "Movies..2024/"))).toBeUndefined();
+    expect(validateDownloadPlan(planWithBasename("clip", "Downloads/.."))).toBe("Unsafe download directory");
+    expect(validateDownloadPlan(planWithBasename("clip", "../etc/"))).toBe("Unsafe download directory");
+    expect(validateDownloadPlan(planWithBasename("clip", "a/../b/"))).toBe("Unsafe download directory");
+    expect(validateDownloadPlan(planWithBasename("clip", "./Downloads/"))).toBe("Unsafe download directory");
+  });
+
+  it("accepts every container the planner and the writer can produce", () => {
+    // These were rejected before the allow-list was unified with the writer's extension set:
+    // an FLV/MOV/M4V plan failed with "Unsupported output extension" before any transfer.
+    for (const extension of ["flv", "mov", "m4v", "opus", "wav", "m2ts", "webm"]) {
+      expect(validateDownloadPlan({ ...planWithBasename("clip"), extension })).toBeUndefined();
+    }
+    expect(validateDownloadPlan({ ...planWithBasename("clip"), extension: "exe" })).toBe("Unsupported output extension");
+  });
 });

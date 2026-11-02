@@ -43,6 +43,7 @@ import { buildPlan } from "../plan/build.js";
 import { applyOutputFormat, normalizeOutputFormat, type OutputFormat } from "../plan/output-format.js";
 import { buildPreviewPlan } from "../plan/strategies.js";
 import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
+import { isMediaOutputExtension } from "../transfer/media-extensions.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
 import {
   isSafeManifestUrl,
@@ -73,6 +74,7 @@ import {
   type ContextMenuItem,
 } from "./context-menu.js";
 import { computeBadge, type BadgeBackgroundColor } from "./badge.js";
+import { PendingDownloadNames } from "./download-names.js";
 import { createWorkerChannel, WorkerClient } from "./worker-client.js";
 import { SessionPublisher } from "./session-publisher.js";
 import { openOpfsRoot, removeStagedFile, type OpfsRoot } from "./staging.js";
@@ -221,7 +223,7 @@ export class MediaDownloaderService {
   /** Direct video tracks seen per tab, used to give manifest rows a hover preview. */
   private readonly previewsByTab = new Map<number, { byAsset: Map<string, string> }>();
   /** Exact names to re-assert for extension-originated blob downloads. */
-  private readonly pendingDownloadNames = new Map<string, string>();
+  private readonly pendingDownloadNames = new PendingDownloadNames();
   private readonly enriching = new Set<string>();
   private readonly headerReplay: HeaderReplay;
   private readonly manifests: ManifestEnrichment;
@@ -634,19 +636,11 @@ export class MediaDownloaderService {
   private subscribeDownloadNames(): void {
     this.disposers.push(
       this.gateway.downloads.onDeterminingFilename((item, suggest) => {
-        let filename = item.url === undefined ? undefined : this.pendingDownloadNames.get(item.url);
-        let key = item.url;
-        if (filename === undefined && item.byExtensionId === true) {
-          // Chrome versions/situations differ in whether the blob URL is present on this event.
-          // For our own download, the most recent pending name is the intended one.
-          const last = [...this.pendingDownloadNames.keys()].at(-1);
-          if (last !== undefined) {
-            key = last;
-            filename = this.pendingDownloadNames.get(last);
-          }
-        }
+        // Match by download id first, then by blob URL; only then fall back to the pending order
+        // (Chrome raises one event per download in start order, so the oldest name is the right
+        // one - picking the newest handed two racing downloads the same name).
+        const filename = this.pendingDownloadNames.resolve(item);
         if (filename === undefined) return;
-        if (key !== undefined) this.pendingDownloadNames.delete(key);
         const extension = filename.includes(".") ? filename.slice(filename.lastIndexOf(".") + 1) : "";
         const proposed = item.filename.includes(".") ? item.filename.slice(item.filename.lastIndexOf(".") + 1) : "";
         console.info("[media-downloader] filename hook", proposed, "->", extension);
@@ -1560,18 +1554,16 @@ export class MediaDownloaderService {
     const filenamePlan: DownloadPlan =
       outcome.output_extension !== undefined ? { ...plan, extension: outcome.output_extension } : plan;
     const request = buildDownloadRequest({ blobUrl: outcome.internal_bloburl as string, plan: filenamePlan });
-    this.pendingDownloadNames.set(request.url, request.filename);
+    this.pendingDownloadNames.addUrl(request.url, request.filename);
     console.info("[media-downloader] requested download extension", request.filename.slice(request.filename.lastIndexOf(".") + 1));
-    if (this.pendingDownloadNames.size > 100) {
-      const oldest = this.pendingDownloadNames.keys().next().value;
-      if (oldest !== undefined) this.pendingDownloadNames.delete(oldest);
-    }
     let downloadId: number;
     try {
       downloadId = await this.gateway.downloads.download(request);
     } catch (error) {
+      this.pendingDownloadNames.discardUrl(request.url);
       return { tag: "Err", error: String(error) };
     }
+    this.pendingDownloadNames.addId(downloadId, request.filename);
     const terminal = await this.waitForDownload(downloadId);
     const mapped = mapDownloadTerminalState(terminal);
     if (isErr(mapped)) return { tag: "Err", error: mapped.error.message ?? "download failed" };
@@ -1806,9 +1798,6 @@ const isRelayStreamMessage = (name: string | undefined): boolean =>
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
 
-/** Output containers this rebuild can actually produce. */
-const ALLOWED_OUTPUT_EXTENSIONS = new Set(["mp4", "mkv", "webm", "mp3", "m4a", "ogg", "ts", "m2ts"]);
-
 /** Credential-bearing request headers must never be written to storage (review round 2). */
 const SENSITIVE_HEADER = /^(cookie|set-cookie|authorization|x-auth)/iu;
 
@@ -1884,9 +1873,14 @@ export function validateDownloadPlan(plan: DownloadPlan): string | undefined {
   if (plan.url_audio !== undefined && plan.url_audio.protocol !== "http:" && plan.url_audio.protocol !== "https:") {
     return "Unsupported audio URL scheme";
   }
-  if (!ALLOWED_OUTPUT_EXTENSIONS.has(plan.extension)) return "Unsupported output extension";
+  if (typeof plan.extension !== "string" || !isMediaOutputExtension(plan.extension)) {
+    return "Unsupported output extension";
+  }
   const subdir = plan.subdir;
-  if (subdir.includes("..") || subdir.startsWith("/") || subdir.includes("\\")) return "Unsafe download directory";
+  // Path traversal needs a path separator: a folder name may legitimately contain two dots
+  // ("Season 1..2", a title ending in an ellipsis). Only a real `..`/`.` segment is unsafe.
+  const hasTraversalSegment = subdir.split("/").some((segment) => segment === ".." || segment === ".");
+  if (hasTraversalSegment || subdir.startsWith("/") || subdir.includes("\\")) return "Unsafe download directory";
   if (/[\r\n\0]/u.test(subdir)) return "Unsafe download directory";
   const basename = typeof plan.good_basename === "string" ? plan.good_basename : "";
   if (basename.length === 0 || basename.length > 190) return "Unsafe filename";

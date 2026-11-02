@@ -6,22 +6,10 @@
  * use that extension when the plan's extension is missing or non-media.
  */
 
-/** Media output extensions this rebuild can safely name. */
-const MEDIA_OUTPUT_EXTENSIONS: ReadonlySet<string> = new Set([
-  "mp4",
-  "m4v",
-  "mkv",
-  "webm",
-  "mov",
-  "flv",
-  "ts",
-  "mp3",
-  "m4a",
-  "ogg",
-  "opus",
-  "wav",
-  "m2ts",
-]);
+/** Media output extensions this rebuild can safely name (shared with the saver and validator). */
+import { isMediaOutputExtension } from "./media-extensions.js";
+
+export { MEDIA_EXTENSIONS, isMediaOutputExtension } from "./media-extensions.js";
 
 function ascii(bytes: Uint8Array, start: number, length: number): string {
   let value = "";
@@ -63,11 +51,6 @@ export function sniffMediaExtension(bytes: Uint8Array): string | undefined {
   if (bytes[0] === 0xff && ((bytes[1] ?? 0) & 0xe0) === 0xe0) return "mp3";
 
   return undefined;
-}
-
-/** Whether an extension is a media container the downloader can name. */
-export function isMediaOutputExtension(extension: string): boolean {
-  return MEDIA_OUTPUT_EXTENSIONS.has(extension.toLowerCase());
 }
 
 /** Replace a missing/non-media extension with the sniffed container (falling back to mp4). */

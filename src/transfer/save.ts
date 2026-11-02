@@ -23,6 +23,7 @@ import {
   type EndingReason,
 } from "../core/types.js";
 import { percentageIncompleteReason } from "./assemble.js";
+import { MEDIA_EXTENSIONS } from "./media-extensions.js";
 
 // ---------------------------------------------------------------------------
 // Filename and chrome.downloads request
@@ -37,11 +38,6 @@ export type FilenamePlan = Pick<
  * Final download filename. `subdir` is already normalised with a trailing slash when non-empty
  * (`materializeRule` / `validateDirectory`), so plain concatenation reproduces the original.
  */
-const MEDIA_EXTENSIONS: ReadonlySet<string> = new Set([
-  "mp4", "m4v", "mkv", "webm", "mov", "flv", "ts",
-  "mp3", "m4a", "ogg", "opus", "wav", "m2ts",
-]);
-
 export function composeFilename(plan: FilenamePlan): string {
   const extension = plan.extension.toLowerCase();
   const safeExtension = MEDIA_EXTENSIONS.has(extension) ? extension : "mp4";
