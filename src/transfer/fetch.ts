@@ -17,7 +17,6 @@
 import { err, ok, type Result } from "../core/option.js";
 import {
   BODY_READ_TIMEOUT_MS,
-  DEFAULT_SEGMENT_CONCURRENCY,
   httpError,
   abortedError,
   otherError,

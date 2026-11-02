@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { TransferStrategy, type MediaItem } from "../src/core/types.js";
+import { containerToMuxer } from "../src/discovery/classify.js";
 import {
   DRM_PROTECTION_SCHEMES,
   demuxerForCodecs,
@@ -526,6 +527,16 @@ describe("plan helpers", () => {
     expect(extensionForDemuxer("mp4", "mkv")).toBe("mkv");
     expect(extensionForDemuxer("webm", "mp4")).toBe("mkv");
     expect(extensionForDemuxer("mkv", "mp4")).toBe("mkv");
+    // The video table is shared with the discovery-side `it`/`fv` implementation.
+    for (const demuxer of ["mp4", "webm", "mkv"]) {
+      for (const preferred of ["mp4", "mkv"] as const) {
+        expect(extensionForDemuxer(demuxer, preferred)).toBe(containerToMuxer(demuxer, preferred));
+      }
+    }
+    // An unknown demuxer keeps the planner's fallback instead of the discovery table's audio
+    // default (that table is only called for containers known to be video).
+    expect(extensionForDemuxer("flv", "mkv")).toBe("mkv");
+    expect(extensionForDemuxer("flv", "mp4")).toBe("mp4");
   });
 
   it("isAudioOnlyDemuxer covers the shipped audio set", () => {

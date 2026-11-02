@@ -112,7 +112,8 @@ export interface QualityFallback {
   bitrate?: number;
 }
 
-function bitrateLabel(bitrate: number | undefined): string | undefined {
+/** Human bitrate label (`MB/s`/`KB/s`) used by quality labels and measured-page metadata. */
+export function bitrateLabel(bitrate: number | undefined): string | undefined {
   if (bitrate === undefined || !Number.isFinite(bitrate) || bitrate <= 0) return undefined;
   const bytesPerSecond = bitrate / 8;
   return bytesPerSecond >= 1e6

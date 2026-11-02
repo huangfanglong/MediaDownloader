@@ -27,6 +27,7 @@ import { BoundedCache } from "../bounded-cache.js";
 import { MediaSelections } from "../panel-state.js";
 import { QualityProbeTracker, collectPageQuality, type PageQuality } from "../panel-quality.js";
 import {
+  bitrateLabel,
   decodePanelSnapshot,
   formatLabel,
   panelMediaSignature,
@@ -523,13 +524,6 @@ function renderStatus(snapshot: PanelSnapshot): void {
   }
 }
 
-function formatMeasuredBitrate(bitrate: number): string {
-  const bytesPerSecond = bitrate / 8;
-  return bytesPerSecond >= 1e6
-    ? `${(bytesPerSecond / 1e6).toFixed(1)}MB/s`
-    : `${Math.max(1, Math.round(bytesPerSecond / 1e3))}KB/s`;
-}
-
 /** First frame that reported a usable video wins; results are page-supplied values. */
 function parseProbeResults(results: Array<{ result?: unknown }>): PageQuality | undefined {
   for (const entry of results) {
@@ -581,7 +575,8 @@ function enrichRowsWithMeasuredQuality(snapshot: PanelSnapshot): PanelSnapshot {
       if (hasResolution && hasBitrate) return row;
       const parts = [variant.label];
       if (!hasResolution) parts.push(`${quality.width}x${quality.height}`);
-      if (!hasBitrate && quality.bitrate !== undefined) parts.push(formatMeasuredBitrate(quality.bitrate));
+      const measuredBitrate = bitrateLabel(quality.bitrate);
+      if (!hasBitrate && measuredBitrate !== undefined) parts.push(measuredBitrate);
       return { ...row, variants: [{ ...variant, label: parts.join(" · ") }] };
     }),
   };

@@ -50,7 +50,7 @@ import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
 import { endingReasonToMessage } from "../transfer/save.js";
 import { muxFragmentedMp4ToSink } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
-import { sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
+import { DEFAULT_SEGMENT_CONCURRENCY, sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
 import { isSafeSegmentUrl } from "../transfer/url-safety.js";
 import {
   createStagedFile,
@@ -64,7 +64,7 @@ import {
 } from "./staging.js";
 
 /** Segment fetch concurrency proven in the original (semaphore 4, 1 when throttled). */
-export const SEGMENT_CONCURRENCY = 4;
+export const SEGMENT_CONCURRENCY = DEFAULT_SEGMENT_CONCURRENCY;
 export const THROTTLED_SEGMENT_CONCURRENCY = 1;
 
 /** In-browser transcode budget: beyond this, VP8/x264 conversion is far slower than a download. */

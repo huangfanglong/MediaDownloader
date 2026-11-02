@@ -43,6 +43,7 @@ import { buildPlan } from "../plan/build.js";
 import { applyOutputFormat, normalizeOutputFormat, type OutputFormat } from "../plan/output-format.js";
 import { buildPreviewPlan } from "../plan/strategies.js";
 import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
+import { MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import { isMediaOutputExtension } from "../transfer/media-extensions.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
 import {
@@ -956,7 +957,7 @@ export class MediaDownloaderService {
           if (senderTabId !== undefined) {
             const urls = Array.isArray((data as { urls?: unknown })?.urls)
               ? ((data as { urls: unknown[] }).urls.filter(
-                  (value): value is string => typeof value === "string" && value.length <= 8192,
+                  (value): value is string => typeof value === "string" && value.length <= MAX_CAPTURED_URL_LENGTH,
                 ).slice(0, 20))
               : [];
             if (urls.length > 0) {
@@ -1767,8 +1768,6 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
     ...(interruptReason !== undefined ? { interruptReason } : {}),
   };
 }
-
-const MAX_CAPTURED_URL_LENGTH = 8192;
 
 /** Parse a browser-supplied URL; malformed strings are simply not remembered. */
 function safeUrl(raw: string): URL | undefined {

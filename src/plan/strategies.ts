@@ -21,6 +21,7 @@ import {
   type SubtitleTrack,
 } from "../core/types.js";
 import { DEMUXER_ORDER } from "../manifests/hls.js";
+import { containerToMuxer } from "../discovery/classify.js";
 import { normalizeSubdir } from "../naming/safe-path.js";
 
 /** Audio-only demuxers (`er`, svc:7272-7274). */
@@ -35,17 +36,14 @@ export const VIDEO_DEMUXERS: ReadonlySet<string> = new Set(["mp4", "webm", "mkv"
 
 /**
  * Extension/muxer for a demuxer (`it`, F24): mp4 keeps the user's preferred container,
- * webm/mkv become mkv.
- *
- * Evidence E25 truth table (now owned here; the removed `transfer/remux.ts` mirror had drifted):
- * audio-only → mp3 transcode; the progressive single-request strategy → source bytes verbatim;
- * mp4 → preferred muxer; webm/mkv → mkv. `build.ts` refines the WebM half for the js-fetch route:
- * a video-only WebM stays WebM, while a WebM video with a separate (AAC) audio track becomes MKV
- * so both streams can be copied without an Opus re-encode.
+ * webm/mkv become mkv. The table itself lives once in `discovery/classify.ts`
+ * (`containerToMuxer`, the `it`/`fv` implementation); this wrapper only keeps the planner's
+ * fallback for a demuxer outside the known video set (keep the preferred container) and documents
+ * the two production refinements in `build.ts`: a video-only WebM stays WebM, and a WebM video
+ * with a separate AAC track becomes MKV so both streams can be copied without an Opus re-encode.
  */
 export function extensionForDemuxer(demuxer: string, preferredAvMuxer: "mp4" | "mkv"): string {
-  if (demuxer === "mp4") return preferredAvMuxer;
-  if (demuxer === "webm" || demuxer === "mkv") return "mkv";
+  if (VIDEO_DEMUXERS.has(demuxer)) return containerToMuxer(demuxer, preferredAvMuxer);
   return preferredAvMuxer;
 }
 

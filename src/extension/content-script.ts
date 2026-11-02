@@ -18,6 +18,7 @@ import { REBUILD_MESSAGES, RELAY_MESSAGES, type MediaStreamAck } from "../protoc
 import { encode } from "../protocol/serde.js";
 import type { MediaItem, PlaylistEntry } from "../core/types.js";
 import { declaredSize } from "../transfer/declared-size.js";
+import { MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import {
   PAGE_ON_MEDIA_HINTS,
   PAGE_REQUEST_MEDIA_HINTS,
@@ -409,7 +410,7 @@ export function installContentBridge(
     for (const candidate of value.slice(0, 200)) {
       if (candidate === null || typeof candidate !== "object") continue;
       const hint = candidate as Record<string, unknown>;
-      if (typeof hint.url !== "string" || hint.url.length === 0 || hint.url.length > 8192) continue;
+      if (typeof hint.url !== "string" || hint.url.length === 0 || hint.url.length > MAX_CAPTURED_URL_LENGTH) continue;
       const kind = hint.kind === "hls" || hint.kind === "dash" || hint.kind === "file" ? hint.kind : "file";
       const source = typeof hint.source === "string" ? hint.source : "player-response";
       const rawVariants = Array.isArray(hint.variants) ? hint.variants.slice(0, 40) : [];
@@ -417,12 +418,12 @@ export function installContentBridge(
       for (const candidate of rawVariants) {
         if (candidate === null || typeof candidate !== "object") continue;
         const variant = candidate as Record<string, unknown>;
-        if (typeof variant.url !== "string" || variant.url.length === 0 || variant.url.length > 8192) continue;
+        if (typeof variant.url !== "string" || variant.url.length === 0 || variant.url.length > MAX_CAPTURED_URL_LENGTH) continue;
         const number = (value: unknown): number | undefined =>
           typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
         variants.push({
           url: variant.url,
-          ...(typeof variant.audio_url === "string" && variant.audio_url.length <= 8192
+          ...(typeof variant.audio_url === "string" && variant.audio_url.length <= MAX_CAPTURED_URL_LENGTH
             ? { audio_url: variant.audio_url }
             : {}),
           ...(typeof variant.mime === "string" ? { mime: variant.mime.slice(0, 64) } : {}),
@@ -437,13 +438,13 @@ export function installContentBridge(
       hints.push({
         url: hint.url,
         ...(variants.length > 0 ? { variants } : {}),
-        ...(typeof hint.audio_url === "string" && hint.audio_url.length <= 8192
+        ...(typeof hint.audio_url === "string" && hint.audio_url.length <= MAX_CAPTURED_URL_LENGTH
           ? { audio_url: hint.audio_url }
           : {}),
         ...(typeof hint.thumbnail === "string" && hint.thumbnail.length <= 2048
           ? { thumbnail: hint.thumbnail }
           : {}),
-        ...(typeof hint.preview === "string" && hint.preview.length <= 8192
+        ...(typeof hint.preview === "string" && hint.preview.length <= MAX_CAPTURED_URL_LENGTH
           ? { preview: hint.preview }
           : {}),
         ...(hint.focused === true ? { focused: true } : {}),
@@ -455,7 +456,7 @@ export function installContentBridge(
         ...(typeof hint.title === "string" ? { title: hint.title.slice(0, 300) } : {}),
         ...(typeof hint.identity === "string" ? { identity: hint.identity.slice(0, 200) } : {}),
         ...(hint.allow_segment === true ? { allow_segment: true } : {}),
-        ...(typeof hint.hls_url === "string" && hint.hls_url.length <= 8192 ? { hls_url: hint.hls_url } : {}),
+        ...(typeof hint.hls_url === "string" && hint.hls_url.length <= MAX_CAPTURED_URL_LENGTH ? { hls_url: hint.hls_url } : {}),
         ...(typeof hint.rendered_width === "number" && Number.isFinite(hint.rendered_width) && hint.rendered_width > 0
           ? { rendered_width: hint.rendered_width }
           : {}),
@@ -465,7 +466,7 @@ export function installContentBridge(
         ...(typeof hint.estimated_bitrate === "number" && Number.isFinite(hint.estimated_bitrate) && hint.estimated_bitrate > 0
           ? { estimated_bitrate: hint.estimated_bitrate }
           : {}),
-        ...(typeof hint.referer === "string" && hint.referer.length <= 8192
+        ...(typeof hint.referer === "string" && hint.referer.length <= MAX_CAPTURED_URL_LENGTH
           ? { referer: hint.referer }
           : {}),
       });
@@ -494,7 +495,7 @@ export function installContentBridge(
     };
     const focusedUrls = Array.isArray(data.focused_urls)
       ? data.focused_urls
-          .filter((value): value is string => typeof value === "string" && value.length <= 8192)
+          .filter((value): value is string => typeof value === "string" && value.length <= MAX_CAPTURED_URL_LENGTH)
           .slice(0, 20)
       : [];
     if (data.focus_active === true && focusedUrls.length > 0) {
@@ -514,7 +515,7 @@ export function installContentBridge(
     // per-hint fields: everything arriving on the page bridge is untrusted input.
     const pageTitle = typeof data.title === "string" && data.title.length > 0 ? data.title.slice(0, 300) : undefined;
     const pageReferer =
-      typeof data.referer === "string" && data.referer.length > 0 && data.referer.length <= 8192
+      typeof data.referer === "string" && data.referer.length > 0 && data.referer.length <= MAX_CAPTURED_URL_LENGTH
         ? data.referer
         : undefined;
     for (const hint of hintsToMap) {

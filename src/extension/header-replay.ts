@@ -1,14 +1,13 @@
 import type { DownloadPlan } from "../core/types.js";
 import type { HeaderPair } from "../discovery/engine.js";
 import { buildDnrRule, sanitizeReplayHeaders } from "../transfer/fetch.js";
+import { MAX_CAPTURED_HEADER_LENGTH, MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import type { NetworkGateway } from "./gateways.js";
 
 const HEADER_REPLAY_TTL_MS = 10 * 60 * 1000;
 /** Expired entries are swept at most this often; the entry cap is still enforced on insert. */
 const HEADER_REPLAY_PRUNE_INTERVAL_MS = 60_000;
 const HEADER_REPLAY_CAP = 300;
-const MAX_CAPTURED_URL_LENGTH = 8192;
-const MAX_CAPTURED_HEADER_LENGTH = 8192;
 const MAX_CAPTURED_HEADERS = 60;
 const MAX_ACTIVE_DNR_RULES = 700;
 const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
