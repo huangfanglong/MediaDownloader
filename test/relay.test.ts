@@ -56,6 +56,33 @@ describe("page-context relay (content script)", () => {
     expect((sent.at(-1)?.msg.data as { total: number }).total).toBe(1200);
   });
 
+  it("reports a short relay body instead of finishing the relay", async () => {
+    const body = new Uint8Array(1200).fill(1);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 206,
+        arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+      })),
+    );
+    const sent: Array<{ msg: { name: string; data: unknown } }> = [];
+    const runtime = {
+      sendMessage: async (message: { msg: { name: string; data: unknown } }) => {
+        sent.push(message);
+        return { accepted: true };
+      },
+      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+    };
+    await handleMediaStreamRequest(runtime as never, {
+      request_id: "r-short",
+      url: "https://cdn.test/v.mp4?clen=5000",
+    });
+    expect(sent.at(-1)?.msg.name).toBe(RELAY_MESSAGES.MediaStreamError);
+    expect((sent.at(-1)?.msg.data as { error: string }).error).toMatch(/ended early/);
+    expect(sent.map((message) => message.msg.name)).not.toContain(RELAY_MESSAGES.MediaStreamEnd);
+  });
+
   it("reports HTTP failures back to the service worker", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 403, body: null })));
     const sent: Array<{ msg: { name: string } }> = [];

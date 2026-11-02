@@ -218,6 +218,42 @@ describe("fetchBytes releases the response body when reading stops early", () =>
   });
 });
 
+describe("fetchBytes releases combined-signal listeners", () => {
+  /** Parent signals usually outlive one request, so listeners must not accumulate on them. */
+  function countingSignal(counters: { added: number; removed: number }): AbortSignal {
+    return {
+      aborted: false,
+      addEventListener: () => {
+        counters.added += 1;
+      },
+      removeEventListener: () => {
+        counters.removed += 1;
+      },
+    } as unknown as AbortSignal;
+  }
+
+  it("removes the parent abort listeners after the request settles", async () => {
+    const counters = { added: 0, removed: 0 };
+    const { response } = trackedBody([bytes(1)]);
+    const result = await fetchBytes(
+      async () => response,
+      "https://x/",
+      { signal: countingSignal(counters) },
+      { signal: countingSignal(counters) },
+    );
+    expect(result.tag).toBe("Ok");
+    expect(counters).toEqual({ added: 2, removed: 2 });
+  });
+
+  it("attaches no listener when only one signal is supplied", async () => {
+    const counters = { added: 0, removed: 0 };
+    const { response } = trackedBody([bytes(1)]);
+    const result = await fetchBytes(async () => response, "https://x/", {}, { signal: countingSignal(counters) });
+    expect(result.tag).toBe("Ok");
+    expect(counters).toEqual({ added: 0, removed: 0 });
+  });
+});
+
 describe("streamed direct transfers release the response body when staging fails", () => {
   it("fails the transfer and cancels the reader when an OPFS append rejects", async () => {
     const stream = trackedBody([bytes(1), bytes(2), bytes(3)]);

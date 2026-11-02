@@ -77,6 +77,70 @@ describe("bounded-range download helper (googlevideo evidence)", () => {
     expect(result.tag).toBe("Err");
     if (result.tag === "Err") expect(result.error.status).toBe(403);
   });
+
+  it("fails instead of returning a truncated object when the declared size is larger", async () => {
+    const chunk = 512 * 1024;
+    const payload = new Uint8Array(1.5 * chunk).fill(7);
+    const result = await fetchRanged(
+      createRangedFetch(payload),
+      new URL(`https://rr1---sn-x.googlevideo.com/videoplayback?id=1&itag=18&clen=${3 * chunk}`),
+      new Headers(),
+      { chunkSize: chunk },
+    );
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error.message).toMatch(/ended early/);
+  });
+
+  it("retries a transient chunk failure instead of discarding the transfer", async () => {
+    const chunk = 512 * 1024;
+    const payload = new Uint8Array(3 * chunk + 100).fill(9);
+    const serving = createRangedFetch(payload);
+    const failingRange = `bytes=${chunk}-${2 * chunk - 1}`;
+    const attempts = new Map<string, number>();
+    let failedOnce = false;
+    const fetchImpl: FetchLike = async (url, init) => {
+      const range = new Headers(init?.headers).get("range") ?? "";
+      attempts.set(range, (attempts.get(range) ?? 0) + 1);
+      if (range === failingRange && !failedOnce) {
+        failedOnce = true;
+        throw new TypeError("fetch failed");
+      }
+      return serving(url, init);
+    };
+    const result = await fetchRanged(
+      fetchImpl,
+      new URL(`https://rr1---sn-x.googlevideo.com/videoplayback?id=1&itag=18&clen=${payload.byteLength}`),
+      new Headers(),
+      { chunkSize: chunk },
+    );
+    expect(result.tag).toBe("Ok");
+    if (result.tag === "Ok") {
+      expect(Buffer.from(result.value.bytes).equals(Buffer.from(payload))).toBe(true);
+    }
+    expect(attempts.get(failingRange)).toBe(2);
+  });
+
+  it("does not retry a terminal range rejection", async () => {
+    const chunk = 512 * 1024;
+    const payload = new Uint8Array(3 * chunk).fill(4);
+    const failingRange = `bytes=${chunk}-${2 * chunk - 1}`;
+    const attempts = new Map<string, number>();
+    const fetchImpl: FetchLike = async (url, init) => {
+      const range = new Headers(init?.headers).get("range") ?? "";
+      attempts.set(range, (attempts.get(range) ?? 0) + 1);
+      if (range === failingRange) return { status: 404, ok: false, body: null };
+      return createRangedFetch(payload)(url, init);
+    };
+    const result = await fetchRanged(
+      fetchImpl,
+      new URL(`https://rr1---sn-x.googlevideo.com/videoplayback?id=1&itag=18&clen=${payload.byteLength}`),
+      new Headers(),
+      { chunkSize: chunk },
+    );
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error.status).toBe(404);
+    expect(attempts.get(failingRange)).toBe(1);
+  });
 });
 
 describe("worker ranged transfer (YouTube itag=18 path)", () => {
@@ -132,5 +196,45 @@ describe("worker ranged transfer (YouTube itag=18 path)", () => {
       offset += chunk.byteLength;
     }
     expect(merged).toEqual(payload);
+  });
+
+  it("does not stage a transfer whose object is shorter than the declared size", async () => {
+    const actual = 3 * 1024 * 1024;
+    const declared = 4 * 1024 * 1024;
+    const payload = new Uint8Array(actual).fill(2);
+    const { root, files } = createFakeOpfs();
+    const workerChannel: BroadcastChannelLike = {
+      postMessage: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      close: () => undefined,
+    };
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:truncated");
+    const plan: DownloadPlan = {
+      download_id: "download_truncated",
+      headers: new Headers(),
+      good_basename: "truncated",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "http_audio_video_one_source",
+      url: new URL(`https://rr2---sn-x.googlevideo.com/videoplayback?id=1&itag=18&clen=${declared}`),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      is_youtube: true,
+      throttle: false,
+      cache: "default",
+    };
+    const worker = new DownloadWorker({
+      channel: workerChannel,
+      fetchImpl: createRangedFetch(payload),
+      openRoot: async () => root,
+    });
+    const result = await worker.runPlan(plan);
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/ended early/);
+    // The partially staged file is removed instead of being reported as a finished download.
+    expect(files.size).toBe(0);
   });
 });

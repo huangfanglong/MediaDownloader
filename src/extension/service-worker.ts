@@ -1520,6 +1520,11 @@ export class MediaDownloaderService {
         }
         if (bytes.byteLength < chunkSize) break;
       }
+      // Never report success for fewer bytes than the URL advertised: a lying/shrunken object
+      // would otherwise be saved as a silently truncated file.
+      if (total !== undefined && offset < total) {
+        return { tag: "Err", error: `ranged transfer ended early: ${offset} of ${total} bytes` };
+      }
       this.worker.endRelay(plan.download_id);
       finished = true;
       const outcome = await completion;

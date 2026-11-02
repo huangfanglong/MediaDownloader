@@ -87,7 +87,7 @@ function rangedFetch(payload: Uint8Array, advance: () => void): FetchLike {
   };
 }
 
-function makePlan(payload: Uint8Array): DownloadPlan {
+function makePlan(payload: Uint8Array, declaredBytes = payload.byteLength): DownloadPlan {
   return {
     download_id: "download_budget",
     headers: new Headers(),
@@ -97,7 +97,7 @@ function makePlan(payload: Uint8Array): DownloadPlan {
     will_use_jsfetch: false,
     strategy: "youtube_audio_video_one_source",
     url: new URL(
-      `https://rr1---sn-budget.googlevideo.com/videoplayback?id=1&clen=${payload.byteLength}`,
+      `https://rr1---sn-budget.googlevideo.com/videoplayback?id=1&clen=${declaredBytes}`,
     ),
     carry_get_params: false,
     extension: "mp4",
@@ -124,11 +124,12 @@ interface RunResult {
   writes: Array<{ at: number; bytes: number }>;
   sentChunks: number;
   ended: boolean;
+  error?: string;
 }
 
-async function runRanged(chunks: number): Promise<RunResult> {
-  const payload = new Uint8Array(CHUNK_BYTES * chunks);
-  const plan = makePlan(payload);
+async function runRanged(chunks: number, declaredChunks = chunks, extraBytes = 0): Promise<RunResult> {
+  const payload = new Uint8Array(CHUNK_BYTES * chunks + extraBytes);
+  const plan = makePlan(payload, CHUNK_BYTES * declaredChunks);
   const nowRef = { value: 1_000_000 };
   const advance = (): void => {
     // Each chunk takes 50 ms of wall clock; 8 chunks stay inside one checkpoint window and 32
@@ -160,14 +161,19 @@ async function runRanged(chunks: number): Promise<RunResult> {
     transient_history: [],
   };
   (service as unknown as { session: SessionState }).session = session;
-  await (
+  const outcome = (await (
     service as unknown as {
-      rangedDownloadThroughWorker(plan: DownloadPlan): Promise<unknown>;
+      rangedDownloadThroughWorker(plan: DownloadPlan): Promise<{ tag: string; error?: string }>;
     }
-  ).rangedDownloadThroughWorker(plan);
+  ).rangedDownloadThroughWorker(plan)) as { tag: string; error?: string };
   for (let index = 0; index < 5; index += 1) await flush();
   service.stop();
-  return { writes, sentChunks: worker.sentChunks, ended: worker.ended };
+  return {
+    writes,
+    sentChunks: worker.sentChunks,
+    ended: worker.ended,
+    ...(outcome.tag === "Err" && outcome.error !== undefined ? { error: outcome.error } : {}),
+  };
 }
 
 describe("ranged transfer session-write budget", () => {
@@ -188,5 +194,13 @@ describe("ranged transfer session-write budget", () => {
     // And they are full-session writes, not per-chunk copies of each other.
     const sizes = new Set(thirtyTwo.writes.map((write) => write.bytes));
     expect(sizes.size).toBeLessThanOrEqual(1);
+  });
+
+  it("fails instead of finishing when the object is shorter than clen", async () => {
+    // The object ends with a short chunk after 2 MiB + 123 bytes; the URL advertises 4 MiB.
+    const result = await runRanged(1, 2, 123);
+    expect(result.error).toMatch(/ended early/);
+    // The worker never received the end marker, so it cannot save a truncated file.
+    expect(result.ended).toBe(false);
   });
 });

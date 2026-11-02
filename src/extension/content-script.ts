@@ -17,6 +17,7 @@ import { MSG } from "../protocol/messages.js";
 import { REBUILD_MESSAGES, RELAY_MESSAGES, type MediaStreamAck } from "../protocol/rebuild-messages.js";
 import { encode } from "../protocol/serde.js";
 import type { MediaItem, PlaylistEntry } from "../core/types.js";
+import { declaredSize } from "../transfer/declared-size.js";
 import {
   PAGE_ON_MEDIA_HINTS,
   PAGE_REQUEST_MEDIA_HINTS,
@@ -294,6 +295,17 @@ export async function handleMediaStreamRequest(
   try {
     let offset = 0;
     let total = 0;
+    // The URL may advertise the object size (`clen`); use it to detect a short body instead of
+    // finishing the relay and letting the worker save a silently truncated file. Other `len`/
+    // `size` query parameters are not size evidence here: a page-owned URL can carry them for
+    // unrelated purposes.
+    let declared: number | undefined;
+    try {
+      const relayUrl = new URL(data.url);
+      if (relayUrl.searchParams.has("clen")) declared = declaredSize(relayUrl);
+    } catch {
+      declared = undefined;
+    }
     for (let attempt = 0; attempt < 20000; attempt += 1) {
       const end = offset + RANGE_BYTES - 1;
       const response = await fetch(data.url, {
@@ -321,6 +333,9 @@ export async function handleMediaStreamRequest(
       total += value.length;
       // A short chunk means we reached the end of the object.
       if (value.length < RANGE_BYTES) break;
+    }
+    if (declared !== undefined && total < declared) {
+      throw new Error(`relay ended early: ${total} of ${declared} bytes`);
     }
     await sendRelay({
       msg: { name: RELAY_MESSAGES.MediaStreamEnd, data: { request_id: data.request_id, total } },

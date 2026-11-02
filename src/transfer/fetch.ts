@@ -320,20 +320,38 @@ export interface FetchBytesOptions {
   onTotalSize?: (totalBytes: number) => void;
 }
 
-/** Combine two optional abort signals without relying on `AbortSignal.any` (Node/browser parity). */
+/** A combined signal plus the cleanup that releases the listeners it attached to its parents. */
+interface CombinedSignal {
+  signal?: AbortSignal;
+  dispose(): void;
+}
+
+/**
+ * Combine two optional abort signals without relying on `AbortSignal.any` (Node/browser parity).
+ *
+ * The parent signals usually outlive the request (a download-level signal outlives its segments),
+ * so the listeners are released by `dispose()` when the request settles; otherwise they would
+ * accumulate for the whole download.
+ */
 function combineSignals(
   first?: AbortSignal,
   second?: AbortSignal,
-): AbortSignal | undefined {
-  if (first === undefined) return second;
-  if (second === undefined || second === first) return first;
-  if (first.aborted) return first;
-  if (second.aborted) return second;
+): CombinedSignal {
+  if (first === undefined) return { signal: second, dispose: () => undefined };
+  if (second === undefined || second === first) return { signal: first, dispose: () => undefined };
+  if (first.aborted) return { signal: first, dispose: () => undefined };
+  if (second.aborted) return { signal: second, dispose: () => undefined };
   const controller = new AbortController();
   const abort = (): void => controller.abort();
   first.addEventListener("abort", abort, { once: true });
   second.addEventListener("abort", abort, { once: true });
-  return controller.signal;
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      first.removeEventListener("abort", abort);
+      second.removeEventListener("abort", abort);
+    },
+  };
 }
 
 const TIMED_OUT = Symbol("timed-out");
@@ -368,7 +386,21 @@ export async function fetchBytes(
   init: FetchInitLike = {},
   options: FetchBytesOptions = {},
 ): Promise<Result<FetchBytesResult, RetryError>> {
-  const signal = combineSignals(init.signal, options.signal);
+  const combined = combineSignals(init.signal, options.signal);
+  try {
+    return await fetchBytesAttempt(fetchImpl, url, init, options, combined.signal);
+  } finally {
+    combined.dispose();
+  }
+}
+
+async function fetchBytesAttempt(
+  fetchImpl: FetchLike,
+  url: string,
+  init: FetchInitLike,
+  options: FetchBytesOptions,
+  signal: AbortSignal | undefined,
+): Promise<Result<FetchBytesResult, RetryError>> {
   if (signal?.aborted) return err(abortedError());
 
   let headers = init.headers;

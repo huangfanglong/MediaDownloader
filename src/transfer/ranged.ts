@@ -11,12 +11,20 @@
  * chunks are concatenated into the final file.
  */
 import { err, ok, type Result } from "../core/option.js";
+import { declaredSize } from "./declared-size.js";
 import { fetchBytes, type FetchLike } from "./fetch.js";
-import { abortedError, otherError, tooLargeError, type RetryError } from "./retry.js";
+import { abortedError, otherError, tooLargeError, withRetry, type RetryError } from "./retry.js";
 
 /** Largest accepted range from the live probe; 2 MiB worked, 4 MiB was rejected. */
 export const RANGE_CHUNK_BYTES = 2 * 1024 * 1024;
 const MAX_RANGE_CHUNKS = 20000;
+/**
+ * A failed chunk is retried twice (no delay, then 500 ms) so one transient blip does not discard
+ * a transfer that may already have downloaded gigabytes. Terminal failures (4xx, abort, timeout,
+ * an over-ceiling body) are not retried; the retry policy classifies them.
+ */
+const CHUNK_ATTEMPTS = 3;
+const CHUNK_RETRY_DELAYS_MS = [0, 500] as const;
 
 export interface RangedFetchResult {
   bytes: Uint8Array;
@@ -42,15 +50,11 @@ export function isRangeBoundCdn(url: URL): boolean {
   return /videoplayback/iu.test(url.pathname) && url.searchParams.has("clen");
 }
 
-/** Size advertised by the query string (`clen=` or `len=`). */
-export function declaredSize(url: URL): number | undefined {
-  for (const name of ["clen", "len", "size"]) {
-    const raw = url.searchParams.get(name);
-    if (raw === null) continue;
-    const value = Number.parseInt(raw, 10);
-    if (Number.isFinite(value) && value > 0) return value;
-  }
-  return undefined;
+export { declaredSize } from "./declared-size.js";
+
+/** The transfer stopped before the advertised size; saving the bytes would truncate the file. */
+function truncatedError(retrieved: number, declared: number): RetryError {
+  return otherError(`Range download ended early: ${retrieved} of ${declared} bytes`);
 }
 
 function concatenateParts(parts: readonly Uint8Array[], total: number): Uint8Array {
@@ -87,19 +91,41 @@ export async function fetchRanged(
     }
     if (fetchedTotal !== undefined && offset >= fetchedTotal) break;
     const end = offset + chunkSize - 1;
-    const result = await fetchBytes(
-      fetchImpl,
-      url.href,
-      { headers, range: `bytes=${offset}-${end}` },
-      { signal: options.signal, ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}) },
+    // A chunk fetch is idempotent (bytes are buffered before the consumer sees them), so a
+    // transient failure is retried here instead of aborting the whole transfer.
+    const result = await withRetry(
+      () =>
+        fetchBytes(
+          fetchImpl,
+          url.href,
+          { headers, range: `bytes=${offset}-${end}` },
+          { signal: options.signal, ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}) },
+        ),
+      {
+        maxAttempts: CHUNK_ATTEMPTS,
+        delayFor: (attempt) =>
+          CHUNK_RETRY_DELAYS_MS[attempt] ??
+          CHUNK_RETRY_DELAYS_MS[CHUNK_RETRY_DELAYS_MS.length - 1] ??
+          0,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      },
     );
     if (result.tag === "Err") {
-      // A 416 after at least one chunk means the caller's size was larger than the object.
-      if (result.error.kind === "http" && result.error.status === 416 && offset > 0) break;
+      // A 416 after at least one chunk means the object ends here. If the URL advertised more
+      // bytes, the object is truncated and saving it would produce a silently short file.
+      if (result.error.kind === "http" && result.error.status === 416 && offset > 0) {
+        if (total !== undefined && offset < total) return err(truncatedError(offset, total));
+        fetchedTotal = offset;
+        break;
+      }
       return result;
     }
     const bytes = result.value.bytes;
-    if (bytes.byteLength === 0) break;
+    if (bytes.byteLength === 0) {
+      if (total !== undefined && offset < total) return err(truncatedError(offset, total));
+      fetchedTotal = offset;
+      break;
+    }
     // Defensive: if the server ignored the range and returned the whole object, keep it once.
     if (bytes.byteLength > chunkSize && offset === 0) {
       if (options.onChunk !== undefined) await options.onChunk(bytes);
@@ -119,6 +145,11 @@ export async function fetchRanged(
     }
   }
 
+  // The loop can also end at the chunk cap or after a whole-object response: never report success
+  // for fewer bytes than the URL advertised.
+  if (total !== undefined && offset < total) {
+    return err(truncatedError(offset, total));
+  }
   if (offset === 0) {
     return err(otherError("range download returned no data"));
   }
