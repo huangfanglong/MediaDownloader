@@ -191,11 +191,21 @@ export class WorkerClient {
       }
       if (name === MSG.worker.DownloadResult) {
         const outcome = unwrapMaybeSerde(data) as TransferOutcome;
-        const entry = outcome?.download_id ? this.pending.get(outcome.download_id) : undefined;
-        // The original correlates results by download_id when present; the worker also includes
-        // it in its payload. Fall back to the only pending entry to stay tolerant.
-        const pending = entry ?? (this.pending.size === 1 ? [...this.pending.values()][0] : undefined);
+        const outcomeId =
+          typeof outcome?.download_id === "string" && outcome.download_id.length > 0
+            ? outcome.download_id
+            : undefined;
+        // Correlate strictly by download id whenever the payload carries one. Only an id-less
+        // result may fall back to the sole pending request: a non-matching id is a late result
+        // from a cancelled/timed-out download and must not resolve an unrelated transfer.
+        const pending = outcomeId !== undefined
+          ? this.pending.get(outcomeId)
+          : this.pending.size === 1
+            ? [...this.pending.values()][0]
+            : undefined;
         if (!pending) {
+          // A late result: release its blob and staged file instead of handing it to a different
+          // download (which would save it under that download's plan and name).
           if (outcome.internal_bloburl) this.revokeBlobUrl(outcome.internal_bloburl);
           this.onLateOutcome?.(outcome);
           return;

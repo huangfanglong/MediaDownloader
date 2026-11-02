@@ -87,3 +87,59 @@ describe("worker download cancellation", () => {
     client.dispose();
   });
 });
+
+describe("worker result correlation", () => {
+  it("does not resolve the only pending download with a result naming another download", async () => {
+    const channel = new FakeWorkerChannel();
+    const onLateOutcome = vi.fn();
+    const client = new WorkerClient({
+      channel,
+      offscreen: { ensureDocument: async () => undefined },
+      offscreenUrl: "chrome-extension://fake/factory/factory.html",
+      onLateOutcome,
+    });
+    const pendingPlan = { ...plan, download_id: "download_pending" } as DownloadPlan;
+    const completion = client.download(pendingPlan);
+    await client.ensureReady();
+
+    // A late result from a download the service already cancelled: it must be cleaned up, not
+    // handed to the unrelated pending download.
+    const late = {
+      download_id: "download_cancelled",
+      internal_bloburl: "blob:late-a",
+      internal_filename: "a.mp4",
+    } as TransferOutcome;
+    channel.emit(MSG.worker.DownloadResult, late);
+
+    expect(onLateOutcome).toHaveBeenCalledWith(late);
+    expect(channel.posted).toContainEqual({
+      msg: { name: MSG.worker.RevokeBlobUrl, data: { blob_url: "blob:late-a" } },
+      channel: Channel.FromServiceToWorker,
+    });
+
+    const correct = {
+      download_id: "download_pending",
+      internal_bloburl: "blob:b",
+      internal_filename: "b.mp4",
+    } as TransferOutcome;
+    channel.emit(MSG.worker.DownloadResult, correct);
+    await expect(completion).resolves.toBe(correct);
+    client.dispose();
+  });
+
+  it("still resolves the sole pending download when the result carries no id", async () => {
+    const channel = new FakeWorkerChannel();
+    const client = new WorkerClient({
+      channel,
+      offscreen: { ensureDocument: async () => undefined },
+      offscreenUrl: "chrome-extension://fake/factory/factory.html",
+    });
+    const completion = client.download(plan);
+    await client.ensureReady();
+
+    const outcome = { internal_bloburl: "blob:no-id" } as TransferOutcome;
+    channel.emit(MSG.worker.DownloadResult, outcome);
+    await expect(completion).resolves.toBe(outcome);
+    client.dispose();
+  });
+});
