@@ -986,18 +986,6 @@ export class MediaDownloaderService {
           await this.publish();
           return;
         }
-        case MSG.contentToService.RetryDownload: {
-          const payload = data as { tab_id: number; media_hash: string };
-          const media = this.engine.mediaForTab(payload.tab_id).get(payload.media_hash);
-          if (media) {
-            this.engine.removeMedia(payload.tab_id, payload.media_hash);
-            const fresh: MediaItem = { ...media, cache: "reload", hash: `${media.hash}_retry` };
-            const tab = this.session.discovered.get(payload.tab_id);
-            tab?.media.set(fresh.hash, fresh);
-          }
-          await this.publish();
-          return;
-        }
         case MSG.contentToService.MutSettings:
           await this.mutateSettings(data);
           return;

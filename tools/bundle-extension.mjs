@@ -40,6 +40,9 @@ const ENTRIES = [
 
 const STATIC_FILES = ["extension/manifest.json", "extension/panel/panel.html", "extension/factory/factory.html"];
 
+// Build into a clean directory: an entry removed from the lists above must not linger in
+// dist/extension, where Chrome would still package and load it.
+await rm(OUT, { recursive: true, force: true });
 await mkdir(OUT, { recursive: true });
 await mkdir(path.join(OUT, "panel"), { recursive: true });
 await mkdir(path.join(OUT, "factory"), { recursive: true });
@@ -98,6 +101,8 @@ try {
     }
   }
 } catch (error) {
+  // A hash mismatch is a supply-chain finding, not a missing install: keep the original message.
+  if (String(error).includes("ffmpeg vendor hash mismatch")) throw error;
   throw new Error(`ffmpeg.wasm vendor files missing (run npm install): ${String(error)}`);
 }
 // Our worker (same URL as the upstream wrapper) adds the OPFS output path and the chunked

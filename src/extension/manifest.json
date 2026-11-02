@@ -60,12 +60,6 @@
       "all_frames": true,
       "world": "MAIN"
     }
-  ],
-  "commands": {
-    "default-action": {
-      "description": "Run the default action for the current tab",
-      "suggested_key": { "default": "Alt+Down" }
-    }
-  }
+  ]
 }
 

@@ -7,17 +7,10 @@ import {
   computeBadge,
   formatBadgeCount,
 } from "../src/extension/badge.js";
-import {
-  POPUP_PAGE,
-  resolveDockBootstrap,
-  resolveDockOpen,
-  type DockBootstrapPlan,
-} from "../src/extension/dock.js";
 
 /**
- * Extension feedback: badge priority/colours and the dock-mode branch table.
- * Evidence: analysis/evidence/01-messaging-runtime.md E29 (badge, `Ly` pretty 22466-22483),
- * E32 (dock, `$b` pretty 21224-21241 and `K0` 21216-21223).
+ * Extension feedback: badge priority/colours.
+ * Evidence: analysis/evidence/01-messaging-runtime.md E29 (badge, `Ly` pretty 22466-22483).
  */
 
 describe("badge", () => {
@@ -93,81 +86,5 @@ describe("badge", () => {
       0,
       190,
     ]);
-  });
-});
-
-describe("dock bootstrap branch table (E32)", () => {
-  const cases: Array<{
-    name: string;
-    input: Parameters<typeof resolveDockBootstrap>[0];
-    expected: DockBootstrapPlan;
-  }> = [
-    {
-      name: "firefox + sidebar toggles the sidebar on action click",
-      input: { mode: "sidebar", chromium: false, hasSidePanel: false },
-      expected: { actionClickTogglesSidebar: true, setPopup: null },
-    },
-    {
-      name: "firefox + popup registers the popup page",
-      input: { mode: "popup", chromium: false, hasSidePanel: false },
-      expected: { actionClickTogglesSidebar: false, setPopup: POPUP_PAGE },
-    },
-    {
-      name: "firefox + window clears the popup (legacy branch)",
-      input: { mode: "window", chromium: false, hasSidePanel: false },
-      expected: { actionClickTogglesSidebar: false, setPopup: null },
-    },
-    {
-      name: "chromium + sidepanel + sidebar enables the panel and opens on click",
-      input: { mode: "sidebar", chromium: true, hasSidePanel: true },
-      expected: {
-        sidePanelOptions: { enabled: true },
-        sidePanelBehavior: { openPanelOnActionClick: true },
-        setPopup: "",
-      },
-    },
-    {
-      name: "chromium + sidepanel + popup disables the panel and registers the popup",
-      input: { mode: "popup", chromium: true, hasSidePanel: true },
-      expected: {
-        sidePanelOptions: { enabled: false },
-        sidePanelBehavior: { openPanelOnActionClick: false },
-        setPopup: POPUP_PAGE,
-      },
-    },
-    {
-      name: "chromium + sidepanel + window is a no-op (no Chromium implementation)",
-      input: { mode: "window", chromium: true, hasSidePanel: true },
-      expected: {},
-    },
-    {
-      name: "chromium without sidepanel falls back to the popup for sidebar",
-      input: { mode: "sidebar", chromium: true, hasSidePanel: false },
-      expected: { setPopup: POPUP_PAGE },
-    },
-    {
-      name: "chromium without sidepanel falls back to the popup for popup",
-      input: { mode: "popup", chromium: true, hasSidePanel: false },
-      expected: { setPopup: POPUP_PAGE },
-    },
-    {
-      name: "chromium without sidepanel falls back to the popup for window",
-      input: { mode: "window", chromium: true, hasSidePanel: false },
-      expected: { setPopup: POPUP_PAGE },
-    },
-  ];
-
-  it.each(cases)("$name", ({ input, expected }) => {
-    expect(resolveDockBootstrap(input)).toEqual(expected);
-  });
-
-  it("uses the shipped popup page path", () => {
-    expect(POPUP_PAGE).toBe("/content/popup.html");
-  });
-
-  it("describes the runtime dock-open call (K0)", () => {
-    expect(resolveDockOpen("popup")).toBe("openPopup");
-    expect(resolveDockOpen("sidebar")).toBe("openSidePanel");
-    expect(resolveDockOpen("window")).toBeNull();
   });
 });

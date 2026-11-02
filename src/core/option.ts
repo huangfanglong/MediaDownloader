@@ -56,21 +56,3 @@ export const isSome = <T>(option: Option<T>): option is Some<T> => option.tag ==
 export const isOk = <T, E>(result: Result<T, E>): result is Ok<T> => result.tag === "Ok";
 
 export const isErr = <T, E>(result: Result<T, E>): result is Err<E> => result.tag === "Err";
-
-/** First `Some` wins; mirrors the original's `Option.or` chain used for titles. */
-export function orOption<T>(...options: Array<Option<T>>): Option<T> {
-  for (const option of options) if (option.tag === "Some") return option;
-  return none;
-}
-
-export function mapOption<T, U>(option: Option<T>, fn: (value: T) => U): Option<U> {
-  return option.tag === "Some" ? some(fn(option.value)) : none;
-}
-
-export function unwrapOr<T>(option: Option<T>, fallback: T): T {
-  return option.tag === "Some" ? option.value : fallback;
-}
-
-export function mapResult<T, U, E>(result: Result<T, E>, fn: (value: T) => U): Result<U, E> {
-  return result.tag === "Ok" ? ok(fn(result.value)) : result;
-}

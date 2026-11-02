@@ -45,7 +45,7 @@ export function httpFailureReason(status: number): EndingReason {
 }
 
 // ---------------------------------------------------------------------------
-// Discovery model (proven: 02-detection-pipeline.md Â§3.1)
+// Discovery model (proven: 02-detection-pipeline.md §3.1)
 // ---------------------------------------------------------------------------
 
 /** Media item kinds emitted by the sniffing path. Site adapters add `youtube_format`. */
@@ -146,7 +146,7 @@ export interface TabMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Transfer plan (proven: 03-manifest-resolution.md Â§3.1/Â§3.2, 04-download-transfer.md)
+// Transfer plan (proven: 03-manifest-resolution.md §3.1/§3.2, 04-download-transfer.md)
 // ---------------------------------------------------------------------------
 
 /** Transfer strategies observed in the original (`download_args.strategy`). */
@@ -229,10 +229,10 @@ export interface DownloadPlan {
 }
 
 // ---------------------------------------------------------------------------
-// Transfer results / progress (proven: 04-download-transfer.md Â§3.2-Â§3.4)
+// Transfer results / progress (proven: 04-download-transfer.md §3.2-§3.4)
 // ---------------------------------------------------------------------------
 
-/** Worker â†’ service progress payload. At most 2 Hz. */
+/** Worker → service progress payload. At most 2 Hz. */
 export interface DownloadProgress {
   status: "queuing" | "downloading" | "finalizing";
   percent?: { is_known: boolean; value: number };

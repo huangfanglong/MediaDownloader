@@ -1,7 +1,7 @@
 /**
  * Offscreen download worker (module worker).
  *
- * Evidence: 04-download-transfer.md Â§2.1-Â§2.3 and 01-messaging-runtime.md Â§2. The original
+ * Evidence: 04-download-transfer.md §2.1-§2.3 and 01-messaging-runtime.md §2. The original
  * worker answers `is_ready` on `BroadcastChannel("worker_service")`, receives serde-encoded
  * download plans (`download`), fetches/assembles them (HLS segment path or libav js-fetch path),
  * stages the output in OPFS, then posts `download_result` with a blob URL, or `download_error`.
@@ -314,7 +314,6 @@ export class DownloadWorker {
     );
   }
 
-  /** Best-effort native container from a direct URL path. */
   /** Fetch one whole track (bounded ranges for googlevideo-style URLs). */
   private async fetchSourceBytes(
     url: URL,
@@ -1469,7 +1468,6 @@ export function toTransferSegments(segments: readonly ParsedSegment[]): Transfer
           }
         : {}),
       ...(segment.duration !== undefined ? { duration_s: segment.duration } : {}),
-      ...(segment.discontinuity ? { is_live: false } : {}),
     };
   });
 }

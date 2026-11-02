@@ -96,6 +96,12 @@ export interface PersistentSettings {
   hide_nomedia_box: boolean;
   dont_ask_for_user_review: boolean;
   agreed_with_tos: boolean;
+  /**
+   * Persisted for schema parity (E22). The rebuild opens the panel popup and does not apply dock
+   * placement (no `action.setPopup`/`sidePanel` bootstrap yet), so changing this setting has no
+   * visible effect; the shipped branch table (`$b`/`K0`, E32) was removed with the unused module
+   * instead of keeping a tested-but-unwired copy.
+   */
   dockmode: DockMode;
   download_directory: string;
   youtube_throttle: boolean;

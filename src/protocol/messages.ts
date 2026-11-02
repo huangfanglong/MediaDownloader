@@ -1,9 +1,9 @@
 /**
  * Message catalog for every cross-context hop.
  *
- * Evidence: analysis/evidence/01-messaging-runtime.md Â§2.2-Â§2.8, Â§3.1-Â§3.7 (E8-E18, E24-E35);
+ * Evidence: analysis/evidence/01-messaging-runtime.md §2.2-§2.8, §3.1-§3.7 (E8-E18, E24-E35);
  * `MSG` name literals were extracted from all bundles with `analysis/scratch/names.mjs`
- * (evidence doc Â§6.3). Channel numbers are the frozen `Channel` enum from
+ * (evidence doc §6.3). Channel numbers are the frozen `Channel` enum from
  * `src/protocol/channels.ts` (E8: nine values, `FromServiceToService:8` unused/reserved).
  *
  * Wire shape (E13, proven on every hop):
@@ -46,7 +46,7 @@ export interface MessageBody<Name extends string = string, Data = unknown> {
 
 /**
  * One wire message. The outer object has exactly two keys (`msg`, `channel`) and `msg` exactly
- * two (`name`, `data`) â€” asserted by test/messages.test.ts so a serializer never invents extra
+ * two (`name`, `data`) — asserted by test/messages.test.ts so a serializer never invents extra
  * fields the original consumers would ignore or mis-handle.
  */
 export interface MessageEnvelope<Name extends string = string, Data = unknown> {
@@ -64,7 +64,7 @@ export function makeEnvelope<Name extends string, Data>(
 }
 
 // ---------------------------------------------------------------------------
-// Payloads: content/UI -> service (channel 1, E16/Â§3.1)
+// Payloads: content/UI -> service (channel 1, E16/§3.1)
 // ---------------------------------------------------------------------------
 
 /** Which rendition stream the panel selected for a media row. */
@@ -169,11 +169,11 @@ export interface RedockPayload {
   mode: DockMode;
 }
 
-/** `update-smartnaming` carries the raw rules file source, or `null` to reset (E22/Â§3.1). */
+/** `update-smartnaming` carries the raw rules file source, or `null` to reset (E22/§3.1). */
 export type UpdateSmartnamingPayload = string | null;
 
 /**
- * Download-related commands sent from content/UI to the service on channel 1 (E Â§3.1): start
+ * Download-related commands sent from content/UI to the service on channel 1 (E §3.1): start
  * (`do_download`), cancel (`abort_download`), retry (`retry_download`) and delete
  * (`rm_download`). Each message carries at most one of these payloads.
  */
@@ -183,8 +183,8 @@ export type DownloadCommand =
   | RetryDownloadPayload
   | RmDownloadPayload;
 
-/** `mut-settings` data (channel 1). Exactly one key per message; 19 keys proven (E22, Â§3.7).
- * The brief said 18 â€” the shipped handler has 19 branches (pretty 23076-23142). */
+/** `mut-settings` data (channel 1). Exactly one key per message; 19 keys proven (E22, §3.7).
+ * The brief said 18 — the shipped handler has 19 branches (pretty 23076-23142). */
 export type MutSettingsPayload =
   | { preferred_audio_strategy: AudioStrategy }
   | { preferred_audio_languages: string[] }
@@ -224,11 +224,11 @@ export type ContentToServicePayload =
   | null;
 
 // ---------------------------------------------------------------------------
-// Payloads: injected ISOLATED -> service (channel 0, E16/Â§3.2)
+// Payloads: injected ISOLATED -> service (channel 0, E16/§3.2)
 // ---------------------------------------------------------------------------
 
 /** `on_media` from a site extractor. `tab_id` is optional: the service prefers
- * `sender.tab.id` and falls back to the media initiator URL (E2/Â§1.2, E Â§3.2). */
+ * `sender.tab.id` and falls back to the media initiator URL (E2/§1.2, E §3.2). */
 export interface OnMediaPayload {
   media: MediaItem;
   tab_id?: number;
@@ -242,13 +242,13 @@ export interface OnActivateAddonPayload {
   key: string;
 }
 
-/** QuickJS evaluation request (`qjs`): site extractors ship code strings (E Â§3.2). */
+/** QuickJS evaluation request (`qjs`): site extractors ship code strings (E §3.2). */
 export interface QjsPayload {
   code: string;
   uid: string | number;
 }
 
-/** Service-side fetch relay (`do_fetch_from_service`, E Â§3.2): the service performs the
+/** Service-side fetch relay (`do_fetch_from_service`, E §3.2): the service performs the
  * request with its own permissions and replies with `on_fetch_from_service`. */
 export interface DoFetchFromServicePayload {
   url: string;
@@ -259,7 +259,7 @@ export interface DoFetchFromServicePayload {
 }
 
 // ---------------------------------------------------------------------------
-// Payloads: service -> injected (channel 7, E17/Â§3.3)
+// Payloads: service -> injected (channel 7, E17/§3.3)
 // ---------------------------------------------------------------------------
 
 export interface OnActivateAddonFailurePayload {
@@ -267,7 +267,7 @@ export interface OnActivateAddonFailurePayload {
 }
 
 export interface QjsResultPayload {
-  /** JSON string: `{success, uid}` or `{error, uid}` (E Â§3.3). */
+  /** JSON string: `{success, uid}` or `{error, uid}` (E §3.3). */
   json: string;
 }
 
@@ -281,7 +281,7 @@ export interface OnFetchFromServiceFailedPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Payloads: service -> content/UI (channel 6, E17/Â§3.4) â€” the only data pushes
+// Payloads: service -> content/UI (channel 6, E17/§3.4) — the only data pushes
 // ---------------------------------------------------------------------------
 
 export interface OnPreviewAvailablePayload {
@@ -296,7 +296,7 @@ export interface OnNoPreviewPayload {
 }
 
 // ---------------------------------------------------------------------------
-// Payloads: worker bus (E34/Â§3.5)
+// Payloads: worker bus (E34/§3.5)
 // ---------------------------------------------------------------------------
 
 /** service -> worker `download` (channel FromServiceToWorker). */
@@ -334,10 +334,10 @@ export interface DownloadErrorPayload {
 /**
  * Every message name the shipped build produces or consumes, grouped by the direction it
  * travels. Values are the exact wire literals (some are kebab-case commands, some snake_case
- * worker names â€” the original is inconsistent and consumers compare exact strings).
+ * worker names — the original is inconsistent and consumers compare exact strings).
  */
 export const MSG = {
-  /** channel 1 â€” `chrome.runtime.sendMessage`, consumer `Er` in the service worker. */
+  /** channel 1 — `chrome.runtime.sendMessage`, consumer `Er` in the service worker. */
   contentToService: {
     DoDownload: "do_download",
     AbortDownload: "abort_download",
@@ -362,7 +362,7 @@ export const MSG = {
     UpdateSmartnaming: "update-smartnaming",
     Redock: "redock",
   },
-  /** channel 0 â€” `chrome.runtime.sendMessage` from content scripts, consumer `gp`. */
+  /** channel 0 — `chrome.runtime.sendMessage` from content scripts, consumer `gp`. */
   injectedToService: {
     OnMedia: "on_media",
     RemoveMedia: "remove_media",
@@ -370,24 +370,24 @@ export const MSG = {
     Qjs: "qjs",
     DoFetchFromService: "do_fetch_from_service",
   },
-  /** channel 6 â€” `chrome.runtime.sendMessage` broadcast from the service, consumer `dc`. */
+  /** channel 6 — `chrome.runtime.sendMessage` broadcast from the service, consumer `dc`. */
   serviceToContent: {
     OnPreviewAvailable: "on_preview_available",
     OnNoPreview: "on_no_preview",
     Ping: "ping",
   },
-  /** channel 7 â€” `chrome.tabs.sendMessage` from the service (`Et` one-shot / `fp` retry). */
+  /** channel 7 — `chrome.tabs.sendMessage` from the service (`Et` one-shot / `fp` retry). */
   serviceToInjected: {
     OnActivateAddonSuccess: "on_activate_addon_success",
     OnActivateAddonFailure: "on_activate_addon_failure",
     QjsResult: "qjs_result",
     OnFetchFromService: "on_fetch_from_service",
     OnFetchFromServiceFailed: "on_fetch_from_service_failed",
-    /** Config relays fetched by the service and forwarded (`zf`, E Â§3.3). */
+    /** Config relays fetched by the service and forwarded (`zf`, E §3.3). */
     VimeoOnConfig: "vimeo_on_config",
     IqyiOnConfig: "iqyi_on_config",
   },
-  /** `BroadcastChannel("worker_service")` â€” channels 2 / 3 (E9/E34; only SW and worker use it). */
+  /** `BroadcastChannel("worker_service")` — channels 2 / 3 (E9/E34; only SW and worker use it). */
   worker: {
     IsReady: "is_ready",
     IsReadySuccess: "is_ready_success",
@@ -398,7 +398,7 @@ export const MSG = {
     AbortDownload: "abort_download",
     RevokeBlobUrl: "revoke_blob_url",
   },
-  /** channels 5 / 4 â€” per-page `BroadcastChannel("injected-<cyrb53(href)>")` (E12/Â§3.6). */
+  /** channels 5 / 4 — per-page `BroadcastChannel("injected-<cyrb53(href)>")` (E12/§3.6). */
   pageBridge: {
     YouTubeRequestVisitorData: "youtube_request_visitor_data",
     YouTubeOnVisitorData: "youtube_on_visitor_data",
@@ -424,7 +424,7 @@ export type WorkerMessageName = (typeof MSG.worker)[keyof typeof MSG.worker];
 export type PageBridgeName = (typeof MSG.pageBridge)[keyof typeof MSG.pageBridge];
 
 /**
- * The 19 `mut-settings` keys accepted by the service worker (E22/Â§3.7). Order matches the
+ * The 19 `mut-settings` keys accepted by the service worker (E22/§3.7). Order matches the
  * shipped `else if` chain so parity tests can compare against the evidence table directly.
  */
 export const SETTINGS_MUTATION_KEYS = [

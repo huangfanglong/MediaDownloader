@@ -25,6 +25,12 @@ const exists = async (relative) => {
 const manifest = JSON.parse(await readFile(path.join(EXT, "manifest.json"), "utf8"));
 
 const checkFile = async (relative, label) => {
+  // A manifest without a background/page entry passes `undefined` here; report that instead of
+  // letting path.join throw and turn a clear validation problem into a stack trace.
+  if (typeof relative !== "string" || relative.length === 0) {
+    problems.push(`${label}: manifest entry missing`);
+    return "(missing)";
+  }
   if (!(await exists(relative))) problems.push(`${label}: missing ${relative}`);
   return relative;
 };

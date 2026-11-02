@@ -31,7 +31,7 @@ afterEach(() => {
 // End-to-end loop
 // ---------------------------------------------------------------------------
 
-describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â†’ save", () => {
+describe("end-to-end: sniff → playlist → plan → transfer → save", () => {
   it("downloads an fMP4 HLS stream discovered from a master playlist", async () => {
     const harness = createHarness({
       masterUrl: "https://cdn.test/master.m3u8",
