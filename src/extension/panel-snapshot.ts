@@ -6,6 +6,7 @@
  */
 import type { MediaItem, PlaylistEntry, TabMeta } from "../core/types.js";
 import { renderBasename } from "../naming/render.js";
+import { decode } from "../protocol/serde.js";
 
 export interface PanelMediaRow {
   hash: string;
@@ -300,4 +301,148 @@ export function panelMediaSignature(media: readonly PanelMediaRow[]): string {
       ].join("\u0001"),
     )
     .join("\u0002");
+}
+
+// ---------------------------------------------------------------------------
+// Incoming snapshot validation
+// ---------------------------------------------------------------------------
+
+/** Caps so a malformed or hostile snapshot cannot force unbounded DOM work in the panel. */
+const MAX_MEDIA_ROWS = 200;
+const MAX_DOWNLOADS = 100;
+const MAX_NOTIFICATIONS = 50;
+const MAX_VARIANTS = 100;
+const MAX_SOURCES = 8;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const asString = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+
+const asFiniteNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const notUndefined = <Value>(value: Value | undefined): value is Value => value !== undefined;
+
+type PanelVariant = NonNullable<PanelMediaRow["variants"]>[number];
+type PanelSource = NonNullable<PanelMediaRow["sources"]>[number];
+
+const SOURCE_VALUES: readonly string[] = ["fmt", "hls", "dash"];
+const SOURCE_LABELS: readonly string[] = ["FMT", "HLS", "DASH"];
+
+function parseVariant(value: unknown): PanelVariant | undefined {
+  if (!isRecord(value)) return undefined;
+  const index = asFiniteNumber(value.index);
+  const label = asString(value.label);
+  if (index === undefined || label === undefined) return undefined;
+  const container = asString(value.container);
+  return { index, label, ...(container !== undefined ? { container } : {}) };
+}
+
+function parseSource(value: unknown): PanelSource | undefined {
+  if (!isRecord(value)) return undefined;
+  const source = asString(value.value);
+  const label = asString(value.label);
+  if (source === undefined || !SOURCE_VALUES.includes(source)) return undefined;
+  if (label === undefined || !SOURCE_LABELS.includes(label)) return undefined;
+  return { value: source as PanelSource["value"], label: label as PanelSource["label"] };
+}
+
+function parseMediaRow(value: unknown): PanelMediaRow | undefined {
+  if (!isRecord(value)) return undefined;
+  const hash = asString(value.hash);
+  const label = asString(value.label);
+  if (hash === undefined || hash.length === 0 || label === undefined) return undefined;
+  const type = asString(value.type) ?? "";
+  const extension = asString(value.extension);
+  const durationValue = value.duration;
+  const duration = typeof durationValue === "string" ? durationValue : asFiniteNumber(durationValue);
+  const size = asFiniteNumber(value.size);
+  const thumbnail = asString(value.thumbnail);
+  const preview = asString(value.preview);
+  const muxNote = asString(value.muxNote);
+  const downloadDisabled = asString(value.download_disabled_reason);
+  const variants = Array.isArray(value.variants)
+    ? value.variants.slice(0, MAX_VARIANTS).map(parseVariant).filter(notUndefined)
+    : [];
+  const sources = Array.isArray(value.sources)
+    ? value.sources.slice(0, MAX_SOURCES).map(parseSource).filter(notUndefined)
+    : [];
+  const sourceTag = value.source;
+  return {
+    hash,
+    type,
+    label,
+    has_drm: value.has_drm === true,
+    ...(extension !== undefined ? { extension } : {}),
+    ...(duration !== undefined ? { duration } : {}),
+    ...(size !== undefined ? { size } : {}),
+    ...(thumbnail !== undefined ? { thumbnail } : {}),
+    ...(variants.length > 0 ? { variants } : {}),
+    ...(muxNote !== undefined ? { muxNote } : {}),
+    ...(preview !== undefined ? { preview } : {}),
+    ...(downloadDisabled !== undefined ? { download_disabled_reason: downloadDisabled } : {}),
+    ...(sourceTag === "FMT" || sourceTag === "HLS" || sourceTag === "DASH" ? { source: sourceTag } : {}),
+    ...(sources.length > 0 ? { sources } : {}),
+  };
+}
+
+function parseDownloadRow(value: unknown): PanelDownloadRow | undefined {
+  if (!isRecord(value)) return undefined;
+  const downloadId = asString(value.download_id);
+  const status = asString(value.status);
+  if (downloadId === undefined || downloadId.length === 0 || status === undefined) return undefined;
+  const percent = asFiniteNumber(value.percent);
+  const fetched = asFiniteNumber(value.fetched_bytes_count);
+  const bitrate = asFiniteNumber(value.bitrate);
+  return {
+    download_id: downloadId,
+    status,
+    ...(percent !== undefined ? { percent } : {}),
+    ...(fetched !== undefined ? { fetched_bytes_count: fetched } : {}),
+    ...(bitrate !== undefined ? { bitrate } : {}),
+  };
+}
+
+function parseNotificationRow(value: unknown): PanelNotificationRow | undefined {
+  if (!isRecord(value)) return undefined;
+  const type = asString(value.type);
+  if (type === undefined || type.length === 0) return undefined;
+  const message = asString(value.message);
+  return { type, ...(message !== undefined ? { message } : {}) };
+}
+
+/**
+ * Decode and validate the snapshot pushed on channel 6.
+ *
+ * The panel is the last consumer of data that crossed a context boundary: a shape change in a
+ * different build must degrade into "this snapshot is unusable" instead of an exception inside the
+ * message listener. Unknown fields are dropped, malformed rows are skipped, and the arrays are
+ * capped so a bad message cannot force unbounded DOM work.
+ */
+export function decodePanelSnapshot(wire: unknown): PanelSnapshot | undefined {
+  let decoded: unknown;
+  try {
+    decoded = decode(wire);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(decoded)) return undefined;
+  const media = decoded.media;
+  if (!Array.isArray(media)) return undefined;
+  const tabId = asFiniteNumber(decoded.tab_id);
+  const pageUrl = asString(decoded.page_url);
+  const pageTitle = asString(decoded.page_title);
+  const defaultAction = asString(decoded.default_action);
+  const downloading = Array.isArray(decoded.downloading) ? decoded.downloading : [];
+  const notifications = Array.isArray(decoded.notifications) ? decoded.notifications : [];
+  return {
+    ...(tabId !== undefined && Number.isInteger(tabId) && tabId > 0 ? { tab_id: tabId } : {}),
+    ...(pageUrl !== undefined ? { page_url: pageUrl } : {}),
+    ...(pageTitle !== undefined ? { page_title: pageTitle } : {}),
+    ...(defaultAction !== undefined ? { default_action: defaultAction } : {}),
+    media: media.slice(0, MAX_MEDIA_ROWS).map(parseMediaRow).filter(notUndefined),
+    downloading: downloading.slice(0, MAX_DOWNLOADS).map(parseDownloadRow).filter(notUndefined),
+    notifications: notifications.slice(0, MAX_NOTIFICATIONS).map(parseNotificationRow).filter(notUndefined),
+  };
 }

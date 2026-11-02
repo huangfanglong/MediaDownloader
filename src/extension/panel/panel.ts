@@ -22,10 +22,12 @@ import {
   makeRequestSessionEnvelope,
   type RebuildEnvelope,
 } from "../../protocol/rebuild-messages.js";
-import { decode } from "../../protocol/serde.js";
 import { statusPresentation } from "../panel-status.js";
 import { BoundedCache } from "../bounded-cache.js";
+import { MediaSelections } from "../panel-state.js";
+import { QualityProbeTracker, collectPageQuality, type PageQuality } from "../panel-quality.js";
 import {
+  decodePanelSnapshot,
   formatLabel,
   panelMediaSignature,
   PREVIEW_WINDOW_SECONDS,
@@ -56,10 +58,8 @@ const runtime = chromeApi?.runtime;
 const scripting = chromeApi?.scripting;
 let activeTabId: number | undefined;
 let lastSnapshot: PanelSnapshot | undefined;
-let qualityTabId: number | undefined;
-let qualityPageUrl: string | undefined;
-let qualityProbedAt = 0;
-let measuredQuality: { width: number; height: number; bitrate?: number } | undefined;
+/** One measurement attempt budget per tab + page; a page is not re-walked for the whole session. */
+const qualityProbes = new QualityProbeTracker();
 const list = document.getElementById("media-list");
 const empty = document.getElementById("empty");
 const statusLine = document.getElementById("status");
@@ -70,8 +70,8 @@ const statusFill = document.getElementById("status-fill");
 const pageTitle = document.getElementById("page-title");
 const cancelButton = document.getElementById("cancel-button") as HTMLButtonElement | null;
 
-/** Per-media select values survive a row rebuild (quality / format). */
-const SELECTIONS = new Map<string, { quality: string; format: string; source: string }>();
+/** Per-media select values survive a row rebuild (bounded: the panel page lives for a session). */
+const SELECTIONS = new MediaSelections();
 let lastRowSignature: string | undefined;
 let pendingSnapshot: PanelSnapshot | undefined;
 
@@ -95,8 +95,7 @@ function formatDuration(duration: string | number | undefined): string | undefin
 }
 
 function saveSelection(hash: string, patch: Partial<{ quality: string; format: string; source: string }>): void {
-  const current = SELECTIONS.get(hash) ?? { quality: "0", format: "", source: "" };
-  SELECTIONS.set(hash, { ...current, ...patch });
+  SELECTIONS.save(hash, patch);
 }
 
 function createThumbnail(mediaWrap: HTMLElement, row: PanelSnapshot["media"][number]): void {
@@ -296,7 +295,9 @@ function attachHoverPreview(mediaWrap: HTMLElement, row: PanelSnapshot["media"][
   });
 }
 
-window.addEventListener("unload", () => proxiedPreviewCache.clear());
+// `unload` is deprecated and skipped when the page can be cached; `pagehide` is the reliable
+// teardown event for the preview object URLs this panel creates.
+window.addEventListener("pagehide", () => proxiedPreviewCache.clear());
 function createSourceControl(row: PanelSnapshot["media"][number]): HTMLElement | undefined {
   const sources = row.sources;
   if (sources === undefined || sources.length === 0) return undefined;
@@ -512,82 +513,46 @@ function formatMeasuredBitrate(bitrate: number): string {
     : `${Math.max(1, Math.round(bytesPerSecond / 1e3))}KB/s`;
 }
 
-async function probePageQuality(tabId: number): Promise<{ width: number; height: number; bitrate?: number } | undefined> {
-  if (scripting === undefined) return undefined;
-  try {
-    const results = await scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: "MAIN",
-      func: () => {
-        const videos: HTMLVideoElement[] = [];
-        const walk = (root: Document | ShadowRoot): void => {
-          videos.push(...(Array.from(root.querySelectorAll("video")) as HTMLVideoElement[]));
-          for (const element of Array.from(root.querySelectorAll("*"))) {
-            const shadow = (element as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-            if (shadow !== null && shadow !== undefined) walk(shadow);
-          }
-        };
-        walk(document);
-        const video =
-          videos.find((candidate) => !candidate.paused && candidate.videoWidth > 0 && candidate.videoHeight > 0) ??
-          videos.find((candidate) => candidate.videoWidth > 0 && candidate.videoHeight > 0);
-        if (video === undefined) return undefined;
-        let bytes = 0;
-        try {
-          for (const entry of performance.getEntriesByType("resource") as PerformanceResourceTiming[]) {
-            if (!/\.(?:ts|m4s|mp4|m4a|webm)(?:[?#]|$)/iu.test(entry.name)) continue;
-            const size = entry.transferSize > 0 ? entry.transferSize : entry.encodedBodySize;
-            if (Number.isFinite(size) && size > 0) bytes += size;
-          }
-        } catch {
-          /* resource timing unavailable */
-        }
-        const duration = video.duration;
-        const bitrate =
-          Number.isFinite(duration) && duration > 0 && bytes > 0 ? Math.round((bytes * 8) / duration) : undefined;
-        return {
-          width: video.videoWidth,
-          height: video.videoHeight,
-          ...(bitrate !== undefined && bitrate > 0 ? { bitrate } : {}),
-        };
-      },
-    });
-    const result = results
-      .map((entry) => entry.result as { width?: unknown; height?: unknown; bitrate?: unknown } | undefined)
-      .find((entry) => entry !== undefined && typeof entry.width === "number" && typeof entry.height === "number");
-    if (result === undefined || typeof result.width !== "number" || typeof result.height !== "number") return undefined;
-    console.info("[media-downloader] measured page quality", result.width, result.height, result.bitrate ?? "");
-    return {
-      width: result.width,
-      height: result.height,
-      ...(typeof result.bitrate === "number" && result.bitrate > 0 ? { bitrate: result.bitrate } : {}),
-    };
-  } catch {
-    return undefined;
+/** First frame that reported a usable video wins; results are page-supplied values. */
+function parseProbeResults(results: Array<{ result?: unknown }>): PageQuality | undefined {
+  for (const entry of results) {
+    const result = entry.result as { width?: unknown; height?: unknown; bitrate?: unknown } | null | undefined;
+    if (result === null || typeof result !== "object") continue;
+    if (typeof result.width !== "number" || typeof result.height !== "number") continue;
+    const width = Math.round(result.width);
+    const height = Math.round(result.height);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) continue;
+    const bitrate = typeof result.bitrate === "number" && Number.isFinite(result.bitrate) && result.bitrate > 0
+      ? result.bitrate
+      : undefined;
+    return { width, height, ...(bitrate !== undefined ? { bitrate } : {}) };
   }
+  return undefined;
 }
 
 function scheduleQualityProbe(snapshot: PanelSnapshot): void {
   const tabId = snapshot.tab_id;
   if (tabId === undefined || scripting === undefined) return;
-  if (tabId !== qualityTabId || snapshot.page_url !== qualityPageUrl) {
-    qualityTabId = tabId;
-    qualityPageUrl = snapshot.page_url;
-    measuredQuality = undefined;
-    qualityProbedAt = 0;
-  }
-  if (measuredQuality !== undefined) return;
-  if (Date.now() - qualityProbedAt < 5000) return;
-  qualityProbedAt = Date.now();
-  void probePageQuality(tabId).then((quality) => {
-    if (activeTabId !== tabId) return;
-    measuredQuality = quality;
-    if (lastSnapshot !== undefined) render(lastSnapshot);
-  });
+  if (!qualityProbes.shouldProbe(snapshot, Date.now())) return;
+  void scripting
+    .executeScript({
+      target: { tabId, allFrames: true },
+      world: "MAIN",
+      // Serialized into the page: the function must stay self-contained (no module captures).
+      func: collectPageQuality,
+    })
+    .then((results) => {
+      const quality = parseProbeResults(results);
+      if (quality === undefined) return;
+      if (!qualityProbes.resolve(tabId, quality)) return;
+      console.info("[media-downloader] measured page quality", quality.width, quality.height, quality.bitrate ?? "");
+      if (lastSnapshot !== undefined) render(lastSnapshot);
+    })
+    .catch(() => undefined);
 }
 
 function enrichRowsWithMeasuredQuality(snapshot: PanelSnapshot): PanelSnapshot {
-  const quality = measuredQuality;
+  const quality = qualityProbes.measuredQuality;
   if (quality === undefined) return snapshot;
   return {
     ...snapshot,
@@ -663,7 +628,13 @@ runtime?.onMessage.addListener((message: unknown) => {
   const envelope = message as { msg?: { name?: string; data?: unknown }; channel?: number };
   if (envelope?.channel !== Channel.FromServiceToContent) return;
   if (envelope.msg?.name !== REBUILD_MESSAGES.SessionSnapshot) return;
-  const snapshot = decode(envelope.msg.data) as PanelSnapshot;
+  const snapshot = decodePanelSnapshot(envelope.msg.data);
+  if (snapshot === undefined) {
+    // Not a snapshot this build understands: keep the current rows instead of throwing in the
+    // listener and freezing the panel on every subsequent push.
+    console.warn("[media-downloader] ignoring a panel snapshot with an unexpected shape");
+    return;
+  }
   render(snapshot);
 });
 
