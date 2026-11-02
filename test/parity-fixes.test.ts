@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { parsePlaylist } from "../src/manifests/hls.js";
-import { DownloadWorker } from "../src/extension/download-worker.js";
+import { DownloadWorker, toTransferSegments } from "../src/extension/download-worker.js";
 import { deriveCarryGetParams } from "../src/extension/service-worker.js";
 import { setFlag, type Behaviours } from "../src/settings/flags.js";
 import type { DownloadPlan } from "../src/core/types.js";
-import type { FetchLike } from "../src/transfer/fetch.js";
+import { buildSegmentRequests } from "../src/transfer/assemble.js";
+import type { FetchLike, FetchResponseLike } from "../src/transfer/fetch.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
 import { createFakeOpfs } from "./helpers/transfer-fakes.js";
 
@@ -127,6 +128,172 @@ describe("worker refuses encrypted HLS instead of saving ciphertext", () => {
     // so this only asserts the encryption pre-flight does not trip on unencrypted input.
     const result = await worker.runPlan(planFor("m3u8_audio_video_one_source"));
     expect(result.tag === "Err" ? result.error : "").not.toMatch(/Encrypted HLS/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EXT-X-MAP is stream state: keyed init sections and mid-playlist map changes
+// ---------------------------------------------------------------------------
+
+const HLS_URL = "https://cdn.test/index.m3u8";
+
+const playlistHeader = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:2"];
+
+/** The key applies to the map, then METHOD=NONE clears it for the media segments. */
+const KEYED_INIT_PLAYLIST = [
+  ...playlistHeader,
+  '#EXT-X-KEY:METHOD=AES-128,URI="https://keys.test/k"',
+  '#EXT-X-MAP:URI="init.mp4"',
+  "#EXT-X-KEY:METHOD=NONE",
+  "#EXTINF:2.0,",
+  "seg-0.m4s",
+  "#EXTINF:2.0,",
+  "seg-1.m4s",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
+/** A new map after a discontinuity (ad break / multi-period fMP4). */
+const TWO_MAP_PLAYLIST = [
+  ...playlistHeader,
+  '#EXT-X-MAP:URI="init-1.mp4"',
+  "#EXTINF:2.0,",
+  "seg-0.m4s",
+  "#EXTINF:2.0,",
+  "seg-1.m4s",
+  "#EXT-X-DISCONTINUITY",
+  '#EXT-X-MAP:URI="init-2.mp4"',
+  "#EXTINF:2.0,",
+  "seg-2.m4s",
+  "#EXTINF:2.0,",
+  "seg-3.m4s",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
+/** The same map is re-declared before every segment; it must be fetched once. */
+const REPEATED_MAP_PLAYLIST = [
+  ...playlistHeader,
+  '#EXT-X-MAP:URI="init.mp4"',
+  "#EXTINF:2.0,",
+  "seg-0.m4s",
+  '#EXT-X-MAP:URI="init.mp4"',
+  "#EXTINF:2.0,",
+  "seg-1.m4s",
+  "#EXT-X-ENDLIST",
+].join("\n");
+
+const tagged = (marker: number, size = 512): Uint8Array => new Uint8Array(size).fill(marker);
+
+const bytesResponse = (data: Uint8Array): FetchResponseLike => {
+  let sent = false;
+  return {
+    status: 200,
+    ok: true,
+    body: {
+      getReader: () => ({
+        read: async () => {
+          if (sent) return { done: true };
+          sent = true;
+          return { done: false, value: data };
+        },
+        cancel: async () => undefined,
+      }),
+    },
+  };
+};
+
+const segmentsUrl = (name: string): string => `https://cdn.test/${name}`;
+
+function workerWithBodies(bodies: Record<string, string | Uint8Array>): {
+  worker: DownloadWorker;
+  opfs: ReturnType<typeof createFakeOpfs>;
+  fetched: string[];
+} {
+  const fetched: string[] = [];
+  const opfs = createFakeOpfs();
+  const worker = new DownloadWorker({
+    channel: noopChannel(),
+    fetchImpl: (async (url: string) => {
+      fetched.push(url);
+      const body = bodies[url];
+      if (body === undefined) return { status: 404, ok: false, body: null };
+      return bytesResponse(typeof body === "string" ? new TextEncoder().encode(body) : body);
+    }) as FetchLike,
+    openRoot: async () => opfs.root,
+  });
+  return { worker, opfs, fetched };
+}
+
+const stagedBytes = (opfs: ReturnType<typeof createFakeOpfs>): number[] =>
+  [...opfs.files.values()].flat().flatMap((chunk) => [...chunk]);
+
+/** First byte of each descriptor's 512-byte payload, in assembled order. */
+const stagedMarkers = (opfs: ReturnType<typeof createFakeOpfs>, size = 512): number[] => {
+  const output = stagedBytes(opfs);
+  const markers: number[] = [];
+  for (let offset = 0; offset < output.length; offset += size) markers.push(output[offset] as number);
+  return markers;
+};
+
+describe("EXT-X-MAP handling during transfer", () => {
+  it("refuses a keyed init section before fetching anything", async () => {
+    const { worker, fetched } = workerWithBodies({ [HLS_URL]: KEYED_INIT_PLAYLIST });
+
+    const result = await worker.runPlan(planFor("m3u8_audio_video_one_source"));
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") {
+      expect(result.error).toMatch(/AES-128 encrypted HLS is not supported/);
+    }
+    expect(fetched).toEqual([HLS_URL]);
+  });
+
+  it("follows an EXT-X-MAP change so the later init section is part of the file", async () => {
+    const { worker, opfs, fetched } = workerWithBodies({
+      [HLS_URL]: TWO_MAP_PLAYLIST,
+      [segmentsUrl("init-1.mp4")]: tagged(1),
+      [segmentsUrl("init-2.mp4")]: tagged(2),
+      [segmentsUrl("seg-0.m4s")]: tagged(10),
+      [segmentsUrl("seg-1.m4s")]: tagged(11),
+      [segmentsUrl("seg-2.m4s")]: tagged(20),
+      [segmentsUrl("seg-3.m4s")]: tagged(21),
+    });
+
+    const result = await worker.runPlan(planFor("m3u8_audio_video_one_source"));
+
+    expect(result.tag).toBe("Ok");
+    expect(fetched.filter((url) => url === segmentsUrl("init-1.mp4"))).toHaveLength(1);
+    expect(fetched.filter((url) => url === segmentsUrl("init-2.mp4"))).toHaveLength(1);
+    expect(stagedMarkers(opfs)).toEqual([1, 10, 11, 2, 20, 21]);
+  });
+
+  it("fetches a re-declared identical map once", async () => {
+    const { worker, opfs, fetched } = workerWithBodies({
+      [HLS_URL]: REPEATED_MAP_PLAYLIST,
+      [segmentsUrl("init.mp4")]: tagged(1),
+      [segmentsUrl("seg-0.m4s")]: tagged(10),
+      [segmentsUrl("seg-1.m4s")]: tagged(11),
+    });
+
+    const result = await worker.runPlan(planFor("m3u8_audio_video_one_source"));
+
+    expect(result.tag).toBe("Ok");
+    expect(fetched.filter((url) => url === segmentsUrl("init.mp4"))).toHaveLength(1);
+    expect(stagedMarkers(opfs)).toEqual([1, 10, 11]);
+  });
+
+  it("carries the EXT-X-MAP key into the transfer model", () => {
+    const parsed = parsePlaylist(KEYED_INIT_PLAYLIST, new URL(HLS_URL));
+    if (parsed.kind !== "media") throw new Error(`expected media playlist, got ${parsed.kind}`);
+
+    const segments = toTransferSegments(parsed.segments);
+    expect(segments[0]?.init?.encryption).toEqual({ url: new URL("https://keys.test/k") });
+
+    const descriptors = buildSegmentRequests(segments, {
+      masterUrl: new URL(HLS_URL),
+      carryGetParams: false,
+    });
+    expect(descriptors[0]?.isInit).toBe(true);
+    expect(descriptors[0]?.aes128?.keyUrl).toBe("https://keys.test/k");
   });
 });
 

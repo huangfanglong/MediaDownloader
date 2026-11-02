@@ -78,14 +78,14 @@ export interface BuildSegmentRequestsOptions {
   masterUrl: string | URL;
   /** Copy the master URL's query string onto every media segment URL (`carry_get_params`). */
   carryGetParams: boolean;
-  /** Init segment to fetch once before the media segments (falls back to `segments[0].init`). */
+  /** Init segment used for segments that do not carry their own `init` (leading segments). */
   initSegment?: HlsInitSegment;
   /** First media sequence number; used for the default AES IV. Defaults to 0. */
   mediaSequence?: number;
   /**
-   * Emit the init descriptor before every segment that carries one instead of once at the front.
-   * See the module comment: the original prepends cached init bytes per segment at demux time
-   * (E15); a single leading descriptor is the contract for the rebuilt plan model.
+   * Emit the init descriptor before every segment that carries one, instead of only when the
+   * effective init changes. Kept as the parity switch for the original per-segment prepend (E15);
+   * production relies on the change-detecting default below.
    */
   repeatInit?: boolean;
 }
@@ -152,8 +152,23 @@ function descriptorForInit(
 }
 
 /**
- * Turn parsed playlist segments into an ordered GET list:
- * optional init first (unless `repeatInit`), then media segments in playlist order.
+ * Identity of one init section: the same bytes are requested only when URL and range match.
+ * The map's key is deliberately not part of it — an init with different encryption is the same
+ * bytes, and encrypted HLS is refused before any request is built.
+ */
+function initIdentity(init: HlsInitSegment, master: URL): string {
+  return `${resolveUrl(init.url, master)}|${init.byte_range ? byteRangeHeader(init.byte_range) : ""}`;
+}
+
+/**
+ * Turn parsed playlist segments into an ordered GET list.
+ *
+ * HLS defines the initialization section as stream state: an `#EXT-X-MAP` stays in effect for
+ * every following segment until the next one replaces it (RFC 8216 §4.3.2.5). The list therefore
+ * emits the effective init before the first segment and again whenever that init changes, while
+ * consecutive identical maps stay a single descriptor. `repeatInit` still forces one before every
+ * segment (the original per-segment prepend, E15).
+ *
  * Relative URLs resolve against `masterUrl`; byte ranges become `Range` values; AES-128
  * references resolve the key URL and derive the default IV when the playlist omitted one.
  */
@@ -168,20 +183,18 @@ export function buildSegmentRequests(
   );
   const baseSequence = options.mediaSequence ?? 0;
   const descriptors: SegmentDescriptor[] = [];
-
   const explicitInit = options.initSegment;
-  const firstSegmentInit = segments.find(
-    (segment) => segment.init !== undefined,
-  )?.init;
-  const singleInit = explicitInit ?? firstSegmentInit;
-
-  if (singleInit && !options.repeatInit)
-    descriptors.push(descriptorForInit(singleInit, master));
+  /** Identity of the init descriptor emitted last; `undefined` before the first one. */
+  let emittedInit: string | undefined;
 
   segments.forEach((segment, index) => {
-    if (options.repeatInit) {
-      const init = segment.init ?? explicitInit;
-      if (init) descriptors.push(descriptorForInit(init, master));
+    const init = segment.init ?? explicitInit;
+    if (init !== undefined) {
+      const identity = initIdentity(init, master);
+      if (options.repeatInit || identity !== emittedInit) {
+        descriptors.push(descriptorForInit(init, master));
+        emittedInit = identity;
+      }
     }
     const sequenceNumber = segment.sequence_number ?? baseSequence + index;
     const url = applyCarry(

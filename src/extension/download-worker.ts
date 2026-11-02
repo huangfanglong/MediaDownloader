@@ -1088,13 +1088,18 @@ export class DownloadWorker {
     // Encryption boundary: the rebuilt scope has no decrypter. Refuse explicitly instead of
     // saving ciphertext; AES-128 is the only standard scheme the original handled itself, and even
     // there we need a WebCrypto implementation that this rebuild deliberately omits.
-    if (segments.some((segment) => segment.key !== undefined)) {
-      const methods = new Set(segments.map((segment) => segment.key?.method ?? "NONE"));
-      const unsupported = [...methods].filter((method) => method !== "NONE");
+    // An `#EXT-X-KEY` also covers the initialization section declared by a preceding `#EXT-X-MAP`
+    // (RFC 8216 §4.3.2.5), so the map's key belongs to the same boundary. Checking only the media
+    // segments let a keyed init be fetched raw and saved as part of a "successful" download.
+    const encryptionKeys = segments.flatMap((segment) =>
+      [segment.key, segment.map?.key].filter((key) => key !== undefined),
+    );
+    const methods = [...new Set(encryptionKeys.map((key) => key.method))];
+    if (methods.length > 0) {
       return err(
-        unsupported.includes("AES-128")
+        methods.includes("AES-128")
           ? "AES-128 encrypted HLS is not supported by this rebuild (no decrypter implemented)"
-          : `Encrypted HLS is not supported (methods: ${unsupported.join(", ")})`,
+          : `Encrypted HLS is not supported (methods: ${methods.join(", ")})`,
       );
     }
     const initSegment = segments.find((segment) => segment.map !== undefined)?.map;
@@ -1350,33 +1355,51 @@ export class DownloadWorker {
   }
 }
 
+/**
+ * AES-128 reference for one parser key, or `undefined` when the transfer layer cannot use it.
+ * The worker refuses encrypted HLS before building descriptors; carrying the reference keeps the
+ * transfer model honest (an init and a media segment use the same shape) instead of silently
+ * dropping the key of an `#EXT-X-MAP`.
+ */
+function aes128Of(
+  key: ParsedSegment["key"],
+): { url: URL; iv?: Uint8Array } | undefined {
+  if (key === undefined || key.method !== "AES-128" || key.uri === undefined) return undefined;
+  return { url: key.uri, ...(key.iv ? { iv: ivFromHex(key.iv) } : {}) };
+}
+
 /** Map the parser's segment shape onto the transfer layer's descriptor input. */
 export function toTransferSegments(segments: readonly ParsedSegment[]): TransferSegment[] {
-  return segments.map((segment) => ({
-    url: segment.uri,
-    ...(segment.byterange ? { byte_range: { offset: segment.byterange.offset, length: segment.byterange.length } } : {}),
-    ...(segment.key && segment.key.method === "AES-128" && segment.key.uri
-      ? { encryption: { url: segment.key.uri, ...(segment.key.iv ? { iv: ivFromHex(segment.key.iv) } : {}) } }
-      : {}),
-    ...(segment.map
-      ? {
-          init: {
-            url: segment.map.uri,
-            ...(segment.map.byterange
-              ? { byte_range: { offset: segment.map.byterange.offset, length: segment.map.byterange.length } }
-              : {}),
-          },
-        }
-      : {}),
-    ...(segment.duration !== undefined ? { duration_s: segment.duration } : {}),
-    ...(segment.discontinuity ? { is_live: false } : {}),
-  }));
+  return segments.map((segment) => {
+    const encryption = aes128Of(segment.key);
+    const initEncryption = aes128Of(segment.map?.key);
+    return {
+      url: segment.uri,
+      ...(segment.byterange ? { byte_range: { offset: segment.byterange.offset, length: segment.byterange.length } } : {}),
+      ...(encryption ? { encryption } : {}),
+      ...(segment.map
+        ? {
+            init: {
+              url: segment.map.uri,
+              ...(segment.map.byterange
+                ? { byte_range: { offset: segment.map.byterange.offset, length: segment.map.byterange.length } }
+                : {}),
+              ...(initEncryption ? { encryption: initEncryption } : {}),
+            },
+          }
+        : {}),
+      ...(segment.duration !== undefined ? { duration_s: segment.duration } : {}),
+      ...(segment.discontinuity ? { is_live: false } : {}),
+    };
+  });
 }
 
 function toTransferInit(map: NonNullable<ParsedSegment["map"]>): HlsInitSegment {
+  const encryption = aes128Of(map.key);
   return {
     url: map.uri,
     ...(map.byterange ? { byte_range: { offset: map.byterange.offset, length: map.byterange.length } } : {}),
+    ...(encryption ? { encryption } : {}),
   };
 }
 

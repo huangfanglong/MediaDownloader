@@ -52,6 +52,7 @@ import {
   totalBytes,
   unsupportedAes128Decrypter,
   type HlsSegment,
+  type SegmentDescriptor,
 } from "../src/transfer/assemble.js";
 import {
   DOWNLOAD_ERROR_MESSAGES,
@@ -70,6 +71,14 @@ afterEach(() => {
 });
 
 const bytes = (...values: number[]): Uint8Array => new Uint8Array(values);
+
+/** Compact descriptor label: `init:<file>[|range]` for init sections, the file name otherwise. */
+const describeDescriptor = (descriptor: SegmentDescriptor): string => {
+  const name = descriptor.url.split("/").pop() ?? descriptor.url;
+  return descriptor.isInit === true
+    ? `init:${name}${descriptor.range ? `|${descriptor.range}` : ""}`
+    : name;
+};
 
 // ===========================================================================
 // retry.ts — E11/E12/E13/E17
@@ -629,6 +638,67 @@ describe("buildSegmentRequests (E15/E16)", () => {
     expect(descriptors.map((descriptor) => descriptor.isInit === true)).toEqual(
       [true, false, true, false],
     );
+  });
+
+  it("emits a new init descriptor when the EXT-X-MAP changes mid-playlist", () => {
+    const first = { url: "init-1.mp4" };
+    const second = { url: "init-2.mp4" };
+    const descriptors = buildSegmentRequests(
+      [
+        { url: "s1.m4s", init: first },
+        { url: "s2.m4s", init: first },
+        { url: "s3.m4s", init: second },
+        { url: "s4.m4s", init: second },
+      ],
+      { masterUrl: "https://cdn.example/master.m3u8", carryGetParams: false },
+    );
+    expect(descriptors.map(describeDescriptor)).toEqual([
+      "init:init-1.mp4",
+      "s1.m4s",
+      "s2.m4s",
+      "init:init-2.mp4",
+      "s3.m4s",
+      "s4.m4s",
+    ]);
+  });
+
+  it("re-emits an init when the map changes back (A, B, A)", () => {
+    const first = { url: "init-1.mp4" };
+    const second = { url: "init-2.mp4" };
+    const descriptors = buildSegmentRequests(
+      [
+        { url: "s1.m4s", init: first },
+        { url: "s2.m4s", init: second },
+        { url: "s3.m4s", init: first },
+      ],
+      { masterUrl: "https://cdn.example/master.m3u8", carryGetParams: false },
+    );
+    expect(descriptors.map(describeDescriptor)).toEqual([
+      "init:init-1.mp4",
+      "s1.m4s",
+      "init:init-2.mp4",
+      "s2.m4s",
+      "init:init-1.mp4",
+      "s3.m4s",
+    ]);
+  });
+
+  it("treats a byte-range change on the same init URL as a new init", () => {
+    const whole = { url: "init.mp4" };
+    const section = { url: "init.mp4", byte_range: { offset: 0, length: 700 } };
+    const descriptors = buildSegmentRequests(
+      [
+        { url: "s1.m4s", init: whole },
+        { url: "s2.m4s", init: section },
+      ],
+      { masterUrl: "https://cdn.example/master.m3u8", carryGetParams: false },
+    );
+    expect(descriptors.map(describeDescriptor)).toEqual([
+      "init:init.mp4",
+      "s1.m4s",
+      "init:init.mp4|bytes=0-699",
+      "s2.m4s",
+    ]);
   });
 
   it("defaultIv is 16 bytes big-endian at offset 12", () => {
