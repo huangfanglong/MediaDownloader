@@ -338,11 +338,22 @@ export async function handleMediaStreamRequest(
 }
 
 interface RuntimeLike {
+  /** Extension id; it disappears from an orphaned content-script context after a reload. */
+  readonly id?: string;
   sendMessage(message: Envelope): Promise<unknown>;
   onMessage: {
     addListener(listener: (message: unknown) => void): void;
     removeListener(listener: (message: unknown) => void): void;
   };
+}
+
+/** Does the extension context that owns this `runtime` object still exist? */
+function runtimeContextAlive(runtime: RuntimeLike): boolean {
+  try {
+    return typeof runtime.id === "string";
+  } catch {
+    return false;
+  }
 }
 
 /** Attach the bridge. Returns a disposer. */
@@ -359,8 +370,10 @@ export function installContentBridge(
   let lastFocusedSignature = "";
   /** The old content script outlives an extension reload; its runtime calls then throw. */
   let invalidated = false;
-  // Consumed by the service worker's healing probe after an extension reload.
-  (globalThis as { __mediaDownloaderBridgePing?: () => boolean }).__mediaDownloaderBridgePing = () => !invalidated;
+  // Consumed by the service worker's healing probe after an extension reload. Liveness covers
+  // both an observed failure and an orphaned context that has not attempted a call yet.
+  (globalThis as { __mediaDownloaderBridgePing?: () => boolean }).__mediaDownloaderBridgePing = () =>
+    !invalidated && runtimeContextAlive(runtime);
   const sendToService = (message: Envelope): void => {
     if (invalidated) return;
     try {
@@ -589,9 +602,23 @@ export function bootContentScript(): () => void {
   const scope = globalThis as {
     chrome?: { runtime: RuntimeLike };
     __mediaDownloaderContentBridgeInstalled?: boolean;
+    __mediaDownloaderBridgePing?: () => boolean;
   };
-  // Programmatic healing may re-run this file; the existing bridge wins.
-  if (scope.__mediaDownloaderContentBridgeInstalled === true) return () => undefined;
+  /**
+   * Programmatic healing may re-run this file. A LIVE bridge wins; a dead one must not block the
+   * new copy. The guard survives in the isolated world after an extension reload, while the old
+   * bridge can never reach the replacement context again, so treating the guard alone as "already
+   * installed" would leave the tab without a working bridge until the page is reloaded.
+   */
+  const existingBridgeAlive = (): boolean => {
+    if (scope.__mediaDownloaderContentBridgeInstalled !== true) return false;
+    try {
+      return scope.__mediaDownloaderBridgePing?.() === true;
+    } catch {
+      return false;
+    }
+  };
+  if (existingBridgeAlive()) return () => undefined;
   const chromeApi = scope.chrome;
   if (!chromeApi?.runtime) return () => undefined;
   scope.__mediaDownloaderContentBridgeInstalled = true;
