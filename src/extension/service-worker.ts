@@ -29,7 +29,7 @@ import {
   percentFromBytes,
 } from "../core/progress.js";
 import { Channel } from "../protocol/channels.js";
-import { MSG, type DoDownloadPayload } from "../protocol/messages.js";
+import { MSG, parseDoDownloadPayload, type DoDownloadPayload } from "../protocol/messages.js";
 import { decode, encode } from "../protocol/serde.js";
 import { buildPanelSnapshot, type PanelSnapshot } from "./panel-snapshot.js";
 import { debugInfo } from "./log.js";
@@ -40,7 +40,7 @@ import type { Result } from "../core/option.js";
 import { isErr } from "../core/option.js";
 import { DiscoveryEngine, SNIFF_RESOURCE_TYPES, type BehaviourGate } from "../discovery/engine.js";
 import { buildPlan } from "../plan/build.js";
-import { applyOutputFormat, normalizeOutputFormat } from "../plan/output-format.js";
+import { applyOutputFormat, normalizeOutputFormat, type OutputFormat } from "../plan/output-format.js";
 import { buildPreviewPlan } from "../plan/strategies.js";
 import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
@@ -192,6 +192,13 @@ const createSessionState = (): SessionState => ({
   notifications: new Map(),
   transient_history: [],
 });
+
+/** Per-row choices a download command carries; absent fields fall back to settings/defaults. */
+interface DownloadSelection {
+  preferredEntry?: number;
+  requestedFormat?: OutputFormat;
+  requestedSource?: "fmt" | "hls";
+}
 
 export class MediaDownloaderService {
   private readonly gateway: BrowserGateway;
@@ -684,7 +691,7 @@ export class MediaDownloaderService {
     const media = this.engine.mediaForTab(tabId).get(menuItemId.slice(MEDIA_MENU_PREFIX.length));
     const meta = this.session.discovered.get(tabId)?.meta;
     if (!media || !meta) return;
-    await this.startDownload({ download_args: undefined as never, media: media as never, meta: meta as never });
+    await this.startDownloadFor(media, meta);
   }
 
   /** A stable id shared by a manifest and its sibling direct track (Twitter amplify videos). */
@@ -963,9 +970,15 @@ export class MediaDownloaderService {
     const data = envelope.msg?.data;
     if (envelope.channel === Channel.FromContentToService) {
       switch (name) {
-        case MSG.contentToService.DoDownload:
-          await this.startDownload(data as DoDownloadPayload);
+        case MSG.contentToService.DoDownload: {
+          const payload = parseDoDownloadPayload(data);
+          if (payload === undefined) {
+            console.warn("[media-downloader] ignoring malformed do_download message");
+            return;
+          }
+          await this.startDownload(payload);
           return;
+        }
         case REBUILD_MESSAGES.MediaFocus: {
           if (senderTabId !== undefined) {
             const urls = Array.isArray((data as { urls?: unknown })?.urls)
@@ -1146,36 +1159,33 @@ export class MediaDownloaderService {
   // Downloads
   // -------------------------------------------------------------------------
 
-  private async startDownload(rawPayload: DoDownloadPayload): Promise<void> {
-    // The panel addresses media by (tab, hash); the service resolves it, so the UI never has to
-    // round-trip URL/Headers objects through the message bus.
-    const addressed = rawPayload as unknown as {
-      media?: unknown;
-      tab_id?: number;
-      media_hash?: string;
-      preferred_entry?: number;
-      output_format?: string;
-      source?: string;
-    };
-    const preferredEntry =
-      typeof addressed.preferred_entry === "number" &&
-      Number.isInteger(addressed.preferred_entry) &&
-      addressed.preferred_entry >= 0 &&
-      addressed.preferred_entry <= 100
-        ? addressed.preferred_entry
-        : undefined;
-    const requestedFormat = normalizeOutputFormat(addressed.output_format);
-    const requestedSource = addressed.source === "hls" || addressed.source === "fmt" ? addressed.source : undefined;
-    let payload = rawPayload;
-    if (addressed.media === undefined && addressed.tab_id !== undefined && addressed.media_hash !== undefined) {
-      const media = this.engine.mediaForTab(addressed.tab_id).get(addressed.media_hash);
-      const meta = this.session.discovered.get(addressed.tab_id)?.meta;
-      if (!media || !meta) return;
-      payload = { download_args: undefined as never, media, meta };
-    }
-    const media = decodeMaybe(payload.media) as MediaItem | undefined;
-    const meta = decodeMaybe(payload.meta) as TabMeta | undefined;
-    if (!media || !meta) return;
+  /**
+   * `do_download`: the panel addresses the registry item by tab + hash, so the full media object
+   * (URLs, Headers) never has to cross the message bus.
+   */
+  private async startDownload(payload: DoDownloadPayload): Promise<void> {
+    const media = this.engine.mediaForTab(payload.tab_id).get(payload.media_hash);
+    const meta = this.session.discovered.get(payload.tab_id)?.meta;
+    // The row can disappear between the snapshot and the click (navigation, tab close, dismiss):
+    // start nothing rather than a download without a resolved media item and page metadata.
+    if (media === undefined || meta === undefined) return;
+    const requestedFormat = normalizeOutputFormat(payload.output_format);
+    await this.startDownloadFor(media, meta, {
+      ...(payload.preferred_entry !== undefined ? { preferredEntry: payload.preferred_entry } : {}),
+      ...(requestedFormat !== undefined ? { requestedFormat } : {}),
+      ...(payload.source === "hls" || payload.source === "fmt" ? { requestedSource: payload.source } : {}),
+    });
+  }
+
+  /**
+   * Start a download for a resolved item. The context menu calls this directly: its click already
+   * carries the item hash, so it resolves the item and skips the addressed message path.
+   */
+  private async startDownloadFor(
+    media: MediaItem,
+    meta: TabMeta,
+    selection: DownloadSelection = {},
+  ): Promise<void> {
     if (this.activeMediaHashes.has(media.hash)) return;
     if (media.type === "mpd_playlist") {
       this.addNotification({
@@ -1197,17 +1207,8 @@ export class MediaDownloaderService {
       await this.publish();
       return;
     }
-    let plan: DownloadPlan | undefined;
-    try {
-      plan = payload.download_args === undefined ? undefined : (decodeMaybe(payload.download_args) as DownloadPlan);
-    } catch (error) {
-      console.warn("[media-downloader] malformed download plan", error);
-      this.addNotification({ type: "download_error", timestamp: this.now(), details: "Malformed download plan" });
-      await this.publish();
-      return;
-    }
     let downloadMedia = media;
-    if (requestedSource === "hls" && media.hls_url !== undefined) {
+    if (selection.requestedSource === "hls" && media.hls_url !== undefined) {
       const { playlist: _playlist, extension: _extension, libav_demuxer: _libav, ...rest } = media;
       downloadMedia = {
         ...rest,
@@ -1217,33 +1218,31 @@ export class MediaDownloaderService {
         demuxer: media.demuxer ?? "mp4",
       };
     }
-    if (!plan) {
-      const built = buildPlan({
-        media: downloadMedia,
-        meta,
-        audioOnly: meta.default_action === "download_audio",
-        preferredAudioStrategy: this.settings.preferred_audio_strategy,
-        preferredAudioLanguages: this.settings.preferred_audio_languages,
-        preferredAvMuxer: this.settings.preferred_av_muxer,
-        downloadDirectory: this.settings.download_directory,
-        carryGetParams: deriveCarryGetParams(this.settings.remote_behaviours, downloadMedia),
-        subtitleLanguages: this.settings.subtitle_languages,
-        youtubeThrottle: this.settings.youtube_throttle,
-        downloadIdFactory: this.downloadIdFactory,
-        ...(this.settings.preferred_quality !== null
-          ? { preferredQuality: this.settings.preferred_quality }
-          : {}),
-        ...(preferredEntry !== undefined ? { preferredEntry } : {}),
-      });
-      if (isErr(built)) {
-        this.addNotification({ type: "download_error", timestamp: this.now(), details: built.error });
-        await this.publish();
-        return;
-      }
-      plan = built.value;
+    const built = buildPlan({
+      media: downloadMedia,
+      meta,
+      audioOnly: meta.default_action === "download_audio",
+      preferredAudioStrategy: this.settings.preferred_audio_strategy,
+      preferredAudioLanguages: this.settings.preferred_audio_languages,
+      preferredAvMuxer: this.settings.preferred_av_muxer,
+      downloadDirectory: this.settings.download_directory,
+      carryGetParams: deriveCarryGetParams(this.settings.remote_behaviours, downloadMedia),
+      subtitleLanguages: this.settings.subtitle_languages,
+      youtubeThrottle: this.settings.youtube_throttle,
+      downloadIdFactory: this.downloadIdFactory,
+      ...(this.settings.preferred_quality !== null
+        ? { preferredQuality: this.settings.preferred_quality }
+        : {}),
+      ...(selection.preferredEntry !== undefined ? { preferredEntry: selection.preferredEntry } : {}),
+    });
+    if (isErr(built)) {
+      this.addNotification({ type: "download_error", timestamp: this.now(), details: built.error });
+      await this.publish();
+      return;
     }
-    if (requestedFormat !== undefined && plan !== undefined) {
-      plan = applyOutputFormat(plan, requestedFormat);
+    let plan: DownloadPlan = built.value;
+    if (selection.requestedFormat !== undefined) {
+      plan = applyOutputFormat(plan, selection.requestedFormat);
     }
     const invalid = validateDownloadPlan(plan);
     if (invalid !== undefined) {
@@ -1266,7 +1265,7 @@ export class MediaDownloaderService {
         ? focusKey(plan.url.href)
         : undefined;
     const outcome = await this.queue.queueTask(
-      () => this.executeDownload(plan as DownloadPlan, downloadMedia, meta),
+      () => this.executeDownload(plan, downloadMedia, meta),
       plan.download_id,
       plan.is_youtube,
       connectionKey,

@@ -2,7 +2,7 @@ import { MediaDownloaderService } from "../../src/extension/service-worker.js";
 import { DownloadWorker } from "../../src/extension/download-worker.js";
 import { WorkerClient } from "../../src/extension/worker-client.js";
 import { Channel } from "../../src/protocol/channels.js";
-import { MSG } from "../../src/protocol/messages.js";
+import { MSG, type DoDownloadPayload } from "../../src/protocol/messages.js";
 import type {
   BroadcastChannelLike,
   BrowserGateway,
@@ -410,11 +410,19 @@ export function sniffDetails(url: string, contentType: string, extra: Record<str
   };
 }
 
-export const doDownloadEnvelope = (media: MediaItem, meta: TabMeta): Envelope =>
+/**
+ * The download command a panel row sends: media is addressed by tab + hash, and the caller can
+ * add the per-row choices (source/entry/format) the panel would have sent.
+ */
+export const doDownloadEnvelope = (
+  media: MediaItem,
+  meta: TabMeta,
+  choices: Pick<DoDownloadPayload, "preferred_entry" | "output_format" | "source"> = {},
+): Envelope =>
   ({
     msg: {
       name: MSG.contentToService.DoDownload,
-      data: { download_args: undefined, meta, media },
+      data: { tab_id: meta.tab_id, media_hash: media.hash, ...choices },
     },
     channel: Channel.FromContentToService,
   }) as unknown as Envelope;

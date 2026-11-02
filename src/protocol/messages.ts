@@ -18,7 +18,6 @@ import type {
   DownloadPlan,
   DownloadProgress,
   MediaItem,
-  TabMeta,
   TransferOutcome,
 } from "../core/types.js";
 import { Channel, type ChannelValue } from "./channels.js";
@@ -68,11 +67,60 @@ export function makeEnvelope<Name extends string, Data>(
 // Payloads: content/UI -> service (channel 1, E16/Â§3.1)
 // ---------------------------------------------------------------------------
 
-/** `do_download` (panel/media item/context-menu click). Serde-encoded at the wire level. */
+/** Which rendition stream the panel selected for a media row. */
+export type DownloadSource = "fmt" | "hls" | "dash";
+
+/**
+ * `do_download` (panel Download button / media item row).
+ *
+ * The UI addresses the media by tab + hash; the service resolves the full item from its own
+ * registry, so URL/Header objects never round-trip through the message bus. The optional fields
+ * are the per-row choices the panel offers and the service applies to the plan.
+ */
 export interface DoDownloadPayload {
-  download_args: DownloadPlan;
-  meta: TabMeta;
-  media: MediaItem;
+  tab_id: number;
+  media_hash: string;
+  /** Playlist entry index chosen in the quality select (0 when the row had no real choice). */
+  preferred_entry?: number;
+  /** Container the user picked in the format select; omitted for the rendition's native one. */
+  output_format?: string;
+  /** Stream the user picked when the row offers both a direct and a segmented source. */
+  source?: DownloadSource;
+}
+
+const DOWNLOAD_SOURCE_VALUES: readonly string[] = ["fmt", "hls", "dash"];
+
+/**
+ * Validate the wire shape of a `do_download` payload.
+ *
+ * Message bodies cross the boundary as `unknown`, so the catalogue type alone cannot protect the
+ * service's switch at runtime. Invalid optional fields are dropped, invalid required fields make
+ * the whole payload unusable — a partially understood command must not start a download.
+ */
+export function parseDoDownloadPayload(value: unknown): DoDownloadPayload | undefined {
+  if (value === null || typeof value !== "object") return undefined;
+  const payload = value as Record<string, unknown>;
+  const tabId = payload.tab_id;
+  const mediaHash = payload.media_hash;
+  if (typeof tabId !== "number" || !Number.isInteger(tabId) || tabId <= 0) return undefined;
+  if (typeof mediaHash !== "string" || mediaHash.length === 0 || mediaHash.length > 512) return undefined;
+  const preferredEntry = payload.preferred_entry;
+  const outputFormat = payload.output_format;
+  const source = payload.source;
+  return {
+    tab_id: tabId,
+    media_hash: mediaHash,
+    ...(typeof preferredEntry === "number" &&
+    Number.isInteger(preferredEntry) &&
+    preferredEntry >= 0 &&
+    preferredEntry <= 100
+      ? { preferred_entry: preferredEntry }
+      : {}),
+    ...(typeof outputFormat === "string" && outputFormat.length <= 16 ? { output_format: outputFormat } : {}),
+    ...(typeof source === "string" && DOWNLOAD_SOURCE_VALUES.includes(source)
+      ? { source: source as DownloadSource }
+      : {}),
+  };
 }
 
 export interface AbortDownloadPayload {
@@ -442,10 +490,10 @@ export function isWorkerBus(envelope: MessageEnvelope, direction: "toWorker" | "
   return envelope.channel === expected;
 }
 
-/** Convenience builders for the common hops (typed names, but `data` stays unknown-checked). */
+/** Convenience builders for the common hops (typed names and catalogue payloads). */
 export function makeContentToServiceEnvelope(
   name: ContentToServiceName,
-  data: unknown,
+  data: ContentToServicePayload | null,
 ): MessageEnvelope<ContentToServiceName> {
   return makeEnvelope(name, data, Channel.FromContentToService);
 }

@@ -228,6 +228,44 @@ describe("content-script adapter (ISOLATED world)", () => {
     expect(sent).toHaveLength(1);
     dispose();
   });
+
+  it("bounds the page-supplied envelope title and referer like the per-hint fields", () => {
+    const sent: Envelope[] = [];
+    const runtime = {
+      sendMessage: async (message: Envelope) => {
+        sent.push(message);
+      },
+      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+    };
+    const channel = createFakeChannel();
+    const dispose = installContentBridge(runtime, "https://page.test/watch", channel.port);
+    channel.emit({
+      channel: Channel.FromUntrustedInjectedToTrusted,
+      msg: {
+        name: "on_media_hints",
+        data: {
+          hints: [{ url: "https://cdn.test/one.mp4", source: "video" }],
+          title: "T".repeat(5000),
+          referer: "R".repeat(50_000),
+        },
+      },
+    });
+    channel.emit({
+      channel: Channel.FromUntrustedInjectedToTrusted,
+      msg: {
+        name: "on_media_hints",
+        data: { hints: [{ url: "https://cdn.test/two.mp4", source: "video" }], referer: "S".repeat(8000) },
+      },
+    });
+    expect(sent).toHaveLength(2);
+    const oversized = decode((sent[0]?.msg.data as { media: unknown }).media) as MediaItem;
+    expect(oversized.title).toBe("T".repeat(300));
+    // An over-long page referer is dropped, not forwarded; the page URL remains the fallback.
+    expect(oversized.sent_headers.get("referer")).toBe("https://page.test/watch");
+    const accepted = decode((sent[1]?.msg.data as { media: unknown }).media) as MediaItem;
+    expect(accepted.sent_headers.get("referer")).toBe("S".repeat(8000));
+    dispose();
+  });
 });
 
 describe("panel snapshot (UI contract)", () => {

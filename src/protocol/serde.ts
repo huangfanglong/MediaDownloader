@@ -54,7 +54,10 @@ export interface DecodeLimits {
   maxDepth?: number;
   /** Maximum number of visited values (default 200 000). */
   maxNodes?: number;
-  /** Maximum length of a single string payload (default 4 MiB). */
+  /**
+   * Maximum length of any string the decoder materializes (default 4 MiB): primitive values,
+   * URLs, regular-expression sources and flags, header names and values, and object keys.
+   */
   maxStringLength?: number;
   /** Maximum length of an array/map/set (default 200 000). */
   maxCollectionLength?: number;
@@ -124,6 +127,17 @@ export function decode(value: unknown, limits: DecodeLimits = {}): unknown {
   const seen = new WeakSet<object>();
   let nodes = 0;
 
+  /**
+   * Strings that are rebuilt into runtime values (a URL, a compiled RegExp, a Headers entry, an
+   * object key) bypass the `primitive` case below, so the limit is enforced here for every one
+   * of them. Type checks come along for free: a non-string must never be coerced silently.
+   */
+  const wireString = (value: unknown, field: string): string => {
+    if (typeof value !== "string") throw new Error(`serde decode: ${field} must be a string`);
+    if (value.length > maxStringLength) throw new Error("serde decode: string payload exceeds limit");
+    return value;
+  };
+
   const walk = (input: unknown, depth: number): unknown => {
     if (depth > maxDepth) throw new Error("serde decode: maximum depth exceeded");
     if (nodes++ > maxNodes) throw new Error("serde decode: maximum node count exceeded");
@@ -135,9 +149,7 @@ export function decode(value: unknown, limits: DecodeLimits = {}): unknown {
     switch (tagged.__serde_tag) {
       case "primitive": {
         const primitive = tagged.__serde_val;
-        if (typeof primitive === "string" && primitive.length > maxStringLength) {
-          throw new Error("serde decode: string payload exceeds limit");
-        }
+        if (typeof primitive === "string") wireString(primitive, "primitive value");
         return primitive;
       }
       case "array": {
@@ -146,11 +158,15 @@ export function decode(value: unknown, limits: DecodeLimits = {}): unknown {
         return entries.map((entry) => walk(entry, depth + 1));
       }
       case "url":
-        return new URL(tagged.__serde_val as string);
+        return new URL(wireString(tagged.__serde_val, "url"));
       case "headers": {
-        const pairs = tagged.__serde_val as Array<[string, string]>;
+        const pairs = tagged.__serde_val;
         if (!Array.isArray(pairs) || pairs.length > maxHeaders) throw new Error("serde decode: headers too large");
-        return new Headers(pairs);
+        const entries: Array<[string, string]> = pairs.map((pair: unknown) => {
+          if (!Array.isArray(pair) || pair.length !== 2) throw new Error("serde decode: malformed header entry");
+          return [wireString(pair[0], "header name"), wireString(pair[1], "header value")];
+        });
+        return new Headers(entries);
       }
       case "set": {
         const entries = tagged.__serde_val as EncodedValue[];
@@ -165,8 +181,9 @@ export function decode(value: unknown, limits: DecodeLimits = {}): unknown {
         );
       }
       case "regex": {
-        const [source, flags] = tagged.__serde_val as [string, string];
-        return new RegExp(source, flags);
+        const pattern = tagged.__serde_val;
+        if (!Array.isArray(pattern) || pattern.length !== 2) throw new Error("serde decode: malformed regex payload");
+        return new RegExp(wireString(pattern[0], "regex source"), wireString(pattern[1], "regex flags"));
       }
       case "some":
         return some(walk(tagged.__serde_val, depth + 1));
@@ -178,8 +195,13 @@ export function decode(value: unknown, limits: DecodeLimits = {}): unknown {
         return err(walk(tagged.__serde_val, depth + 1));
       case "object": {
         // Null prototype: hostile keys can never reach a prototype chain.
+        const record = tagged.__serde_val;
+        if (record === null || typeof record !== "object" || Array.isArray(record)) {
+          throw new Error("serde decode: object payload must be an object");
+        }
         const out = Object.create(null) as Record<string, unknown>;
-        for (const [key, entry] of Object.entries(tagged.__serde_val as Record<string, EncodedValue>)) {
+        for (const [key, entry] of Object.entries(record as Record<string, EncodedValue>)) {
+          wireString(key, "object key");
           if (UNSAFE_KEYS.has(key)) throw new Error(`serde decode: unsafe key "${key}" rejected`);
           Object.defineProperty(out, key, {
             value: walk(entry, depth + 1),

@@ -10,8 +10,18 @@
  * the browser closes the dropdown under the cursor.
  */
 import { Channel } from "../../protocol/channels.js";
-import { MSG } from "../../protocol/messages.js";
-import { REBUILD_MESSAGES } from "../../protocol/rebuild-messages.js";
+import {
+  MSG,
+  makeContentToServiceEnvelope,
+  type ContentToServiceName,
+  type DoDownloadPayload,
+  type MessageEnvelope,
+} from "../../protocol/messages.js";
+import {
+  REBUILD_MESSAGES,
+  makeRequestSessionEnvelope,
+  type RebuildEnvelope,
+} from "../../protocol/rebuild-messages.js";
 import { decode } from "../../protocol/serde.js";
 import { statusPresentation } from "../panel-status.js";
 import { BoundedCache } from "../bounded-cache.js";
@@ -65,8 +75,14 @@ const SELECTIONS = new Map<string, { quality: string; format: string; source: st
 let lastRowSignature: string | undefined;
 let pendingSnapshot: PanelSnapshot | undefined;
 
-function send(name: string, data: unknown): void {
-  void runtime?.sendMessage({ msg: { name, data }, channel: Channel.FromContentToService }).catch(() => undefined);
+/**
+ * Every outbound message goes through a catalogue builder, so a mistyped name or a payload that
+ * drifted from the protocol types fails the typecheck instead of silently reaching the service.
+ */
+type OutboundEnvelope = MessageEnvelope<ContentToServiceName> | RebuildEnvelope;
+
+function sendToService(envelope: OutboundEnvelope): void {
+  void runtime?.sendMessage(envelope).catch(() => undefined);
 }
 
 function formatDuration(duration: string | number | undefined): string | undefined {
@@ -437,9 +453,15 @@ function renderRows(snapshot: PanelSnapshot): void {
     button.textContent = button.disabled ? "Unavailable" : "Download";
     button.title = row.download_disabled_reason ?? "";
     button.addEventListener("click", () => {
+      const tabId = snapshot.tab_id;
+      // A row only exists while a tab is active; the guard keeps a stale render from sending an
+      // unaddressable command.
+      if (tabId === undefined) return;
       button.disabled = true;
-      send(MSG.contentToService.DoDownload, {
-        tab_id: snapshot.tab_id,
+      const sourceSelect = titleLine.querySelector<HTMLSelectElement>("select.media-source-select");
+      const selectedSource = sourceSelect?.value;
+      const payload: DoDownloadPayload = {
+        tab_id: tabId,
         media_hash: row.hash,
         // A one-option quality select is informational; omit it so the saved/default rendition
         // settings still apply. A real choice (2+ options) overrides them.
@@ -447,11 +469,11 @@ function renderRows(snapshot: PanelSnapshot): void {
           ? { preferred_entry: Number(qualitySelect.value) }
           : {}),
         ...(formatSelect !== undefined && formatSelect.value !== "" ? { output_format: formatSelect.value } : {}),
-        ...(() => {
-          const select = titleLine.querySelector("select.media-source-select") as HTMLSelectElement | null;
-          return select !== null ? { source: select.value } : {};
-        })(),
-      });
+        ...(selectedSource === "fmt" || selectedSource === "hls" || selectedSource === "dash"
+          ? { source: selectedSource }
+          : {}),
+      };
+      sendToService(makeContentToServiceEnvelope(MSG.contentToService.DoDownload, payload));
     });
 
     item.append(details, button);
@@ -629,7 +651,9 @@ cancelButton?.addEventListener("click", () => {
   if (!lastSnapshot) return;
   // Cancel all active downloads
   for (const download of lastSnapshot.downloading) {
-    send(MSG.contentToService.AbortDownload, { download_id: download.download_id });
+    sendToService(
+      makeContentToServiceEnvelope(MSG.contentToService.AbortDownload, { download_id: download.download_id }),
+    );
   }
   // Immediately hide the button to prevent double-clicks
   if (cancelButton) cancelButton.hidden = true;
@@ -643,7 +667,7 @@ runtime?.onMessage.addListener((message: unknown) => {
   render(snapshot);
 });
 
-send(REBUILD_MESSAGES.RequestSession, null);
+sendToService(makeRequestSessionEnvelope());
 
 // The worker pushes snapshots on changes; this poll covers messages lost while it was asleep.
-setInterval(() => send(REBUILD_MESSAGES.RequestSession, null), 2000);
+setInterval(() => sendToService(makeRequestSessionEnvelope()), 2000);

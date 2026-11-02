@@ -495,12 +495,19 @@ export function installContentBridge(
     const allHints = sanitizeHints(data.hints);
     const focusedHints = allHints.filter((hint) => hint.focused === true);
     const hintsToMap = data.focus_active === true && focusedHints.length > 0 ? focusedHints : allHints;
+    // The page also controls the envelope-level title/referer fallbacks. Bound them like the
+    // per-hint fields: everything arriving on the page bridge is untrusted input.
+    const pageTitle = typeof data.title === "string" && data.title.length > 0 ? data.title.slice(0, 300) : undefined;
+    const pageReferer =
+      typeof data.referer === "string" && data.referer.length > 0 && data.referer.length <= 8192
+        ? data.referer
+        : undefined;
     for (const hint of hintsToMap) {
       const item = itemFromHint(
         {
           ...hint,
-          ...(hint.referer === undefined && data.referer !== undefined ? { referer: data.referer } : {}),
-          ...(hint.title === undefined && data.title !== undefined ? { title: data.title } : {}),
+          ...(hint.referer === undefined && pageReferer !== undefined ? { referer: pageReferer } : {}),
+          ...(hint.title === undefined && pageTitle !== undefined ? { title: pageTitle } : {}),
         },
         pageUrl,
       );

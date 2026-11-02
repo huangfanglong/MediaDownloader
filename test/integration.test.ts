@@ -68,7 +68,7 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
     const meta = harness.service.getSession().discovered.get(7)?.meta;
     expect(meta?.title).toBe("Test Page");
 
-    // Download: panel sends do_download with media+meta; the service builds the plan.
+    // Download: the panel addresses the discovered item by tab + hash; the service builds the plan.
     await harness.gateway.deliverToService(doDownloadEnvelope(item as MediaItem, meta as TabMeta));
 
     // Save request mirrors the original: subdir+basename+extension, uniquify, blob URL.
@@ -136,8 +136,8 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
       },
       "https://site.test/watch",
     );
-    const envelope = doDownloadEnvelope(direct as MediaItem, meta);
-    (envelope.msg.data as { source?: string }).source = "hls";
+    const envelope = doDownloadEnvelope(direct as MediaItem, meta, { source: "hls" });
+    harness.service.getEngine().insertExternal(direct as MediaItem, 7);
     await harness.gateway.deliverToService(envelope);
     expect(harness.gateway.downloadRequestsLog).toHaveLength(1);
     expect(harness.gateway.downloadRequestsLog[0]?.filename).toBe("Test Page.mp4");
@@ -355,6 +355,8 @@ describe("end-to-end: sniff â†’ playlist â†’ plan â†’ transfer â
         force_doc_title: false,
       },
     };
+    service.getEngine().insertExternal(media, 7);
+    service.getSession().discovered.set(7, { media: new Map([[media.hash, media]]), meta });
     await gateway.deliverToService(doDownloadEnvelope(media, meta));
     expect(gateway.downloadRequestsLog).toHaveLength(0);
     const notifications = [...service.getSession().notifications.values()];

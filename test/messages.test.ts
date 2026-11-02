@@ -15,6 +15,7 @@ import {
   makeEnvelope,
   makeServiceToContentEnvelope,
   makeWorkerEnvelope,
+  parseDoDownloadPayload,
   type DownloadProgressPayload,
   type DoDownloadPayload,
   type MessageEnvelope,
@@ -28,62 +29,61 @@ import { structured } from "../src/protocol/serde.js";
  * captured during discovery and recorded in analysis/evidence/), not invented.
  */
 
-const doDownloadFixture = (): DoDownloadPayload => {
-  const media: MediaItem = {
-    type: "m3u8_playlist",
-    hash: "media_hash_1234567890123456",
-    is_youtube: false,
-    sent_headers: new Headers({ referer: "https://example.com/watch" }),
-    initiator: new URL("https://example.com/watch"),
-    master_url: new URL("https://cdn.example.com/master.m3u8"),
-    playlist: [
-      {
-        demuxer: "mp4",
-        quality: { size: { height: 1080, width: 1920 }, bitrate: 4_000_000 },
-        av: { video: new URL("https://cdn.example.com/1080.m3u8"), audio: false },
-        audio_language: "en",
-      },
-    ],
-    duration: 93.5,
-    has_drm: false,
-    discovery_timestamp_ms: 1_700_000_000_000,
-    cache: "default",
-  };
-  const meta: TabMeta = {
-    incognito: false,
-    tab_id: 7,
-    title: "Example movie",
-    thumbnail_url: new URL("https://example.com/thumb.jpg"),
-    favicon_url: new URL("https://example.com/favicon.ico"),
-    url: new URL("https://example.com/watch"),
-    default_action: "download",
-    smartnaming_rule: {
-      template: "%title",
-      selector: null,
-      max_length: 64,
-      replace: [{ from: /\bfoo\b/gi, to: "bar" }],
-      subdir: "",
-      force_doc_title: false,
+const mediaFixture = (): MediaItem => ({
+  type: "m3u8_playlist",
+  hash: "media_hash_1234567890123456",
+  is_youtube: false,
+  sent_headers: new Headers({ referer: "https://example.com/watch" }),
+  initiator: new URL("https://example.com/watch"),
+  master_url: new URL("https://cdn.example.com/master.m3u8"),
+  playlist: [
+    {
+      demuxer: "mp4",
+      quality: { size: { height: 1080, width: 1920 }, bitrate: 4_000_000 },
+      av: { video: new URL("https://cdn.example.com/1080.m3u8"), audio: false },
+      audio_language: "en",
     },
-  };
-  const download_args: DownloadPlan = {
-    download_id: "download_1f2e3d4c",
-    headers: new Headers({ referer: "https://example.com/watch" }),
-    good_basename: "Example movie",
+  ],
+  duration: 93.5,
+  has_drm: false,
+  discovery_timestamp_ms: 1_700_000_000_000,
+  cache: "default",
+});
+
+const tabMetaFixture = (): TabMeta => ({
+  incognito: false,
+  tab_id: 7,
+  title: "Example movie",
+  thumbnail_url: new URL("https://example.com/thumb.jpg"),
+  favicon_url: new URL("https://example.com/favicon.ico"),
+  url: new URL("https://example.com/watch"),
+  default_action: "download",
+  smartnaming_rule: {
+    template: "%title",
+    selector: null,
+    max_length: 64,
+    replace: [{ from: /\bfoo\b/gi, to: "bar" }],
     subdir: "",
-    save_as: false,
-    will_use_jsfetch: false,
-    strategy: TransferStrategy.HlsAudioVideoOneSource,
-    url: new URL("https://cdn.example.com/master.m3u8"),
-    carry_get_params: true,
-    extension: "mp4",
-    muxer: "mp4",
-    is_youtube: false,
-    throttle: false,
-    cache: "default",
-  };
-  return { download_args, meta, media };
-};
+    force_doc_title: false,
+  },
+});
+
+const downloadPlanFixture = (): DownloadPlan => ({
+  download_id: "download_1f2e3d4c",
+  headers: new Headers({ referer: "https://example.com/watch" }),
+  good_basename: "Example movie",
+  subdir: "",
+  save_as: false,
+  will_use_jsfetch: false,
+  strategy: TransferStrategy.HlsAudioVideoOneSource,
+  url: new URL("https://cdn.example.com/master.m3u8"),
+  carry_get_params: true,
+  extension: "mp4",
+  muxer: "mp4",
+  is_youtube: false,
+  throttle: false,
+  cache: "default",
+});
 
 describe("channel contract (E8: the nine-value enum)", () => {
   it("keeps the shipped channel-1 command names (22 proven), exact spelling", () => {
@@ -267,30 +267,46 @@ describe("direction guards (E9-E12/E16/E17)", () => {
 });
 
 describe("serde round-trip of data-bearing payloads (E13/E17/E34)", () => {
-  it("round-trips a do_download payload (URLs, Headers, RegExp in smart-naming rule)", () => {
-    const payload = doDownloadFixture();
-    const roundTripped = structured(payload);
+  it("round-trips a do_download payload (the panel addresses media by tab and hash)", () => {
+    const payload: DoDownloadPayload = {
+      tab_id: 7,
+      media_hash: "media_hash_1234567890123456",
+      preferred_entry: 2,
+      output_format: "mkv",
+      source: "hls",
+    };
+    expect(structured(payload)).toEqual(payload);
+  });
 
-    expect(roundTripped).toEqual(payload);
-    expect(roundTripped.download_args.url).toBeInstanceOf(URL);
-    expect(roundTripped.download_args.url.href).toBe("https://cdn.example.com/master.m3u8");
-    expect(roundTripped.download_args.headers).toBeInstanceOf(Headers);
-    expect(roundTripped.download_args.headers.get("referer")).toBe("https://example.com/watch");
-    expect(roundTripped.meta.smartnaming_rule.replace[0]?.from).toBeInstanceOf(RegExp);
-    expect(roundTripped.media.master_url).toBeInstanceOf(URL);
-    expect(roundTripped.media.sent_headers).toBeInstanceOf(Headers);
+  it("round-trips download plans and tab metadata (URLs, Headers, RegExp in smart-naming rule)", () => {
+    const plan = structured(downloadPlanFixture());
+    expect(plan.url).toBeInstanceOf(URL);
+    expect(plan.url.href).toBe("https://cdn.example.com/master.m3u8");
+    expect(plan.headers).toBeInstanceOf(Headers);
+    expect(plan.headers.get("referer")).toBe("https://example.com/watch");
+
+    const meta = structured(tabMetaFixture());
+    expect(meta.url).toBeInstanceOf(URL);
+    expect(meta.smartnaming_rule?.replace[0]?.from).toBeInstanceOf(RegExp);
+
+    const media = structured(mediaFixture());
+    expect(media.master_url).toBeInstanceOf(URL);
+    expect(media.sent_headers).toBeInstanceOf(Headers);
   });
 
   it("round-trips a do_download envelope and keeps the channel number", () => {
-    const envelope = makeContentToServiceEnvelope(MSG.contentToService.DoDownload, doDownloadFixture());
+    const envelope = makeContentToServiceEnvelope(MSG.contentToService.DoDownload, {
+      tab_id: 7,
+      media_hash: "media_hash_1234567890123456",
+    });
     const roundTripped = structured(envelope);
     expect(roundTripped.channel).toBe(Channel.FromContentToService);
     expect(roundTripped.msg.name).toBe("do_download");
-    expect((roundTripped.msg.data as DoDownloadPayload).meta.tab_id).toBe(7);
+    expect((roundTripped.msg.data as DoDownloadPayload).tab_id).toBe(7);
   });
 
   it("serialises worker payloads through the same tagged wire format", () => {
-    const plan: WorkerDownloadPayload = { download_args: doDownloadFixture().download_args };
+    const plan: WorkerDownloadPayload = { download_args: downloadPlanFixture() };
     const roundTrippedPlan = structured(plan);
     expect(roundTrippedPlan.download_args.strategy).toBe("m3u8_audio_video_one_source");
     expect(roundTrippedPlan.download_args.url).toBeInstanceOf(URL);
@@ -319,5 +335,56 @@ describe("serde round-trip of data-bearing payloads (E13/E17/E34)", () => {
       aborted_no_partial: false,
     };
     expect(structured(result)).toEqual(result);
+  });
+});
+
+describe("do_download wire shape (the service parses what the panel actually sends)", () => {
+  it("accepts the panel payload and keeps its optional choices", () => {
+    expect(
+      parseDoDownloadPayload({
+        tab_id: 7,
+        media_hash: "media_hash_1",
+        preferred_entry: 3,
+        output_format: "webm",
+        source: "hls",
+      }),
+    ).toEqual({
+      tab_id: 7,
+      media_hash: "media_hash_1",
+      preferred_entry: 3,
+      output_format: "webm",
+      source: "hls",
+    });
+  });
+
+  it("drops optional choices it cannot use instead of failing the whole command", () => {
+    const base = { tab_id: 7, media_hash: "media_hash_1" };
+    expect(
+      parseDoDownloadPayload({
+        ...base,
+        preferred_entry: 101,
+        output_format: "x".repeat(40),
+        source: "bogus",
+      }),
+    ).toEqual(base);
+    expect(parseDoDownloadPayload({ ...base, preferred_entry: -1 })).toEqual(base);
+    expect(parseDoDownloadPayload({ ...base, preferred_entry: 1.5 })).toEqual(base);
+  });
+
+  it("rejects payloads without a usable address", () => {
+    for (const value of [
+      null,
+      undefined,
+      "do_download",
+      {},
+      { tab_id: 0, media_hash: "hash" },
+      { tab_id: -3, media_hash: "hash" },
+      { tab_id: 7 },
+      { tab_id: 7, media_hash: "" },
+      { tab_id: 7, media_hash: 42 },
+      { tab_id: 7, media_hash: "h".repeat(600) },
+    ]) {
+      expect(parseDoDownloadPayload(value)).toBeUndefined();
+    }
   });
 });

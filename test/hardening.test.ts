@@ -215,6 +215,36 @@ describe("extra decoder limits (review round 2)", () => {
     expect(() => decode(payload, { maxStringLength: 16 })).toThrow(/string payload/);
   });
 
+  it("applies the string limit to every rebuilt value, not only primitive tags", () => {
+    const long = "x".repeat(64);
+    const limits = { maxStringLength: 16 };
+    // URL/RegExp/Headers payloads carry their strings outside the `primitive` tag.
+    expect(() => decode({ __serde_tag: "url", __serde_val: `https://a.test/${long}` }, limits)).toThrow(
+      /string payload/,
+    );
+    expect(() => decode({ __serde_tag: "regex", __serde_val: [long, "g"] }, limits)).toThrow(/string payload/);
+    expect(() => decode({ __serde_tag: "regex", __serde_val: ["a", long] }, limits)).toThrow(/string payload/);
+    expect(() => decode({ __serde_tag: "headers", __serde_val: [["referer", long]] }, limits)).toThrow(
+      /string payload/,
+    );
+    expect(() => decode({ __serde_tag: "headers", __serde_val: [[long, "v"]] }, limits)).toThrow(/string payload/);
+    // Object keys are strings too.
+    expect(() =>
+      decode(
+        { __serde_tag: "object", __serde_val: { [long]: { __serde_tag: "primitive", __serde_val: 1 } } },
+        limits,
+      ),
+    ).toThrow(/string payload/);
+  });
+
+  it("rejects non-string url, regex and header payloads instead of coercing them", () => {
+    expect(() => decode({ __serde_tag: "url", __serde_val: 42 })).toThrow(/must be a string/);
+    expect(() => decode({ __serde_tag: "regex", __serde_val: [42, "g"] })).toThrow(/must be a string/);
+    expect(() => decode({ __serde_tag: "headers", __serde_val: [["referer", 42]] })).toThrow(/must be a string/);
+    expect(() => decode({ __serde_tag: "headers", __serde_val: [["only-a-name"]] })).toThrow(/malformed header/);
+    expect(() => decode({ __serde_tag: "object", __serde_val: null })).toThrow(/must be an object/);
+  });
+
   it("rejects oversized collections", () => {
     const payload = { __serde_tag: "array", __serde_val: Array.from({ length: 20 }, () => ({ __serde_tag: "primitive", __serde_val: 1 })) };
     expect(() => decode(payload, { maxCollectionLength: 5 })).toThrow(/collection too large/);
