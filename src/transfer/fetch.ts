@@ -260,12 +260,16 @@ export interface FetchResponseLike {
   ok: boolean;
   headers?: { get(name: string): string | null };
   body: { getReader(): ByteStreamReader } | null;
+  /** Final URL after redirects, when the fetch surface reports it (browser `Response.url`). */
+  url?: string;
 }
 
 export interface FetchInitLike {
   headers?: Headers;
   signal?: AbortSignal;
   cache?: RequestCache;
+  /** Redirect handling; automatic callers pass `"error"` so a request cannot leave the gated URL. */
+  redirect?: RequestRedirect;
   /** Value for the `Range` request header, e.g. `bytes=0-1023` (E16, `Ft`). */
   range?: string;
 }
@@ -280,6 +284,8 @@ export interface FetchBytesResult {
   status: number;
   /** Response headers when the fetch surface exposes them (range integrity checks read these). */
   headers?: { get(name: string): string | null };
+  /** Final URL after redirects when the fetch surface reports it. */
+  finalUrl?: string;
 }
 
 function responseTotalBytes(response: FetchResponseLike): number | undefined {
@@ -299,6 +305,8 @@ export interface FetchBytesOptions {
   maxBytes?: number;
   /** Cancels the fetch and the body read. Combined with `init.signal` when both are present. */
   signal?: AbortSignal;
+  /** Redirect handling; automatic callers pass `"error"` so a request cannot leave the gated URL. */
+  redirect?: RequestRedirect;
   /** Write chunks to a consumer instead of retaining and concatenating the complete body. */
   onChunk?: (chunk: Uint8Array) => void | Promise<void>;
   /** Full response size from Content-Range or Content-Length, before body streaming begins. */
@@ -397,6 +405,8 @@ async function fetchBytesAttempt(
   if (headers !== undefined) requestInit.headers = headers;
   if (signal !== undefined) requestInit.signal = signal;
   if (init.cache !== undefined) requestInit.cache = init.cache;
+  const redirect = init.redirect ?? options.redirect;
+  if (redirect !== undefined) requestInit.redirect = redirect;
 
   let response: FetchResponseLike;
   try {
@@ -453,6 +463,7 @@ async function fetchBytesAttempt(
     bytes: options.onChunk === undefined ? concatenateBytes(chunks, total) : new Uint8Array(),
     status: response.status,
     ...(response.headers === undefined ? {} : { headers: response.headers }),
+    ...(typeof response.url === "string" && response.url !== "" ? { finalUrl: response.url } : {}),
   });
 }
 

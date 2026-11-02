@@ -3,13 +3,34 @@ import type { DiscoveryEngine } from "../discovery/engine.js";
 import { parsePlaylist } from "../manifests/hls.js";
 import { parseMpd } from "../manifests/dash.js";
 import { probeMpegTsVideoSize } from "../manifests/ts-probe.js";
-import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
+import { fetchBytes, headersForPlan, scopedHeadersFor, type FetchBytesResult, type FetchLike } from "../transfer/fetch.js";
 import { isSafeManifestUrl } from "../transfer/url-safety.js";
 import { BoundedCache } from "./bounded-cache.js";
 import { debugInfo } from "./log.js";
 
 const MAX_MANIFEST_BYTES = 8 * 1024 * 1024;
 const MAX_PROBE_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Automatic enrichment must not follow redirects: the request must not silently leave the URL the
+ * top-level gate approved, so every fetch below passes `redirect: "error"`. Fetch surfaces that
+ * still report the final URL are revalidated as well: it must be a safe public URL, and for the
+ * manifest itself the redirect may not leave the approved host (an http→https upgrade still does).
+ */
+function endedAtApprovedUrl(
+  fetched: Pick<FetchBytesResult, "finalUrl">,
+  requested: URL,
+  mustStayOnHost: boolean,
+): boolean {
+  if (fetched.finalUrl === undefined) return true;
+  try {
+    const finalUrl = new URL(fetched.finalUrl);
+    if (!isSafeManifestUrl(finalUrl)) return false;
+    return !mustStayOnHost || finalUrl.host === requested.host;
+  } catch {
+    return false;
+  }
+}
 
 interface VariantProbe {
   duration?: MediaItem["duration"];
@@ -54,9 +75,10 @@ export class ManifestEnrichment {
       this.fetchImpl,
       manifestUrl.href,
       { headers: headersForPlan(item.sent_headers) },
-      { maxBytes: MAX_MANIFEST_BYTES },
+      { maxBytes: MAX_MANIFEST_BYTES, redirect: "error" },
     );
     if (fetched.tag === "Err") return;
+    if (!endedAtApprovedUrl(fetched.value, manifestUrl, true)) return;
     const text = new TextDecoder().decode(fetched.value.bytes);
     const parsed = parsePlaylist(text, manifestUrl);
     if (parsed.kind === "invalid" || parsed.kind === "subtitle") return;
@@ -83,7 +105,7 @@ export class ManifestEnrichment {
     const probeController = new AbortController();
     const probe = firstVariant
       ? await withTimeout(
-          this.fetchVariantProbe(firstVariant.uri, item.sent_headers, probeController.signal),
+          this.fetchVariantProbe(firstVariant.uri, manifestUrl, item.sent_headers, probeController.signal),
           5000,
           { hasDrm: false } as VariantProbe,
           () => probeController.abort(),
@@ -128,9 +150,10 @@ export class ManifestEnrichment {
       this.fetchImpl,
       manifestUrl.href,
       { headers: headersForPlan(item.sent_headers) },
-      { maxBytes: MAX_MANIFEST_BYTES },
+      { maxBytes: MAX_MANIFEST_BYTES, redirect: "error" },
     );
     if (fetched.tag === "Err") return;
+    if (!endedAtApprovedUrl(fetched.value, manifestUrl, true)) return;
     const text = new TextDecoder().decode(fetched.value.bytes);
     const parsed = parseMpd(text, manifestUrl);
     if (parsed.tag === "Err") return;
@@ -177,6 +200,7 @@ export class ManifestEnrichment {
     if (segment === undefined) return {};
     if (segment.uri.protocol !== "https:" && segment.uri.protocol !== "http:") return {};
     if (!isSafeManifestUrl(segment.uri)) return {};
+    const captureOrigin = (item.master_url ?? item.url)?.origin ?? segment.uri.origin;
     const cacheKey = item.master_url?.href ?? item.url?.href;
     const cached = cacheKey !== undefined ? this.hlsQualityCache.get(cacheKey) : undefined;
     if (cached !== undefined) return cached;
@@ -184,10 +208,11 @@ export class ManifestEnrichment {
       const fetched = await fetchBytes(
         this.fetchImpl,
         segment.uri.href,
-        { headers: headersForPlan(item.sent_headers) },
-        { maxBytes: 8 * 1024 * 1024 },
+        { headers: scopedHeadersFor(segment.uri.href, captureOrigin, headersForPlan(item.sent_headers)) },
+        { maxBytes: 8 * 1024 * 1024, redirect: "error" },
       );
       if (fetched.tag === "Err") return {};
+      if (!endedAtApprovedUrl(fetched.value, segment.uri, false)) return {};
       const dimensions = probeMpegTsVideoSize(fetched.value.bytes);
       if (dimensions === undefined) {
         if (cacheKey !== undefined) this.hlsQualityCache.set(cacheKey, {});
@@ -210,14 +235,22 @@ export class ManifestEnrichment {
     }
   }
 
-  private async fetchVariantProbe(url: URL, sentHeaders: Headers, signal: AbortSignal): Promise<VariantProbe> {
+  private async fetchVariantProbe(
+    url: URL,
+    manifestUrl: URL,
+    sentHeaders: Headers,
+    signal: AbortSignal,
+  ): Promise<VariantProbe> {
+    // A nested manifest obeys the same URL policy as the top-level gate: public http(s) only.
+    if (!isSafeManifestUrl(url)) return { hasDrm: false };
     const fetched = await fetchBytes(
       this.fetchImpl,
       url.href,
-      { headers: headersForPlan(sentHeaders) },
-      { maxBytes: MAX_PROBE_BYTES, signal },
+      { headers: scopedHeadersFor(url.href, manifestUrl.origin, headersForPlan(sentHeaders)) },
+      { maxBytes: MAX_PROBE_BYTES, signal, redirect: "error" },
     );
     if (fetched.tag === "Err") return { hasDrm: false };
+    if (!endedAtApprovedUrl(fetched.value, url, false)) return { hasDrm: false };
     const parsed = parsePlaylist(new TextDecoder().decode(fetched.value.bytes), url);
     if (parsed.kind !== "media") return { hasDrm: false };
     return {
