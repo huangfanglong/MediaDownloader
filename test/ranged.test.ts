@@ -11,6 +11,21 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/** One-chunk response body for fake range servers. */
+function singleValueBody(value: Uint8Array) {
+  let sent = false;
+  return {
+    getReader: () => ({
+      read: async () => {
+        if (sent) return { done: true };
+        sent = true;
+        return { done: false, value };
+      },
+      cancel: async () => undefined,
+    }),
+  };
+}
+
 describe("bounded-range download helper (googlevideo evidence)", () => {
   it("recognises range-bound CDN URLs", () => {
     expect(isRangeBoundCdn(new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=18&clen=5"))).toBe(true);
@@ -140,6 +155,73 @@ describe("bounded-range download helper (googlevideo evidence)", () => {
     expect(result.tag).toBe("Err");
     if (result.tag === "Err") expect(result.error.status).toBe(404);
     expect(attempts.get(failingRange)).toBe(1);
+  });
+
+  it("rejects a server that ignores Range and repeats a short 200 body", async () => {
+    // A proxy that ignores the range header answers every request with the same 1000-byte 200
+    // body; trusting it concatenates that body until the advertised size and saves a corrupt file.
+    const advertised = 10_000;
+    const repeated = new Uint8Array(1_000).fill(3);
+    const fetchImpl: FetchLike = async () => ({
+      status: 200,
+      ok: true,
+      body: singleValueBody(repeated),
+    });
+    const result = await fetchRanged(
+      fetchImpl,
+      new URL(`https://cdn.test/videoplayback?id=1&clen=${advertised}`),
+      new Headers(),
+      { chunkSize: 1_024 },
+    );
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error.message).toMatch(/range|advertis/i);
+  });
+
+  it("rejects a 206 whose Content-Range starts at the wrong offset", async () => {
+    // The first range is genuine; every later response repeats it, so concatenation duplicates
+    // the first kilobyte of the file until the advertised size is reached.
+    const body = new Uint8Array(1_024).fill(1);
+    const fetchImpl: FetchLike = async () => ({
+      status: 206,
+      ok: true,
+      headers: {
+        get: (name: string) => (name.toLowerCase() === "content-range" ? "bytes 0-1023/2048" : null),
+      },
+      body: singleValueBody(body),
+    });
+    const result = await fetchRanged(
+      fetchImpl,
+      new URL("https://cdn.test/videoplayback?id=1&clen=2048"),
+      new Headers(),
+      { chunkSize: 1_024 },
+    );
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error.message).toMatch(/range/i);
+  });
+
+  it("rejects a 200 response once the requested range is no longer at the start", async () => {
+    const body = new Uint8Array(1_024).fill(2);
+    let calls = 0;
+    const fetchImpl: FetchLike = async () => {
+      calls += 1;
+      return {
+        status: calls === 1 ? 206 : 200,
+        ok: true,
+        headers: {
+          get: (name: string) =>
+            calls === 1 && name.toLowerCase() === "content-range" ? "bytes 0-1023/2048" : null,
+        },
+        body: singleValueBody(body),
+      };
+    };
+    const result = await fetchRanged(
+      fetchImpl,
+      new URL("https://cdn.test/videoplayback?id=1&clen=2048"),
+      new Headers(),
+      { chunkSize: 1_024 },
+    );
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error.message).toMatch(/200|range/i);
   });
 });
 

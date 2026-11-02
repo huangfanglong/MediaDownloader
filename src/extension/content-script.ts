@@ -18,6 +18,7 @@ import { REBUILD_MESSAGES, RELAY_MESSAGES, type MediaStreamAck } from "../protoc
 import { encode } from "../protocol/serde.js";
 import type { MediaItem, PlaylistEntry } from "../core/types.js";
 import { declaredSize } from "../transfer/declared-size.js";
+import { checkRangeResponse, parseContentRange } from "../transfer/range-integrity.js";
 import { MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import {
   PAGE_ON_MEDIA_HINTS,
@@ -307,6 +308,8 @@ export async function handleMediaStreamRequest(
     } catch {
       declared = undefined;
     }
+    /** Complete size declared by `Content-Range`, used when the URL itself carries no `clen`. */
+    let rangeTotal: number | undefined;
     for (let attempt = 0; attempt < 20000; attempt += 1) {
       const end = offset + RANGE_BYTES - 1;
       const response = await fetch(data.url, {
@@ -317,8 +320,54 @@ export async function handleMediaStreamRequest(
       // 416 means the previous chunk ended at the object size.
       if (response.status === 416 && offset > 0) break;
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const contentRange = response.headers?.get?.("content-range") ?? null;
+      const parsedRange = contentRange === null || contentRange.trim() === ""
+        ? undefined
+        : parseContentRange(contentRange);
+      // Refuse a body that cannot belong at this offset before allocating it: an ignored range
+      // (HTTP 200 after the first chunk) or an oversized range would otherwise be read whole
+      // into this tab's memory.
+      if (contentRange !== null && parsedRange === undefined) {
+        throw new Error(`invalid Content-Range "${contentRange}"`);
+      }
+      if (parsedRange !== undefined && parsedRange.start !== offset) {
+        throw new Error(`range response starts at ${parsedRange.start}, expected ${offset}`);
+      }
+      if (parsedRange !== undefined && parsedRange.end - parsedRange.start + 1 > RANGE_BYTES) {
+        throw new Error(`range response is larger than the requested ${RANGE_BYTES} bytes`);
+      }
+      if (offset > 0 && response.status === 200) {
+        throw new Error(`range request at offset ${offset} was answered with HTTP 200 (byte range ignored)`);
+      }
+      // Reject an oversized body before allocating it when Content-Length is visible: a compliant
+      // bounded-range response can never be larger than the requested range.
+      const rawContentLength = response.headers?.get?.("content-length");
+      const contentLength = rawContentLength === null || rawContentLength === undefined
+        ? undefined
+        : Number(rawContentLength);
+      if (contentLength !== undefined && Number.isFinite(contentLength) && contentLength >= 0) {
+        if (offset > 0 && contentLength > RANGE_BYTES) {
+          throw new Error(`range response is ${contentLength} bytes for a ${RANGE_BYTES}-byte request`);
+        }
+        if (parsedRange !== undefined && contentLength !== parsedRange.end - parsedRange.start + 1) {
+          throw new Error(`range body is ${contentLength} bytes, Content-Range declares ${parsedRange.end - parsedRange.start + 1}`);
+        }
+        if (offset === 0 && declared !== undefined && contentLength !== declared) {
+          throw new Error(`whole-object response is ${contentLength} bytes, the URL advertises ${declared}`);
+        }
+      }
       const value = new Uint8Array(await response.arrayBuffer());
       if (value.length === 0) break;
+      const verdict = checkRangeResponse({
+        requestedOffset: offset,
+        requestedLength: RANGE_BYTES,
+        status: response.status,
+        bodyLength: value.length,
+        contentRange,
+        ...(declared === undefined ? {} : { declaredTotal: declared }),
+      });
+      if (verdict.tag === "Err") throw new Error(`range response rejected: ${verdict.reason}`);
+      if (verdict.kind === "range" && verdict.total !== undefined) rangeTotal = verdict.total;
       for (let inner = 0; inner < value.length; inner += MESSAGE_CHUNK_BYTES) {
         const slice = value.subarray(inner, Math.min(inner + MESSAGE_CHUNK_BYTES, value.length));
         const sent = await sendRelay({
@@ -332,11 +381,14 @@ export async function handleMediaStreamRequest(
       }
       offset += value.length;
       total += value.length;
+      // A whole-object response (the server ignored Range) is the complete file.
+      if (verdict.kind === "whole-object") break;
       // A short chunk means we reached the end of the object.
       if (value.length < RANGE_BYTES) break;
     }
-    if (declared !== undefined && total < declared) {
-      throw new Error(`relay ended early: ${total} of ${declared} bytes`);
+    const expectedTotal = declared ?? rangeTotal;
+    if (expectedTotal !== undefined && total < expectedTotal) {
+      throw new Error(`relay ended early: ${total} of ${expectedTotal} bytes`);
     }
     await sendRelay({
       msg: { name: RELAY_MESSAGES.MediaStreamEnd, data: { request_id: data.request_id, total } },

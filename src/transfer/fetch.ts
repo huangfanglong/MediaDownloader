@@ -278,6 +278,8 @@ export type FetchLike = (
 export interface FetchBytesResult {
   bytes: Uint8Array;
   status: number;
+  /** Response headers when the fetch surface exposes them (range integrity checks read these). */
+  headers?: { get(name: string): string | null };
 }
 
 function responseTotalBytes(response: FetchResponseLike): number | undefined {
@@ -450,6 +452,7 @@ async function fetchBytesAttempt(
   return ok({
     bytes: options.onChunk === undefined ? concatenateBytes(chunks, total) : new Uint8Array(),
     status: response.status,
+    ...(response.headers === undefined ? {} : { headers: response.headers }),
   });
 }
 

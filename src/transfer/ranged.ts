@@ -13,6 +13,7 @@
 import { err, ok, type Result } from "../core/option.js";
 import { declaredSize } from "./declared-size.js";
 import { fetchBytes, type FetchLike } from "./fetch.js";
+import { checkRangeResponse } from "./range-integrity.js";
 import { abortedError, otherError, tooLargeError, withRetry, type RetryError } from "./retry.js";
 
 /** Largest accepted range from the live probe; 2 MiB worked, 4 MiB was rejected. */
@@ -126,18 +127,28 @@ export async function fetchRanged(
       fetchedTotal = offset;
       break;
     }
-    // Defensive: if the server ignored the range and returned the whole object, keep it once.
-    if (bytes.byteLength > chunkSize && offset === 0) {
-      if (options.onChunk !== undefined) await options.onChunk(bytes);
-      else parts.push(bytes);
-      offset = bytes.byteLength;
-      if (pastCeiling()) return err(tooLargeError(`Range download exceeds ${options.maxBytes} bytes`));
-      break;
-    }
+    // Never append bytes that cannot be placed at the requested offset: an ignored or mismatched
+    // range would otherwise concatenate the same body repeatedly and report a corrupt file as done.
+    const verdict = checkRangeResponse({
+      requestedOffset: offset,
+      requestedLength: chunkSize,
+      status: result.value.status,
+      bodyLength: bytes.byteLength,
+      contentRange: result.value.headers?.get("content-range") ?? null,
+      ...(total === undefined ? {} : { declaredTotal: total }),
+    });
+    if (verdict.tag === "Err") return err(otherError(`range response rejected: ${verdict.reason}`));
     if (options.onChunk !== undefined) await options.onChunk(bytes);
     else parts.push(bytes);
     offset += bytes.byteLength;
     if (pastCeiling()) return err(tooLargeError(`Range download exceeds ${options.maxBytes} bytes`));
+    // A 200 at offset 0 means the server ignored Range and sent the whole object: that is the file.
+    if (verdict.kind === "whole-object") {
+      fetchedTotal = offset;
+      options.onBytes?.(offset, offset);
+      break;
+    }
+    if (fetchedTotal === undefined && verdict.total !== undefined) fetchedTotal = verdict.total;
     options.onBytes?.(offset, fetchedTotal);
     if (fetchedTotal === undefined && bytes.byteLength < chunkSize) {
       fetchedTotal = offset;
@@ -146,9 +157,10 @@ export async function fetchRanged(
   }
 
   // The loop can also end at the chunk cap or after a whole-object response: never report success
-  // for fewer bytes than the URL advertised.
-  if (total !== undefined && offset < total) {
-    return err(truncatedError(offset, total));
+  // for fewer bytes than the URL advertised (or the responses declared through Content-Range).
+  const expected = total ?? fetchedTotal;
+  if (expected !== undefined && offset < expected) {
+    return err(truncatedError(offset, expected));
   }
   if (offset === 0) {
     return err(otherError("range download returned no data"));

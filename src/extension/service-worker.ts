@@ -46,6 +46,7 @@ import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js
 import { MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import { isMediaOutputExtension } from "../transfer/media-extensions.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
+import { checkRangeResponse } from "../transfer/range-integrity.js";
 import {
   isSafeManifestUrl,
   manifestEnrichmentAllowed,
@@ -1510,7 +1511,9 @@ export class MediaDownloaderService {
           this.fetchImpl,
           plan.url.href,
           { headers: headersForPlan(plan.headers), range: `bytes=${offset}-${end}` },
-          { signal },
+          // A later chunk can never legitimately exceed the requested range, so cap what is read
+          // into memory before the integrity check can reject it.
+          { signal, ...(offset > 0 ? { maxBytes: chunkSize } : {}) },
         );
         if (fetched.tag === "Err") {
           // An abort is the user cancelling, not a CDN failure; report it structurally so the
@@ -1528,6 +1531,19 @@ export class MediaDownloaderService {
         if (bytes.byteLength === 0) break;
         // Do not hand the worker another chunk once the cancel landed mid-fetch.
         if (signal.aborted) return { tag: "Err", error: "user_abort" };
+        // A repeated or misaddressed body would be staged into a corrupt file and reported as a
+        // finished download, so reject it before it reaches the relay.
+        const verdict = checkRangeResponse({
+          requestedOffset: offset,
+          requestedLength: chunkSize,
+          status: fetched.value.status,
+          bodyLength: bytes.byteLength,
+          contentRange: fetched.value.headers?.get("content-range") ?? null,
+          ...(total === undefined ? {} : { declaredTotal: total }),
+        });
+        if (verdict.tag === "Err") {
+          return { tag: "Err", error: `range response rejected: ${verdict.reason}` };
+        }
         this.worker.sendRelayChunk(plan.download_id, bytes);
         offset += bytes.byteLength;
         if (total !== undefined) {
@@ -1540,6 +1556,7 @@ export class MediaDownloaderService {
             ...(percent !== undefined ? { percent: { is_known: true, value: percent } } : {}),
           });
         }
+        if (verdict.kind === "whole-object") break;
         if (bytes.byteLength < chunkSize) break;
       }
       if (signal.aborted) return { tag: "Err", error: "user_abort" };
