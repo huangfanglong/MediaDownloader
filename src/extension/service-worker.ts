@@ -239,6 +239,11 @@ export class MediaDownloaderService {
   private readonly relayRequests = new Map<string, { downloadId: string }>();
   /** Downloads the user cancelled; their relay teardown is not a transfer failure. */
   private readonly userCancelled = new Set<string>();
+  /**
+   * Cancels work the service itself drives for a download (the bounded-range path fetches and
+   * stages here rather than in the download worker, which has its own abort message).
+   */
+  private readonly transferAborts = new Map<string, AbortController>();
   /** Keeps the MV3 worker alive while transfers run (review 4.2). */
   private keepAliveTimer?: ReturnType<typeof setInterval>;
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
@@ -1228,13 +1233,19 @@ export class MediaDownloaderService {
       plan.strategy === "http_audio_video_one_source_jsfetch"
         ? focusKey(plan.url.href)
         : undefined;
-    const outcome = await this.queue.queueTask(
-      () => this.executeDownload(plan, downloadMedia, meta),
-      plan.download_id,
-      plan.is_youtube,
-      connectionKey,
-    );
-    await this.finishDownload(plan, downloadMedia, meta, outcome);
+    const abort = new AbortController();
+    this.transferAborts.set(plan.download_id, abort);
+    try {
+      const outcome = await this.queue.queueTask(
+        () => this.executeDownload(plan, downloadMedia, meta, abort.signal),
+        plan.download_id,
+        plan.is_youtube,
+        connectionKey,
+      );
+      await this.finishDownload(plan, downloadMedia, meta, outcome);
+    } finally {
+      this.transferAborts.delete(plan.download_id);
+    }
   }
 
   private abortDownload(downloadId: string): void {
@@ -1245,6 +1256,8 @@ export class MediaDownloaderService {
       // The page may currently be feeding the relay; close it so its next chunk is rejected.
       this.stopRelay(downloadId);
     }
+    // A transfer the service drives itself (bounded ranges) has no worker entry to abort.
+    this.transferAborts.get(downloadId)?.abort();
     if (!this.queue.cancelPendingTask(downloadId)) this.worker.abort(downloadId);
     void this.publish();
   }
@@ -1295,16 +1308,17 @@ export class MediaDownloaderService {
     plan: DownloadPlan,
     media: MediaItem,
     meta: TabMeta,
+    signal: AbortSignal,
   ): Promise<Result<TransferOutcome, string>> {
-    const first = await this.executeDownloadAttempt(plan, media, meta);
-    if (first.tag === "Ok" || !/\bhttp 429\b/u.test(first.error)) return first;
+    const first = await this.executeDownloadAttempt(plan, media, meta, signal);
+    if (signal.aborted || first.tag === "Ok" || !/\bhttp 429\b/u.test(first.error)) return first;
 
     // A direct 429 can mean that page playback already holds the server's sole connection.
     // Retry once only after an actual matching element has been unloaded; never add blind retries.
     const released = await this.coordinateDirectPlayback(plan, "release");
     if (released === 0) return first;
     try {
-      return await this.executeDownloadAttempt(plan, media, meta);
+      return await this.executeDownloadAttempt(plan, media, meta, signal);
     } finally {
       await this.coordinateDirectPlayback(plan, "restore");
     }
@@ -1314,7 +1328,19 @@ export class MediaDownloaderService {
     plan: DownloadPlan,
     media: MediaItem,
     meta: TabMeta,
+    signal: AbortSignal,
   ): Promise<Result<TransferOutcome, string>> {
+    // The cancel may have landed while the queue or the 429 retry window was still waiting.
+    if (signal.aborted) {
+      return {
+        tag: "Ok",
+        value: {
+          download_id: plan.download_id,
+          ending_reason: userAbortReason(),
+          aborted_no_partial: true,
+        } as TransferOutcome,
+      };
+    }
     const entry = this.session.downloading.get(plan.download_id);
     if (entry) entry.status = "downloading";
     await this.publish();
@@ -1332,7 +1358,7 @@ export class MediaDownloaderService {
         !/^(m3u8|mpd)_/u.test(plan.strategy) &&
         isRangeBoundCdn(plan.url)
       ) {
-        const ranged = await this.rangedDownloadThroughWorker(plan);
+        const ranged = await this.rangedDownloadThroughWorker(plan, signal);
         if (isErr(ranged)) {
           failure = ranged.error;
         } else {
@@ -1460,9 +1486,14 @@ export class MediaDownloaderService {
    * but 403 when fetched by the offscreen worker for the real plan. The CDN accepts the
    * service-worker request, and the worker is only needed for OPFS staging, so fetch here and
    * reuse the existing relay protocol.
+   *
+   * The loop honours the download's abort signal: a cancel stops before the next request, the
+   * in-flight one is aborted through `fetchBytes`, and the worker relay is aborted so its staging
+   * file is removed immediately instead of after the whole object has been fetched.
    */
   private async rangedDownloadThroughWorker(
     plan: DownloadPlan,
+    signal: AbortSignal,
   ): Promise<Result<TransferOutcome, string>> {
     const completion = this.worker.streamDownload(plan);
     completion.catch(() => undefined);
@@ -1472,15 +1503,21 @@ export class MediaDownloaderService {
     let finished = false;
     try {
       for (let attempt = 0; attempt < 20000; attempt += 1) {
+        if (signal.aborted) return { tag: "Err", error: "user_abort" };
         if (total !== undefined && offset >= total) break;
         const end = offset + chunkSize - 1;
         const fetched = await fetchBytes(
           this.fetchImpl,
           plan.url.href,
           { headers: headersForPlan(plan.headers), range: `bytes=${offset}-${end}` },
-          {},
+          { signal },
         );
         if (fetched.tag === "Err") {
+          // An abort is the user cancelling, not a CDN failure; report it structurally so the
+          // caller does not retry it through the page relay.
+          if (fetched.error.kind === "aborted" || signal.aborted) {
+            return { tag: "Err", error: "user_abort" };
+          }
           const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
           return {
             tag: "Err",
@@ -1489,6 +1526,8 @@ export class MediaDownloaderService {
         }
         const bytes = fetched.value.bytes;
         if (bytes.byteLength === 0) break;
+        // Do not hand the worker another chunk once the cancel landed mid-fetch.
+        if (signal.aborted) return { tag: "Err", error: "user_abort" };
         this.worker.sendRelayChunk(plan.download_id, bytes);
         offset += bytes.byteLength;
         if (total !== undefined) {
@@ -1503,6 +1542,7 @@ export class MediaDownloaderService {
         }
         if (bytes.byteLength < chunkSize) break;
       }
+      if (signal.aborted) return { tag: "Err", error: "user_abort" };
       // Never report success for fewer bytes than the URL advertised: a lying/shrunken object
       // would otherwise be saved as a silently truncated file.
       if (total !== undefined && offset < total) {

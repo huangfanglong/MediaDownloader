@@ -163,9 +163,12 @@ async function runRanged(chunks: number, declaredChunks = chunks, extraBytes = 0
   (service as unknown as { session: SessionState }).session = session;
   const outcome = (await (
     service as unknown as {
-      rangedDownloadThroughWorker(plan: DownloadPlan): Promise<{ tag: string; error?: string }>;
+      rangedDownloadThroughWorker(
+        plan: DownloadPlan,
+        signal: AbortSignal,
+      ): Promise<{ tag: string; error?: string }>;
     }
-  ).rangedDownloadThroughWorker(plan)) as { tag: string; error?: string };
+  ).rangedDownloadThroughWorker(plan, new AbortController().signal)) as { tag: string; error?: string };
   for (let index = 0; index < 5; index += 1) await flush();
   service.stop();
   return {

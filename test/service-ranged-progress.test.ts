@@ -131,8 +131,10 @@ async function runRanged(chunks: number): Promise<RangedProgressResult> {
   };
 
   await (
-    service as unknown as { rangedDownloadThroughWorker(plan: DownloadPlan): Promise<unknown> }
-  ).rangedDownloadThroughWorker(plan);
+    service as unknown as {
+      rangedDownloadThroughWorker(plan: DownloadPlan, signal: AbortSignal): Promise<unknown>;
+    }
+  ).rangedDownloadThroughWorker(plan, new AbortController().signal);
   for (let index = 0; index < 5; index += 1) await flush();
   service.stop();
 
