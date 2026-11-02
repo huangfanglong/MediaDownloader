@@ -45,12 +45,6 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; img-src 'self' https: http:; media-src 'self' https: http: blob:"
   },
-  "web_accessible_resources": [
-    {
-      "resources": ["page-hook.js"],
-      "matches": ["<all_urls>"]
-    }
-  ],
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

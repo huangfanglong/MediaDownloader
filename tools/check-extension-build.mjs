@@ -38,9 +38,8 @@ for (const [size, file] of Object.entries(manifest.action?.default_icon ?? {})) 
 }
 const pageScripts = [manifest.action?.default_popup, manifest.side_panel?.default_path].filter(Boolean);
 for (const page of pageScripts) await checkFile(page, "page");
-for (const group of manifest.content_scripts ?? []) {
-  for (const script of group.js ?? []) await checkFile(script, "content_script");
-}
+const contentScripts = (manifest.content_scripts ?? []).flatMap((group) => group.js ?? []);
+for (const script of contentScripts) await checkFile(script, "content_script");
 
 // Every JS file in the package must be self-contained or import only within the package root.
 const walk = async (dir) => {
@@ -80,9 +79,13 @@ for (const page of [manifest.action?.default_popup, manifest.side_panel?.default
   }
 }
 
-// The page-hook fallback injection requires the resource to be web-accessible.
+// Content scripts and files handed to chrome.scripting are read from the package by the browser;
+// pages never request them by URL. Declaring one web-accessible would let any page that knows the
+// extension id fetch our code and fingerprint the install, which the page hook does not need.
 const war = (manifest.web_accessible_resources ?? []).flatMap((entry) => entry.resources ?? []);
-if (!war.includes("page-hook.js")) problems.push("manifest: page-hook.js is not web-accessible");
+for (const script of contentScripts) {
+  if (war.includes(script)) problems.push(`manifest: content script ${script} must not be web-accessible`);
+}
 
 // Entry points must invoke their bootstrap (a bundle that only exports an install function is
 // a silent no-op in the browser — this exact bug shipped once).
@@ -99,7 +102,7 @@ for (const check of bootstrapChecks) {
 }
 
 // Classic scripts must not be modules.
-const classic = (manifest.content_scripts ?? []).flatMap((group) => group.js ?? []);
+const classic = contentScripts;
 for (const file of classic) {
   const code = await readFile(path.join(EXT, file), "utf8");
   if (/^\s*(import|export)\s/mu.test(code)) problems.push(`${file}: classic script contains module syntax`);
