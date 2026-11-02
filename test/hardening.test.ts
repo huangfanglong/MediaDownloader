@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decode } from "../src/protocol/serde.js";
-import { fetchBytes, sanitizeReplayHeaders } from "../src/transfer/fetch.js";
+import { fetchBytes, isCredentialHeader, sanitizeReplayHeaders } from "../src/transfer/fetch.js";
 import { MAX_HLS_LINES, MAX_HLS_SEGMENTS, parsePlaylist } from "../src/manifests/hls.js";
 import {
   normalizeHeaderReplayUrl,
@@ -206,6 +206,102 @@ describe("session persistence redaction (review round 2, privacy)", () => {
     expect(redacted.discovered.get(1)?.media.get("h")?.sent_headers.get("cookie")).toBeNull();
     expect(redacted.discovered.get(1)?.media.get("h")?.sent_headers.get("referer")).toContain("youtube");
     expect(redacted.downloading.get("d")?.download_args.headers.get("cookie")).toBeNull();
+  });
+
+  it("strips common credential headers beyond cookie and authorization", () => {
+    const credentials = [
+      "x-api-key",
+      "api-key",
+      "x-access-token",
+      "x-auth-token",
+      "proxy-authorization",
+      "x-client-secret",
+      "x-amz-security-token",
+      "x-csrf-token",
+      "x-session-id",
+      "x-hub-signature-256",
+    ];
+    const benign = [
+      "accept",
+      "accept-language",
+      "content-type",
+      "x-requested-with",
+      "x-youtube-client-name",
+      "x-client-data",
+    ];
+    const headers = new Headers();
+    for (const name of credentials) headers.set(name, "secret-value");
+    for (const name of benign) headers.set(name, "public-value");
+    const session = {
+      current_win_tab: {},
+      discovered: new Map([
+        [1, { media: new Map([["h", { type: "http_playlist", hash: "h", sent_headers: headers, discovery_timestamp_ms: 1, cache: "default" }]]) }],
+      ]),
+      downloading: new Map([
+        [
+          "d",
+          {
+            bitrate: 0,
+            status: "queued",
+            download_args: { download_id: "d", headers },
+            media: { type: "http_playlist", hash: "h", sent_headers: headers, discovery_timestamp_ms: 1, cache: "default" },
+            meta: {},
+          },
+        ],
+      ]),
+      notifications: new Map(),
+      transient_history: [],
+    };
+    const redacted = redactSessionForStorage(session as never);
+    const storedMedia = redacted.discovered.get(1)?.media.get("h")?.sent_headers as Headers;
+    const storedPlan = redacted.downloading.get("d")?.download_args.headers as Headers;
+    for (const name of credentials) {
+      expect(storedMedia.has(name)).toBe(false);
+      expect(storedPlan.has(name)).toBe(false);
+    }
+    for (const name of benign) {
+      expect(storedMedia.get(name)).toBe("public-value");
+      expect(storedPlan.get(name)).toBe("public-value");
+    }
+  });
+
+  it("classifies common credential headers and leaves ordinary request headers alone", () => {
+    const credentials = [
+      "cookie",
+      "set-cookie",
+      "authorization",
+      "proxy-authorization",
+      "x-api-key",
+      "api-key",
+      "x-goog-api-key",
+      "x-access-token",
+      "x-auth-token",
+      "x-auth",
+      "x-client-secret",
+      "x-amz-security-token",
+      "x-amz-credential",
+      "x-csrf-token",
+      "x-xsrf-token",
+      "x-session-id",
+      "x-hub-signature-256",
+      "x-password",
+    ];
+    const ordinary = [
+      "accept",
+      "accept-language",
+      "content-type",
+      "referer",
+      "origin",
+      "range",
+      "x-requested-with",
+      "x-youtube-client-name",
+      "x-client-data",
+      "x-goog-authuser",
+      "sec-ch-ua",
+      "sec-fetch-site",
+    ];
+    for (const name of credentials) expect(isCredentialHeader(name)).toBe(true);
+    for (const name of ordinary) expect(isCredentialHeader(name)).toBe(false);
   });
 });
 

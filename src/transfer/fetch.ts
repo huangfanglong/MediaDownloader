@@ -75,6 +75,22 @@ export function isForbiddenHeader(name: string): boolean {
   return matchesAny(name, FORBIDDEN_HEADERS);
 }
 
+/**
+ * Request headers that carry credentials or signed material.
+ *
+ * Used wherever header values outlive a live transfer (for example when a session snapshot is
+ * persisted): those values are never copied to storage. Deliberately broader than the standard
+ * `Cookie`/`Authorization` pair, because sites commonly authenticate with custom headers such as
+ * `X-Api-Key`, `X-Access-Token`, `X-Csrf-Token` or signed `X-Amz-*` values.
+ */
+const CREDENTIAL_HEADER =
+  /^(?:cookie|set-cookie|authorization|proxy-authorization)$|(?:^|[-_])(?:auth|authentication|credential|password|passwd|secret|signature|session|csrf|xsrf|token|api[-_]?key)(?:$|[-_])/iu;
+
+/** True when a header value is a credential and must not be persisted. */
+export function isCredentialHeader(name: string): boolean {
+  return CREDENTIAL_HEADER.test(name);
+}
+
 /** RFC 7230 token characters only; anything else is not a header name. */
 const HEADER_NAME_PATTERN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 const HEADER_VALUE_FORBIDDEN = /[\r\n\0]/;

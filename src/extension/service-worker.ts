@@ -42,7 +42,7 @@ import { DiscoveryEngine, SNIFF_RESOURCE_TYPES, type BehaviourGate } from "../di
 import { buildPlan } from "../plan/build.js";
 import { applyOutputFormat, normalizeOutputFormat, type OutputFormat } from "../plan/output-format.js";
 import { buildPreviewPlan } from "../plan/strategies.js";
-import { fetchBytes, headersForPlan, type FetchLike } from "../transfer/fetch.js";
+import { fetchBytes, headersForPlan, isCredentialHeader, type FetchLike } from "../transfer/fetch.js";
 import { MAX_CAPTURED_URL_LENGTH } from "../transfer/capture-limits.js";
 import { isMediaOutputExtension } from "../transfer/media-extensions.js";
 import { declaredSize, isRangeBoundCdn } from "../transfer/ranged.js";
@@ -1873,19 +1873,17 @@ const isRelayStreamMessage = (name: string | undefined): boolean =>
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
 
-/** Credential-bearing request headers must never be written to storage (review round 2). */
-const SENSITIVE_HEADER = /^(cookie|set-cookie|authorization|x-auth)/iu;
-
 /** Compare badge colours by value: notification red arrives as a fresh array every publish. */
 function badgeBackgroundKey(color: BadgeBackgroundColor | undefined): string | undefined {
   if (color === undefined) return undefined;
   return Array.isArray(color) ? color.join(",") : color;
 }
 
+/** Drop every credential-bearing header before a session copy is written to storage. */
 function redactHeaders(headers: Headers): Headers {
   const redacted = new Headers();
   for (const [name, value] of headers) {
-    if (!SENSITIVE_HEADER.test(name)) redacted.set(name, value);
+    if (!isCredentialHeader(name)) redacted.set(name, value);
   }
   return redacted;
 }
@@ -1919,7 +1917,7 @@ function interruptedDownloadName(entry: DownloadingEntry): string {
   }
 }
 
-/** Session copy safe to persist (no cookies/authorization in plans or media items). */
+/** Session copy safe to persist (credential-bearing headers stripped from plans and media items). */
 export function redactSessionForStorage(session: SessionState): SessionState {
   const downloading = new Map<string, DownloadingEntry>();
   for (const [id, entry] of session.downloading) {

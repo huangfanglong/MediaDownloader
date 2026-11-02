@@ -185,6 +185,36 @@ describe("MV3 lifecycle hardening", () => {
     expect(titles.some((title) => title.startsWith("Download"))).toBe(true);
     restarted.stop();
   });
+  it("never writes captured credential headers to session storage", async () => {
+    const harness = createHarness({
+      masterUrl: "https://cdn.test/key-master.m3u8",
+      mediaPlaylistUrl: "https://cdn.test/1080/index.m3u8",
+      mediaPlaylist: fmp4MediaPlaylist,
+      segmentPrefix: "https://cdn.test/1080/",
+      segments: 1,
+      initBytes: "INIT",
+    });
+    await harness.service.start();
+    const details = sniffDetails("https://cdn.test/key-master.m3u8", "application/vnd.apple.mpegurl");
+    harness.gateway.triggerSendHeaders({
+      ...details,
+      type: "xmlhttprequest",
+      requestHeaders: [
+        { name: "x-api-key", value: "sk-live-secret" },
+        { name: "authorization", value: "Bearer live-secret" },
+        { name: "accept", value: "application/vnd.apple.mpegurl" },
+      ],
+    });
+    await harness.gateway.triggerResponseStarted(details);
+    await flush();
+
+    const stored = (await harness.gateway.storage.session.get("global_session_state")) as Record<string, unknown>;
+    const serialised = JSON.stringify(stored);
+    expect(serialised).not.toContain("sk-live-secret");
+    expect(serialised).not.toContain("live-secret");
+    expect(serialised).toContain("application/vnd.apple.mpegurl");
+    harness.service.stop();
+  });
 });
 
 describe("stored-state repair on boot", () => {
