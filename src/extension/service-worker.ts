@@ -393,9 +393,22 @@ export class MediaDownloaderService {
     if (sessionStored[SESSION_KEY] !== undefined) {
       const restored = reconcileRestoredSession(decode(sessionStored[SESSION_KEY]) as SessionState);
       this.session = restored.session;
+      this.rehydrateDiscovery();
       this.reportInterruptedDownloads(restored.interrupted);
     }
     if (pruneDownloadHistory(this.settings, this.now())) await this.persistSettings();
+  }
+
+  /**
+   * The panel snapshot and the context menu read the discovery engine, while the persisted session
+   * keeps its own per-tab media maps. A restarted worker starts with an empty engine, so the
+   * restored maps must be inserted before the first publish or sniffed media vanish from both
+   * surfaces until the page reports them again.
+   */
+  private rehydrateDiscovery(): void {
+    for (const [tabId, tab] of this.session.discovered) {
+      for (const media of tab.media.values()) this.engine.insertExternal(media, tabId);
+    }
   }
 
   private async persistSettings(): Promise<void> {

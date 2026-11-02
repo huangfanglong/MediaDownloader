@@ -123,6 +123,68 @@ describe("MV3 lifecycle hardening", () => {
     expect(serialised).toContain("media_hash_");
     harness.service.stop();
   });
+  it("rehydrates restored discovery media for the panel and the context menu", async () => {
+    const entries = new Map<string, string | Uint8Array>();
+    const gateway = createFakeGateway("https://site.test/watch", entries);
+    const makeService = (): MediaDownloaderService => {
+      const hub = new FakeChannelHub();
+      return new MediaDownloaderService({
+        gateway,
+        fetchImpl: createFetch(entries),
+        opfsRoot: async () => createFakeOpfs().root,
+        now: () => 1_700_000_000_000,
+        workerClient: new WorkerClient({
+          channel: hub.endpoint("service"),
+          offscreen: gateway.offscreen,
+          offscreenUrl: "chrome-extension://fake/factory/factory.html",
+          readyTimeoutMs: 200,
+        }),
+      });
+    };
+    const adapterItem = {
+      type: "http_playlist",
+      hash: "media_hash_restored",
+      is_youtube: false,
+      sent_headers: new Headers(),
+      playlist: [
+        { demuxer: "mp4", quality: {}, av: { video: new URL("https://cdn.test/page.mp4"), audio: false } },
+      ],
+      extension: "mp4",
+      discovery_timestamp_ms: 1,
+      cache: "default",
+    } as MediaItem;
+
+    const first = makeService();
+    await first.start();
+    await gateway.deliverToService({
+      msg: { name: MSG.injectedToService.OnMedia, data: { media: encode(adapterItem) } },
+      channel: Channel.FromInjectedToService,
+    } as Envelope);
+    await flush();
+    expect(first.getEngine().mediaForTab(7).size).toBe(1);
+    expect(await gateway.storage.session.get("global_session_state")).toBeDefined();
+    first.stop();
+
+    // A fresh worker instance restores the persisted session but starts with an empty engine.
+    const restarted = makeService();
+    await restarted.start();
+    expect(restarted.getSession().discovered.get(7)?.media.size).toBe(1);
+    expect(restarted.getEngine().mediaForTab(7).size).toBe(1);
+
+    await gateway.deliverToService({
+      channel: Channel.FromContentToService,
+      msg: { name: REBUILD_MESSAGES.RequestSession, data: { instance: "restarted-panel" } },
+    } as unknown as Envelope);
+    const snapshot = decode(gateway.contentSends.at(-1)?.msg.data) as {
+      media: Array<{ hash: string }>;
+    };
+    expect(snapshot.media.map((row) => row.hash)).toEqual(["media_hash_restored"]);
+
+    // The context menu projects from the same engine, not from the persisted session map.
+    const titles = gateway.contextMenuItems().map((item) => String(item.title));
+    expect(titles.some((title) => title.startsWith("Download"))).toBe(true);
+    restarted.stop();
+  });
 });
 
 describe("stored-state repair on boot", () => {
