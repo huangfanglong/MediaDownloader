@@ -48,7 +48,7 @@ import {
   type FfmpegRunnerLike,
 } from "../transfer/ffmpeg.js";
 import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
-import { muxFragmentedMp4 } from "../transfer/mux-fmp4.js";
+import { muxFragmentedMp4ToSink } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
 import { sleepWithAbort, withSegmentRetry, withManifestRetry } from "../transfer/retry.js";
 import { isSafeSegmentUrl } from "../transfer/url-safety.js";
@@ -517,6 +517,38 @@ export class DownloadWorker {
     }
   }
 
+  /**
+   * Merge two fragmented fMP4 tracks straight into a staged file.
+   *
+   * The muxer writes init boxes, patched `moof` boxes and `mdat` payloads to the sink as it goes,
+   * so the merged file is never held in memory (nor copied fragment by fragment) — only the two
+   * inputs and the current fragment header are resident.
+   */
+  private async muxStagedTracks(
+    root: OpfsRoot,
+    plan: DownloadPlan,
+    video: Uint8Array,
+    audio: Uint8Array,
+  ): Promise<Result<StagedTransfer, string>> {
+    const staged = await createStagedFile(root, `${plan.download_id}.mp4`);
+    try {
+      const written = await muxFragmentedMp4ToSink(video, audio, { write: (chunk) => staged.append(chunk) });
+      if (written === undefined) {
+        await staged.abort();
+        return err("audio/video muxing: inputs are not fragmented MP4");
+      }
+      if (written < MIN_OUTPUT_BYTES) {
+        await staged.abort();
+        return err(`muxed output too small (${written} bytes)`);
+      }
+      const finished = await staged.finish();
+      return ok({ ...finished, extension: "mp4", totalBytes: written });
+    } catch (error) {
+      await staged.abort().catch(() => undefined);
+      return err(String(error));
+    }
+  }
+
   /** Result describing a finished staged output. */
   private stagedOutcome(plan: DownloadPlan, staged: StagedTransfer, extension: string): TransferOutcome {
     this.emitProgress(plan.download_id, { status: "finalizing", fetched_bytes_count: staged.totalBytes });
@@ -603,17 +635,21 @@ export class DownloadWorker {
         const target = plan.extension || "mp4";
         if (ffmpeg === undefined) {
           if (target === "mp3") return err("ffmpeg unavailable: audio extraction unsupported");
-          // No FFmpeg: the in-memory fMP4 muxer is the only option (fragmented MP4 inputs only).
+          // No FFmpeg: fetch both tracks and merge them into a staged file with the in-memory
+          // fMP4 muxer (fragmented MP4 inputs only); the merged file is never buffered whole.
           const videoBytes = await this.fetchSourceBytes(plan.url, headers, signal);
           if (videoBytes.tag === "Err") return videoBytes;
           const audioBytes = await this.fetchSourceBytes(plan.url_audio, headers, signal);
           if (audioBytes.tag === "Err") return audioBytes;
-          const muxed = muxFragmentedMp4(videoBytes.value, audioBytes.value);
-          if (!muxed) return err("audio/video muxing: inputs are not fragmented MP4");
-          if (muxed.byteLength < MIN_OUTPUT_BYTES) return err(`muxed output too small (${muxed.byteLength} bytes)`);
-          bytes = muxed;
-          extension = "mp4";
-          console.info("[media-downloader] muxed adaptive tracks", bytes.byteLength, "bytes");
+          const muxed = await this.muxStagedTracks(root, plan, videoBytes.value, audioBytes.value);
+          if (muxed.tag === "Err") return muxed;
+          const requested = plan.output_format;
+          if (requested !== undefined && requested !== "mp4") {
+            await this.cleanupStagedTransfer(root, muxed.value);
+            return err(`ffmpeg unavailable: cannot convert mp4 to ${requested}`);
+          }
+          console.info("[media-downloader] muxed adaptive tracks", muxed.value.totalBytes, "bytes");
+          return ok(this.stagedOutcome(plan, muxed.value, "mp4"));
         } else if (target === "mp3") {
           const audioStaged = await this.stageSourceTrack(
             root,
@@ -748,18 +784,28 @@ export class DownloadWorker {
           }
         }
       } else if (ffmpeg === undefined) {
-        // No FFmpeg: buffer both playlists and use the in-memory fMP4 muxer.
+        // No FFmpeg: assemble both playlists and merge the assembled tracks straight into a staged
+        // file, so only the two tracks are resident instead of the merged output as well.
         const videoAssembled = await this.assembleHls(plan, headers, signal);
         if (videoAssembled.tag === "Err") return videoAssembled;
         const audioPlan = { ...plan, url: plan.url_audio };
         const audioAssembled = await this.assembleHls(audioPlan, headers, signal);
         if (audioAssembled.tag === "Err") return audioAssembled;
-        const muxed = muxFragmentedMp4(videoAssembled.value.bytes, audioAssembled.value.bytes);
-        if (!muxed) return err("audio/video muxing: inputs are not fragmented MP4");
-        bytes = muxed;
-        extension = "mp4";
+        const muxed = await this.muxStagedTracks(
+          root,
+          plan,
+          videoAssembled.value.bytes,
+          audioAssembled.value.bytes,
+        );
+        if (muxed.tag === "Err") return muxed;
+        const requested = plan.output_format;
+        if (requested !== undefined && requested !== "mp4") {
+          await this.cleanupStagedTransfer(root, muxed.value);
+          return err(`ffmpeg unavailable: cannot convert mp4 to ${requested}`);
+        }
         duration = videoAssembled.value.duration ?? duration;
-        console.info("[media-downloader] muxed audio+video", bytes.byteLength, "bytes");
+        console.info("[media-downloader] muxed audio+video", muxed.value.totalBytes, "bytes");
+        return ok(this.stagedOutcome(plan, muxed.value, "mp4"));
       } else {
         // HLS with a separate audio rendition: stream both playlists into OPFS, then merge the
         // staged files instead of buffering the complete video and audio first.

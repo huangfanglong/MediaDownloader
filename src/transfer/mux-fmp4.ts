@@ -10,6 +10,10 @@
  *
  * The rebuild deliberately does not include FFmpeg, so this is the original implementation of the
  * `-c copy` mux step for fMP4 inputs (analysis/evidence/04-download-transfer.md E21/E25).
+ *
+ * The merged file is emitted through {@link muxFragmentedMp4ToSink} one box at a time, so callers
+ * can write straight into OPFS staging; the collector {@link muxFragmentedMp4} exists only for
+ * small in-memory inputs and tests.
  */
 
 export interface Box {
@@ -18,6 +22,11 @@ export interface Box {
   end: number;
   /** First payload byte (after the 8/16-byte header). */
   payloadStart: number;
+}
+
+/** Sequential destination for the merged file (OPFS staging in the download worker). */
+export interface MuxSink {
+  write(bytes: Uint8Array): Promise<void>;
 }
 
 const textDecoder = new TextDecoder();
@@ -121,23 +130,24 @@ function patchTrackId(bytes: Uint8Array, box: Box, trackId: number): Uint8Array 
   return copy;
 }
 
-interface Fragment {
-  moof: Uint8Array;
-  mdat: Uint8Array;
+/** One `moof`+`mdat` pair, described by box ranges in its source instead of copied bytes. */
+interface FragmentRef {
+  /** Fragmented track the boxes were parsed from. */
+  source: Uint8Array;
+  moof: Box;
+  mdat?: Box;
   decodeTime: number;
   trackId: number;
 }
 
-/** Extract `moof`+`mdat` pairs from a fragmented file/track. */
-function readFragments(bytes: Uint8Array, boxes: readonly Box[]): Fragment[] {
-  const fragments: Fragment[] = [];
+/** Extract `moof`+`mdat` box ranges from a fragmented file/track, without copying media. */
+function readFragmentRefs(bytes: Uint8Array, boxes: readonly Box[]): FragmentRef[] {
+  const fragments: FragmentRef[] = [];
   for (let index = 0; index < boxes.length; index += 1) {
     const box = boxes[index];
     if (box === undefined || box.type !== "moof") continue;
     const next = boxes[index + 1];
-    const mdatBox = next && next.type === "mdat" ? next : undefined;
-    const moof = copyBox(bytes, box);
-    const mdat = mdatBox ? copyBox(bytes, mdatBox) : new Uint8Array(0);
+    const mdat = next && next.type === "mdat" ? next : undefined;
     let trackId = 1;
     let decodeTime = 0;
     for (const traf of childBoxes(bytes, box)) {
@@ -155,7 +165,7 @@ function readFragments(bytes: Uint8Array, boxes: readonly Box[]): Fragment[] {
         }
       }
     }
-    fragments.push({ moof, mdat, decodeTime, trackId });
+    fragments.push({ source: bytes, moof: box, ...(mdat === undefined ? {} : { mdat }), decodeTime, trackId });
   }
   return fragments;
 }
@@ -194,19 +204,18 @@ function patchNextTrackId(mvhd: Uint8Array): void {
   if (offset + 4 <= mvhd.byteLength) writeUint32(mvhd, offset, 3);
 }
 
-/**
- * Merge a fragmented video file and a fragmented audio file into one playable fMP4.
- * Returns undefined when the inputs are not fragmented fMP4 (e.g. MPEG-TS HLS).
- */
-export function muxFragmentedMp4(video: Uint8Array, audio: Uint8Array): Uint8Array | undefined {
-  let videoBoxes: Box[];
-  let audioBoxes: Box[];
-  try {
-    videoBoxes = readBoxes(video);
-    audioBoxes = readBoxes(audio);
-  } catch {
-    return undefined;
-  }
+/** Everything needed to write the merged file; prepared before the first byte is emitted. */
+interface MuxPlan {
+  ftypBytes?: Uint8Array;
+  moovBytes: Uint8Array;
+  /** Video and audio fragments interleaved by decode time; track ids renumbered 1 and 2. */
+  fragments: FragmentRef[];
+}
+
+/** Prepare the merged box sequence, or `undefined` when the inputs are not fragmented fMP4. */
+function planMux(video: Uint8Array, audio: Uint8Array): MuxPlan | undefined {
+  const videoBoxes = readBoxes(video);
+  const audioBoxes = readBoxes(audio);
   const videoFtyp = findBox(video, videoBoxes, "ftyp");
   const videoMoov = findBox(video, videoBoxes, "moov");
   const audioMoov = findBox(audio, audioBoxes, "moov");
@@ -238,28 +247,78 @@ export function muxFragmentedMp4(video: Uint8Array, audio: Uint8Array): Uint8Arr
   const audioTrex = audioMvex ? findBox(audio, childBoxes(audio, audioMvex), "trex") : undefined;
   if (audioTrex) trexParts.push(patchTrackId(audio, audioTrex, 2));
   if (trexParts.length < 2) return undefined;
-  const mvex = makeBox("mvex", concat(trexParts));
 
-  const videoFragments = readFragments(video, videoBoxes);
-  const audioFragments = readFragments(audio, audioBoxes);
+  const videoFragments = readFragmentRefs(video, videoBoxes);
+  const audioFragments = readFragmentRefs(audio, audioBoxes);
   if (videoFragments.length === 0 || audioFragments.length === 0) return undefined;
 
-  const merged: Fragment[] = [
+  const fragments: FragmentRef[] = [
     ...videoFragments.map((fragment) => ({ ...fragment, trackId: 1 })),
     ...audioFragments.map((fragment) => ({ ...fragment, trackId: 2 })),
   ].sort((left, right) => left.decodeTime - right.decodeTime || left.trackId - right.trackId);
 
-  const output: Uint8Array[] = [];
-  if (videoFtyp) output.push(copyBox(video, videoFtyp));
-  output.push(makeBox("moov", concat([mvhdBytes, videoTrakBytes, audioTrakBytes, mvex])));
+  return {
+    ...(videoFtyp === undefined ? {} : { ftypBytes: copyBox(video, videoFtyp) }),
+    moovBytes: makeBox("moov", concat([mvhdBytes, videoTrakBytes, audioTrakBytes, makeBox("mvex", concat(trexParts))])),
+    fragments,
+  };
+}
+
+/**
+ * Merge a fragmented video file and a fragmented audio file into one playable fMP4, writing each
+ * box to the sink as it goes.
+ *
+ * The merged file is never materialised: the small init boxes are assembled in memory, each `moof`
+ * is copied only so its track id and sequence number can be patched, and every `mdat` is written
+ * straight from a view of its input. A sink that streams into OPFS staging therefore keeps peak
+ * memory near the two inputs, where building one output array used to copy every fragment and then
+ * concatenate them all a second time (roughly three times the output).
+ *
+ * Returns the number of bytes written, or `undefined` when the inputs are not fragmented fMP4 (for
+ * example MPEG-TS HLS); in that case nothing is written.
+ */
+export async function muxFragmentedMp4ToSink(
+  video: Uint8Array,
+  audio: Uint8Array,
+  sink: MuxSink,
+): Promise<number | undefined> {
+  let plan: MuxPlan | undefined;
+  try {
+    plan = planMux(video, audio);
+  } catch {
+    return undefined;
+  }
+  if (plan === undefined) return undefined;
+
+  let written = 0;
+  const write = async (bytes: Uint8Array): Promise<void> => {
+    await sink.write(bytes);
+    written += bytes.byteLength;
+  };
+  if (plan.ftypBytes !== undefined) await write(plan.ftypBytes);
+  await write(plan.moovBytes);
 
   let sequence = 1;
-  for (const fragment of merged) {
-    if (fragment.trackId === 2) setMoofTrackId(fragment.moof, 2);
-    setSequenceNumber(fragment.moof, sequence);
+  for (const fragment of plan.fragments) {
+    const moof = fragment.source.slice(fragment.moof.start, fragment.moof.end);
+    if (fragment.trackId === 2) setMoofTrackId(moof, 2);
+    setSequenceNumber(moof, sequence);
     sequence += 1;
-    output.push(fragment.moof);
-    if (fragment.mdat.byteLength > 0) output.push(fragment.mdat);
+    await write(moof);
+    if (fragment.mdat !== undefined) {
+      await write(fragment.source.subarray(fragment.mdat.start, fragment.mdat.end));
+    }
   }
-  return concat(output);
+  return written;
+}
+
+/** Collect the merged file in memory; convenient for small inputs and tests. */
+export async function muxFragmentedMp4(video: Uint8Array, audio: Uint8Array): Promise<Uint8Array | undefined> {
+  const parts: Uint8Array[] = [];
+  const written = await muxFragmentedMp4ToSink(video, audio, {
+    write: async (chunk) => {
+      parts.push(chunk);
+    },
+  });
+  return written === undefined ? undefined : concat(parts);
 }

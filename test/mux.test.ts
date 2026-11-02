@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { muxFragmentedMp4, readBoxes } from "../src/transfer/mux-fmp4.js";
+import { muxFragmentedMp4, muxFragmentedMp4ToSink, readBoxes } from "../src/transfer/mux-fmp4.js";
 import { FfmpegInputTooLargeError } from "../src/transfer/ffmpeg.js";
 import { DownloadWorker } from "../src/extension/download-worker.js";
 import type { DownloadPlan } from "../src/core/types.js";
@@ -15,6 +15,11 @@ function u32(value: number): number[] {
 
 function box(type: string, payload: number[]): number[] {
   return [...u32(payload.length + 8), ...encoder.encode(type), ...payload];
+}
+
+/** Box type of one muxer sink chunk (each chunk is exactly one box). */
+function boxTypeOf(chunk: Uint8Array): string {
+  return new TextDecoder().decode(chunk.subarray(4, 8));
 }
 
 function fullBox(type: string, version: number, flags: number): number[] {
@@ -43,11 +48,48 @@ function fragmentedTrack(trackId: number, fragmentTimes: number[]): Uint8Array {
   return new Uint8Array(parts);
 }
 
+/** Split a fragmented track into its init bytes and its `moof`+`mdat` fragments (for EXT-X-MAP). */
+function splitFragmentedTrack(track: Uint8Array): { init: Uint8Array; fragments: Uint8Array[] } {
+  const boxes = readBoxes(track);
+  const initEnd = boxes[0]?.type === "ftyp" && boxes[1]?.type === "moov" ? (boxes[1]?.end ?? 0) : 0;
+  const fragments: Uint8Array[] = [];
+  for (let index = 0; index < boxes.length; index += 1) {
+    const moof = boxes[index];
+    if (moof?.type !== "moof") continue;
+    const mdat = boxes[index + 1];
+    const end = mdat?.type === "mdat" ? mdat.end : moof.end;
+    fragments.push(track.slice(moof.start, end));
+  }
+  return { init: track.slice(0, initEnd), fragments };
+}
+
+/** `#EXT-X-MAP` fMP4 media playlist plus the URLs the case needs served. */
+function fragmentedHlsPlaylist(
+  prefix: string,
+  init: Uint8Array,
+  fragments: Uint8Array[],
+): { playlist: string; entries: Array<[string, Uint8Array]> } {
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-TARGETDURATION:2",
+    `#EXT-X-MAP:URI="${prefix}-init.mp4"`,
+  ];
+  const entries: Array<[string, Uint8Array]> = [[`${prefix}-init.mp4`, init]];
+  fragments.forEach((fragment, index) => {
+    lines.push("#EXTINF:2,");
+    lines.push(`${prefix}${index}.m4s`);
+    entries.push([`${prefix}${index}.m4s`, fragment]);
+  });
+  lines.push("#EXT-X-ENDLIST");
+  return { playlist: lines.join("\n"), entries };
+}
+
 describe("fMP4 audio+video muxer", () => {
-  it("merges two fragmented tracks into one moov with two traks and patched fragments", () => {
+  it("merges two fragmented tracks into one moov with two traks and patched fragments", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);
     const audio = fragmentedTrack(1, [0, 1024, 2048]);
-    const muxed = muxFragmentedMp4(video, audio);
+    const muxed = await muxFragmentedMp4(video, audio);
     expect(muxed).toBeDefined();
     if (!muxed) return;
     const boxes = readBoxes(muxed);
@@ -82,8 +124,60 @@ describe("fMP4 audio+video muxer", () => {
     expect(trackIds).toEqual([1, 2, 3, 4, 5, 6]);
   });
 
-  it("returns undefined for non-fragmented inputs", () => {
-    expect(muxFragmentedMp4(new Uint8Array([0, 0, 0, 8, 102, 116, 121, 112]), new Uint8Array(0))).toBeUndefined();
+  it("returns undefined for non-fragmented inputs", async () => {
+    await expect(
+      muxFragmentedMp4(new Uint8Array([0, 0, 0, 8, 102, 116, 121, 112]), new Uint8Array(0)),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("fMP4 muxer staging sink", () => {
+  it("writes one box at a time so the merged file never has to be built in memory", async () => {
+    const video = fragmentedTrack(1, [0, 1000, 2000]);
+    const audio = fragmentedTrack(1, [0, 1024, 2048]);
+    const expected = await muxFragmentedMp4(video, audio);
+    expect(expected).toBeDefined();
+    if (expected === undefined) return;
+
+    const chunks: Uint8Array[] = [];
+    const written = await muxFragmentedMp4ToSink(video, audio, {
+      write: async (chunk) => {
+        chunks.push(chunk);
+      },
+    });
+
+    expect(written).toBe(expected.byteLength);
+    const joined = new Uint8Array(written ?? 0);
+    let offset = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    expect([...joined]).toEqual([...expected]);
+    // ftyp + moov + one moof and one mdat per fragment: nothing is concatenated before writing.
+    const boxTypes = chunks.map((chunk) => boxTypeOf(chunk));
+    expect(boxTypes[0]).toBe("ftyp");
+    expect(boxTypes[1]).toBe("moov");
+    expect(boxTypes.filter((type) => type === "moof")).toHaveLength(6);
+    expect(boxTypes.filter((type) => type === "mdat")).toHaveLength(6);
+    // Media payloads are written as views of the inputs, never copied into a new array.
+    const mediaChunks = chunks.filter((chunk) => boxTypeOf(chunk) === "mdat");
+    expect(mediaChunks.every((chunk) => chunk.buffer === video.buffer || chunk.buffer === audio.buffer)).toBe(true);
+  });
+
+  it("writes nothing when the inputs are not fragmented fMP4", async () => {
+    const chunks: Uint8Array[] = [];
+    const written = await muxFragmentedMp4ToSink(
+      new Uint8Array([0, 0, 0, 8, 102, 116, 121, 112]),
+      new Uint8Array(0),
+      {
+        write: async (chunk) => {
+          chunks.push(chunk);
+        },
+      },
+    );
+    expect(written).toBeUndefined();
+    expect(chunks).toHaveLength(0);
   });
 });
 
@@ -129,11 +223,123 @@ describe("worker direct two-source muxing", () => {
     };
     const result = await worker.runPlan(plan);
     expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
-    const expected = muxFragmentedMp4(video, audio);
+    const expected = await muxFragmentedMp4(video, audio);
     expect(expected).toBeDefined();
     const staged = [...(files.get(`download_two_source.mp4`) ?? [])];
     const total = staged.reduce((sum, chunk) => sum + chunk.byteLength, 0);
     expect(total).toBe(expected?.byteLength);
+  });
+});
+
+describe("worker HLS two-source muxing without FFmpeg", () => {
+  const channel = {
+    postMessage: () => undefined,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    close: () => undefined,
+  } as unknown as BroadcastChannelLike;
+
+  const twoSourcePlan = (downloadId: string): DownloadPlan => ({
+    download_id: downloadId,
+    headers: new Headers(),
+    good_basename: "hls-two",
+    subdir: "",
+    save_as: false,
+    will_use_jsfetch: true,
+    strategy: "m3u8_audio_video_two_sources",
+    url: new URL("https://cdn.test/video.m3u8"),
+    url_audio: new URL("https://cdn.test/audio.m3u8"),
+    carry_get_params: false,
+    extension: "mp4",
+    muxer: "mp4",
+    source_demuxer: "mp4",
+    is_youtube: false,
+    throttle: false,
+    cache: "default",
+  });
+
+  /** Two fragmented HLS renditions and the bytes their playlists reference. */
+  const fmp4Payloads = (): {
+    payloads: Map<string, string | Uint8Array>;
+    videoTrack: Uint8Array;
+    audioTrack: Uint8Array;
+  } => {
+    const videoTrack = fragmentedTrack(1, [0, 1000, 2000]);
+    const audioTrack = fragmentedTrack(1, [0, 1024, 2048]);
+    const videoParts = splitFragmentedTrack(videoTrack);
+    const audioParts = splitFragmentedTrack(audioTrack);
+    const videoPlaylist = fragmentedHlsPlaylist("v", videoParts.init, videoParts.fragments);
+    const audioPlaylist = fragmentedHlsPlaylist("a", audioParts.init, audioParts.fragments);
+    const payloads = new Map<string, string | Uint8Array>([
+      ["https://cdn.test/video.m3u8", videoPlaylist.playlist],
+      ["https://cdn.test/audio.m3u8", audioPlaylist.playlist],
+    ]);
+    for (const [name, bytes] of [...videoPlaylist.entries, ...audioPlaylist.entries]) {
+      payloads.set(`https://cdn.test/${name}`, bytes);
+    }
+    return { payloads, videoTrack, audioTrack };
+  };
+
+  it("muxes two fMP4 renditions straight into a staged file", async () => {
+    const { payloads, videoTrack, audioTrack } = fmp4Payloads();
+    const { root, files } = createFakeOpfs();
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:hls-two-muxed");
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+    });
+
+    const result = await worker.runPlan(twoSourcePlan("download_hls_two_mux"));
+
+    expect(result.tag === "Ok" ? "Ok" : result.error).toBe("Ok");
+    if (result.tag === "Ok") expect(result.value.output_extension).toBe("mp4");
+    const expected = await muxFragmentedMp4(videoTrack, audioTrack);
+    expect(expected).toBeDefined();
+    const staged = [...(files.get("download_hls_two_mux.mp4") ?? [])];
+    expect(staged.reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(expected?.byteLength);
+  });
+
+  it("reports a requested conversion instead of saving the muxed MP4", async () => {
+    const { payloads } = fmp4Payloads();
+    const { root, files } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+    });
+    const plan = { ...twoSourcePlan("download_hls_two_convert"), output_format: "mkv" } as DownloadPlan;
+
+    const result = await worker.runPlan(plan);
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/cannot convert mp4 to mkv/u);
+    expect(files.has("download_hls_two_convert.mp4")).toBe(false);
+  });
+
+  it("refuses non-fragmented HLS tracks without leaving a partial file behind", async () => {
+    const media = (prefix: string): string =>
+      `#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n${prefix}0.ts\n#EXTINF:4,\n${prefix}1.ts\n#EXT-X-ENDLIST\n`;
+    const payloads = new Map<string, string | Uint8Array>([
+      ["https://cdn.test/video.m3u8", media("v")],
+      ["https://cdn.test/audio.m3u8", media("a")],
+      ["https://cdn.test/v0.ts", new Uint8Array(600).fill(1)],
+      ["https://cdn.test/v1.ts", new Uint8Array(600).fill(2)],
+      ["https://cdn.test/a0.ts", new Uint8Array(600).fill(3)],
+      ["https://cdn.test/a1.ts", new Uint8Array(600).fill(4)],
+    ]);
+    const { root, files } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel,
+      fetchImpl: createFetch(payloads),
+      openRoot: async () => root,
+    });
+
+    const result = await worker.runPlan(twoSourcePlan("download_hls_two_bad"));
+
+    expect(result.tag).toBe("Err");
+    if (result.tag === "Err") expect(result.error).toMatch(/not fragmented MP4/u);
+    expect(files.has("download_hls_two_bad.mp4")).toBe(false);
   });
 });
 
