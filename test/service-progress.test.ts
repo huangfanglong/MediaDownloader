@@ -181,7 +181,7 @@ describe("publication cost dedupe", () => {
     service.stop();
   });
 
-  it("does not rebuild and push an unchanged snapshot inside the throttle window", async () => {
+  it("does not rebuild and push an unchanged snapshot", async () => {
     const nowRef = { value: 5_000_000 };
     const { gateway, service } = createService(nowRef);
     const pushes = (): number =>
@@ -189,18 +189,20 @@ describe("publication cost dedupe", () => {
 
     await service.publish();
     expect(pushes()).toBe(1);
-    await service.publish(); // same signature, same clock → suppressed before building rows
-    expect(pushes()).toBe(1);
-
-    nowRef.value += 300; // window elapsed → repeated state may push again
+    // Identical content is not re-sent, however much time passed in between.
     await service.publish();
-    expect(pushes()).toBe(2);
+    expect(pushes()).toBe(1);
+    nowRef.value += 300;
+    await service.publish();
+    expect(pushes()).toBe(1);
 
     nowRef.value += 10;
     const session = (service as unknown as { session: SessionState }).session;
     session.notifications.set("notification_2", { type: "download_error", message: "failed" });
     await service.publish(); // structural change pushes immediately
-    expect(pushes()).toBe(3);
+    expect(pushes()).toBe(2);
+    await service.publish();
+    expect(pushes()).toBe(2);
     service.stop();
   });
 });

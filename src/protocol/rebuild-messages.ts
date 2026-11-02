@@ -22,8 +22,24 @@ export interface RebuildEnvelope {
   channel: ChannelValue;
 }
 
-export function makeRequestSessionEnvelope(): RebuildEnvelope {
-  return { msg: { name: REBUILD_MESSAGES.RequestSession, data: null }, channel: Channel.FromContentToService };
+/**
+ * A panel asks for a snapshot on load and then polls to recover pushes lost while the service
+ * worker was asleep. `instance` is a nonce that is fresh for every panel page load: it tells the
+ * service that this panel has not received its snapshot yet, so it must be answered even when the
+ * content did not change. A poll without a nonce is answered as well.
+ */
+export interface RequestSessionData {
+  instance?: string;
+}
+
+export function makeRequestSessionEnvelope(instance?: string): RebuildEnvelope {
+  return {
+    msg: {
+      name: REBUILD_MESSAGES.RequestSession,
+      data: instance === undefined ? null : { instance },
+    },
+    channel: Channel.FromContentToService,
+  };
 }
 
 /**

@@ -216,7 +216,6 @@ export class MediaDownloaderService {
   private readonly disposers: Array<() => void> = [];
   /** Resolved once `start()` has restored state; handlers registered synchronously await it. */
   private readonly ready: Promise<void>;
-  private lastSnapshotPushAt = 0;
   /** Focused media identities reported by the page (QOL: show the playing clip only). */
   private readonly focusByTab = new Map<number, MediaFocusState>();
   /** Direct video tracks seen per tab, used to give manifest rows a hover preview. */
@@ -241,7 +240,10 @@ export class MediaDownloaderService {
   private keepAliveTimer?: ReturnType<typeof setInterval>;
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
   private readonly observedRequests = new Map<number, Set<string>>();
+  /** Exact encoded payload last handed to the panel; identical content is not re-sent. */
   private lastSnapshotSignature = "";
+  /** Per-page-load panel nonce; a new panel must be answered even when nothing changed. */
+  private lastPanelInstance: string | null = null;
   /** Last applied badge values; Chrome API calls are skipped when nothing changed. */
   private lastBadgeText?: string;
   private lastBadgeBackground?: string;
@@ -458,41 +460,22 @@ export class MediaDownloaderService {
     }
   }
 
-  /** Tell open panel pages about state changes. Push immediately when the observable state
-   * changes; throttle plain progress updates to keep them cheap. */
-  private pushPanelSnapshot(): void {
-    const now = this.now();
-    const signature = this.panelSnapshotSignature();
-    if (signature === this.lastSnapshotSignature && now - this.lastSnapshotPushAt < SNAPSHOT_PUSH_INTERVAL_MS) {
-      return;
-    }
+  /**
+   * Tell open panel pages about state changes.
+   *
+   * The snapshot is only sent when its encoded content actually changed (or when a panel that has
+   * not received one asks), so a publish that changes only non-visual state, or a recovering poll
+   * from a panel that is already up to date, costs no message and no panel render.
+   */
+  private pushPanelSnapshot(force = false): void {
+    const payload = encode(this.panelSnapshot());
+    const signature = JSON.stringify(payload);
+    if (!force && signature === this.lastSnapshotSignature) return;
     this.lastSnapshotSignature = signature;
-    this.lastSnapshotPushAt = now;
     this.sendToContent({
-      msg: { name: REBUILD_MESSAGES.SessionSnapshot, data: encode(this.panelSnapshot()) },
+      msg: { name: REBUILD_MESSAGES.SessionSnapshot, data: payload },
       channel: Channel.FromServiceToContent,
     });
-  }
-
-  /**
-   * Cheap duplicate of the snapshot guard: the signature only needs the values that decide a push,
-   * so a throttled update does not build rows, variant labels and preview URLs for nothing.
-   */
-  private panelSnapshotSignature(): string {
-    const tabId = this.session.current_win_tab.tab_id;
-    const visibleMedia = filterFocusedMedia(
-      tabId === undefined ? [] : [...this.engine.mediaForTab(tabId).values()],
-      tabId === undefined ? undefined : this.focusByTab.get(tabId),
-      this.now(),
-    );
-    const firstNotification = this.session.notifications.values().next().value;
-    return [
-      String(tabId ?? -1),
-      String(visibleMedia.length),
-      String(this.session.downloading.size),
-      String(this.session.notifications.size),
-      firstNotification?.message ?? firstNotification?.details ?? "",
-    ].join(":");
   }
 
   // -------------------------------------------------------------------------
@@ -537,9 +520,12 @@ export class MediaDownloaderService {
             requestHeaders: details.requestHeaders ?? [],
             ...(details.initiator ? { initiator: details.initiator } : {}),
           });
-          this.rememberObservedRequest(details.tabId, details.url);
+          // Both consumers need the same URL object: parse once here instead of repeating it.
+          const url = details.url.length > MAX_CAPTURED_URL_LENGTH ? undefined : safeUrl(details.url);
+          if (url === undefined) return;
+          this.rememberObservedRequest(details.tabId, url);
           if (details.requestHeaders && details.requestHeaders.length > 0) {
-            this.headerReplay.remember(details.url, details.requestHeaders, {
+            this.headerReplay.remember(url, details.requestHeaders, {
               tabId: details.tabId,
               frameId: details.frameId,
               ...(details.initiator ? { initiator: details.initiator } : {}),
@@ -551,7 +537,8 @@ export class MediaDownloaderService {
     register(
       "onResponseStarted",
         (details) => {
-          this.rememberObservedRequest(details.tabId, details.url);
+          const url = safeUrl(details.url);
+          if (url !== undefined) this.rememberObservedRequest(details.tabId, url);
           void this.handleResponse(details);
         },
         responseExtra,
@@ -986,10 +973,12 @@ export class MediaDownloaderService {
           return;
         }
         case REBUILD_MESSAGES.RequestSession: {
-          this.sendToContent({
-            msg: { name: REBUILD_MESSAGES.SessionSnapshot, data: encode(this.panelSnapshot()) },
-            channel: Channel.FromServiceToContent,
-          });
+          // A panel that did not receive this worker's last push (newly opened, or opened while
+          // the worker was asleep) identifies itself with a per-page-load nonce; anything else is
+          // a recovery poll that only needs an answer when the snapshot actually changed.
+          const instance = panelInstanceOf(data);
+          this.pushPanelSnapshot(instance === null || instance !== this.lastPanelInstance);
+          if (instance !== null) this.lastPanelInstance = instance;
           return;
         }
         case MSG.contentToService.AbortDownload:
@@ -1546,20 +1535,15 @@ export class MediaDownloaderService {
   }
 
   /** Remember a URL the browser actually requested in a tab (bounded, per-tab). */
-  private rememberObservedRequest(tabId: number, rawUrl: string): void {
-    if (tabId < 0 || rawUrl.length > MAX_CAPTURED_URL_LENGTH) return;
-    try {
-      const key = observedRequestKey(new URL(rawUrl));
-      let seen = this.observedRequests.get(tabId);
-      if (seen === undefined) {
-        seen = new Set();
-        this.observedRequests.set(tabId, seen);
-      }
-      if (seen.size >= 1000) return;
-      seen.add(key);
-    } catch {
-      /* malformed URL; ignore */
+  private rememberObservedRequest(tabId: number, url: URL): void {
+    if (tabId < 0 || url.href.length > MAX_CAPTURED_URL_LENGTH) return;
+    let seen = this.observedRequests.get(tabId);
+    if (seen === undefined) {
+      seen = new Set();
+      this.observedRequests.set(tabId, seen);
     }
+    if (seen.size >= 1000) return;
+    seen.add(observedRequestKey(url));
   }
 
   private async saveOutcome(
@@ -1788,6 +1772,22 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
 }
 
 const MAX_CAPTURED_URL_LENGTH = 8192;
+
+/** Parse a browser-supplied URL; malformed strings are simply not remembered. */
+function safeUrl(raw: string): URL | undefined {
+  try {
+    return new URL(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The per-page-load nonce a panel attaches to its snapshot poll. */
+function panelInstanceOf(data: unknown): string | null {
+  if (data === null || typeof data !== "object") return null;
+  const instance = (data as { instance?: unknown }).instance;
+  return typeof instance === "string" && instance.length > 0 ? instance : null;
+}
 /** Relay messages are answered per message: the producer stops when the verdict is not accepted. */
 const RELAY_STREAM_MESSAGES: ReadonlySet<string> = new Set([
   RELAY_MESSAGES.MediaStreamChunk,
@@ -1798,8 +1798,6 @@ const RELAY_STREAM_MESSAGES: ReadonlySet<string> = new Set([
 const isRelayStreamMessage = (name: string | undefined): boolean =>
   name !== undefined && RELAY_STREAM_MESSAGES.has(name);
 
-/** Minimum spacing between panel pushes while only progress changed (existing 4 Hz UI budget). */
-const SNAPSHOT_PUSH_INTERVAL_MS = 250;
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
 

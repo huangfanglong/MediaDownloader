@@ -201,6 +201,59 @@ describe("panel updates without explicit requests", () => {
   });
 });
 
+describe("panel snapshot pushes", () => {
+  const pollEnvelope = (instance?: string): Envelope =>
+    ({
+      channel: Channel.FromContentToService,
+      msg: {
+        name: REBUILD_MESSAGES.RequestSession,
+        data: instance === undefined ? null : { instance },
+      },
+    }) as unknown as Envelope;
+
+  it("answers a newly opened panel and skips polls that already have the snapshot", async () => {
+    const harness = createHarness({
+      masterUrl: "https://cdn.test/master.m3u8",
+      mediaPlaylistUrl: "https://cdn.test/1080/index.m3u8",
+      mediaPlaylist: fmp4MediaPlaylist,
+      segmentPrefix: "https://cdn.test/1080/",
+      segments: 1,
+      initBytes: "INIT",
+    });
+    await harness.service.start();
+    const pushes = (): number =>
+      harness.gateway.contentSends.filter(
+        (envelope) => envelope.msg.name === REBUILD_MESSAGES.SessionSnapshot,
+      ).length;
+    const booted = pushes();
+
+    // A panel opened after the worker's last push identifies itself and gets an answer.
+    await harness.gateway.deliverToService(pollEnvelope("panel-a"));
+    expect(pushes()).toBe(booted + 1);
+    // Its recovery polls do not repeat an identical snapshot.
+    await harness.gateway.deliverToService(pollEnvelope("panel-a"));
+    expect(pushes()).toBe(booted + 1);
+
+    // A change the panel has not seen yet is answered even without a push.
+    harness.service.getSession().notifications.set("notification_1", {
+      type: "download_error",
+      message: "failed",
+    });
+    await harness.gateway.deliverToService(pollEnvelope("panel-a"));
+    expect(pushes()).toBe(booted + 2);
+    await harness.gateway.deliverToService(pollEnvelope("panel-a"));
+    expect(pushes()).toBe(booted + 2);
+
+    // A second panel page (new nonce) is answered even though content did not change.
+    await harness.gateway.deliverToService(pollEnvelope("panel-b"));
+    expect(pushes()).toBe(booted + 3);
+    // A poll without a nonce cannot prove the panel is up to date, so it is answered too.
+    await harness.gateway.deliverToService(pollEnvelope());
+    expect(pushes()).toBe(booted + 4);
+    harness.service.stop();
+  });
+});
+
 describe("focus filtering in the panel snapshot (QOL parity)", () => {
   it("shows only the focused media item after the page reports focus", async () => {
     const entries = new Map<string, string | Uint8Array>();

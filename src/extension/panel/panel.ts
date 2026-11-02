@@ -76,6 +76,23 @@ let lastRowSignature: string | undefined;
 let pendingSnapshot: PanelSnapshot | undefined;
 
 /**
+ * Fresh for every panel page load. The service answers a poll from an unknown nonce even when the
+ * snapshot did not change, so a panel opened after the last push is not left empty.
+ */
+const PANEL_INSTANCE = createPanelInstance();
+
+function createPanelInstance(): string {
+  try {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return crypto.randomUUID();
+    }
+  } catch {
+    /* fall through to a non-crypto id; it only needs to be unique per page load */
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
  * Every outbound message goes through a catalogue builder, so a mistyped name or a payload that
  * drifted from the protocol types fails the typecheck instead of silently reaching the service.
  */
@@ -638,7 +655,7 @@ runtime?.onMessage.addListener((message: unknown) => {
   render(snapshot);
 });
 
-sendToService(makeRequestSessionEnvelope());
+sendToService(makeRequestSessionEnvelope(PANEL_INSTANCE));
 
 // The worker pushes snapshots on changes; this poll covers messages lost while it was asleep.
-setInterval(() => sendToService(makeRequestSessionEnvelope()), 2000);
+setInterval(() => sendToService(makeRequestSessionEnvelope(PANEL_INSTANCE)), 2000);

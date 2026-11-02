@@ -4,16 +4,18 @@ import { buildDnrRule, sanitizeReplayHeaders } from "../transfer/fetch.js";
 import type { NetworkGateway } from "./gateways.js";
 
 const HEADER_REPLAY_TTL_MS = 10 * 60 * 1000;
+/** Expired entries are swept at most this often; the entry cap is still enforced on insert. */
+const HEADER_REPLAY_PRUNE_INTERVAL_MS = 60_000;
 const HEADER_REPLAY_CAP = 300;
 const MAX_CAPTURED_URL_LENGTH = 8192;
 const MAX_CAPTURED_HEADER_LENGTH = 8192;
 const MAX_CAPTURED_HEADERS = 60;
 const MAX_ACTIVE_DNR_RULES = 700;
 const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
-const VOLATILE_QUERY_PARAMS = [
+const VOLATILE_QUERY_PARAMS = new Set([
   "range", "rn", "rbuf", "bytestart", "byteend",
   "mx", "mh", "mm", "mn", "ms", "mv", "mvi", "pl", "initcwndbps", "met", "cps", "xpc", "c",
-];
+]);
 
 interface CapturedHeaders {
   headers: HeaderPair[];
@@ -24,20 +26,39 @@ interface CapturedHeaders {
   initiator?: string;
 }
 
-/** Normalise a URL for header replay while preserving the media asset identity. */
-export function normalizeHeaderReplayUrl(raw: string): { href: string; scheme: string; assetKey?: string } {
+/**
+ * Normalise a URL for header replay while preserving the media asset identity.
+ *
+ * This runs for every sniffed request, so it must not rewrite the query unless a volatile
+ * parameter is actually present: every `searchParams.delete` re-serialises the URL, and doing
+ * that twenty times per request dominated the webRequest handler.
+ */
+export function normalizeHeaderReplayUrl(
+  raw: string | URL,
+): { href: string; scheme: string; assetKey?: string } {
   try {
-    const url = new URL(raw);
-    for (const param of VOLATILE_QUERY_PARAMS) url.searchParams.delete(param);
-    const id = url.searchParams.get("id");
-    const itag = url.searchParams.get("itag");
+    const url = typeof raw === "string" ? new URL(raw) : raw;
+    let volatile = false;
+    for (const key of url.searchParams.keys()) {
+      if (!VOLATILE_QUERY_PARAMS.has(key)) continue;
+      volatile = true;
+      break;
+    }
+    let normalized = url;
+    if (volatile) {
+      // Work on a copy: rewrite the query without touching a URL the caller may still use.
+      normalized = new URL(url.href);
+      for (const param of VOLATILE_QUERY_PARAMS) normalized.searchParams.delete(param);
+    }
+    const id = normalized.searchParams.get("id");
+    const itag = normalized.searchParams.get("itag");
     return {
-      href: url.href,
-      scheme: url.protocol,
-      ...(id && itag ? { assetKey: `${url.protocol}//${url.host}${url.pathname}|${id}|${itag}` } : {}),
+      href: normalized.href,
+      scheme: normalized.protocol,
+      ...(id && itag ? { assetKey: `${normalized.protocol}//${normalized.host}${normalized.pathname}|${id}|${itag}` } : {}),
     };
   } catch {
-    return { href: raw, scheme: "" };
+    return { href: typeof raw === "string" ? raw : String(raw), scheme: "" };
   }
 }
 
@@ -53,6 +74,7 @@ function originOf(raw: string): string | undefined {
 export class HeaderReplay {
   private readonly capturedHeaders = new Map<string, CapturedHeaders>();
   private readonly activeRuleIds = new Set<number>();
+  private lastPruneAt = Number.NEGATIVE_INFINITY;
 
   constructor(
     private readonly network: NetworkGateway,
@@ -60,13 +82,19 @@ export class HeaderReplay {
   ) {}
 
   remember(
-    rawUrl: string,
+    rawUrl: string | URL,
     headers: HeaderPair[],
     context: { tabId?: number; frameId?: number; initiator?: string } = {},
   ): void {
-    if (rawUrl.length > MAX_CAPTURED_URL_LENGTH) return;
+    const href = typeof rawUrl === "string" ? rawUrl : rawUrl.href;
+    if (href.length > MAX_CAPTURED_URL_LENGTH) return;
     const now = this.now();
-    this.prune(now);
+    // Expired captures do not need to be swept on every request: the cap bounds memory and a
+    // periodic sweep keeps the replay window close to the TTL.
+    if (now - this.lastPruneAt >= HEADER_REPLAY_PRUNE_INTERVAL_MS) {
+      this.lastPruneAt = now;
+      this.prune(now);
+    }
     const normalized = normalizeHeaderReplayUrl(rawUrl);
     const safe = headers
       .filter((header) => header.value !== undefined)
@@ -85,7 +113,8 @@ export class HeaderReplay {
     };
     this.capturedHeaders.set(normalized.href, entry);
     if (normalized.assetKey !== undefined) this.capturedHeaders.set(normalized.assetKey, entry);
-    this.prune(now);
+    // The cap is the hard memory bound, so it is enforced per insert; it rarely fires.
+    if (this.capturedHeaders.size > HEADER_REPLAY_CAP) this.prune(now);
   }
 
   async apply(plan: DownloadPlan, context: { tabId?: number; initiator?: string } = {}): Promise<number[]> {
