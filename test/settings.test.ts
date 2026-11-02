@@ -263,6 +263,42 @@ describe("set_default_action and per-host override (E30, `Zy` pretty 22484-22488
     expect(effectiveDefaultAction(state, new URL("https://other.com/watch"))).toBe("download");
     expect(effectiveDefaultAction(state, undefined)).toBe("download");
   });
+
+  it("canonicalises the stored hostname so page lookups match it", () => {
+    const state = applySetDefaultAction(createDefaultSettings(), {
+      hostname: "Example.COM.",
+      action: "download_audio",
+    }).state;
+    expect([...state.default_action_per_hostname.keys()]).toEqual(["example.com"]);
+    expect(effectiveDefaultAction(state, new URL("https://example.com/watch"))).toBe("download_audio");
+    // A full URL or a differently cased hostname names the same site and finds the same entry.
+    expect(effectiveDefaultAction(state, "Example.COM")).toBe("download_audio");
+    expect(effectiveDefaultAction(state, "https://example.com/watch")).toBe("download_audio");
+  });
+
+  it("drops a per-host command whose hostname cannot be canonicalised", () => {
+    for (const hostname of ["", "   ", "not a host"]) {
+      const state = createDefaultSettings();
+      const result = applySetDefaultAction(state, { hostname, action: "download_audio" });
+      expect(result.changed).toBe(false);
+      expect(result.state).toBe(state);
+    }
+  });
+
+  it("repairs host keys restored from an older state", () => {
+    const stored = encodeState({
+      ...createDefaultSettings(),
+      default_action_per_hostname: new Map([
+        ["Example.COM", "download_audio"],
+        ["https://other.test/watch", "copy"],
+        ["not a host", "download_audio"],
+      ]),
+    } as never);
+    const decoded = decodeState(stored);
+    expect([...decoded.default_action_per_hostname.keys()].sort()).toEqual(["example.com", "other.test"]);
+    expect(effectiveDefaultAction(decoded, new URL("https://example.com/watch"))).toBe("download_audio");
+    expect(effectiveDefaultAction(decoded, new URL("https://other.test/watch"))).toBe("copy");
+  });
 });
 
 describe("whole-state serde round-trip (E22: one value in chrome.storage.local)", () => {
@@ -311,6 +347,69 @@ describe("whole-state serde round-trip (E22: one value in chrome.storage.local)"
     expect(decoded.version).toBe(3);
     expect(decoded.max_concurrent_downloads).toBe(6);
     expect(decoded.dockmode).toBe("popup");
+  });
+
+  it("repairs nested fields that were stored incomplete", () => {
+    const stored = encodeState({
+      ...createDefaultSettings(),
+      smartnaming: { source: '{"max_length":40,"template":"%title"}' },
+      remote_behaviours: { advertize_premium: false },
+      custom_strings: { web: new Map([["title", "My title"]]) },
+    } as never);
+    const decoded = decodeState(stored);
+    // The rules file is user content: keep it and rebuild the compiled form derived from it.
+    expect(decoded.smartnaming.source).toBe('{"max_length":40,"template":"%title"}');
+    expect(decoded.smartnaming.compiled.default_.max_length).toBe(40);
+    // A behaviour table without its flag map would throw on the first detection: restore it.
+    expect(decoded.remote_behaviours.advertize_premium).toBe(false);
+    expect(decoded.remote_behaviours.websites).toBeInstanceOf(Map);
+    expect(() => isFlagEnabled(decoded.remote_behaviours, "FIFO_DISCOVERED_WEBSITES", "example.com")).not.toThrow();
+    // Missing collection members come from the defaults; the ones present stay.
+    expect(decoded.custom_strings.addon.size).toBe(0);
+    expect(decoded.custom_strings.web.get("title")).toBe("My title");
+  });
+
+  it("falls back to the default behaviour table when its maps are unusable", () => {
+    const defaults = createDefaultSettings();
+    const stored = encodeState({
+      ...defaults,
+      remote_behaviours: {
+        advertize_premium: true,
+        gyt_scanner: defaults.remote_behaviours.gyt_scanner,
+        // Feature gates call `domains.has(...)`; an array here would throw on the first detection.
+        websites: new Map([["behaviour_hash_1", ["example.com"]]]),
+      },
+    } as never);
+    const decoded = decodeState(stored);
+    expect(decoded.remote_behaviours.websites.get(behaviourHash("FIFO_DISCOVERED_WEBSITES"))).toBeInstanceOf(Set);
+    expect(() => isFlagEnabled(decoded.remote_behaviours, "FIFO_DISCOVERED_WEBSITES", "example.com")).not.toThrow();
+  });
+
+  it("falls back per field for values whose type no longer matches", () => {
+    const decoded = decodeState(
+      encodeState({
+        ...createDefaultSettings(),
+        history_days: "7",
+        max_concurrent_downloads: "six",
+        download_directory: 42,
+        preferred_quality: "auto",
+        preferred_audio_languages: ["de"],
+      } as never),
+    );
+    expect(decoded.history_days).toBe(0);
+    expect(decoded.max_concurrent_downloads).toBe(6);
+    expect(decoded.download_directory).toBe("");
+    expect(decoded.preferred_quality).toBe(1080);
+    expect(decoded.preferred_audio_languages).toBeInstanceOf(Set);
+  });
+
+  it("keeps a deliberate null quality preference", () => {
+    const decoded = decodeState(encodeState({ ...createDefaultSettings(), preferred_quality: null } as never));
+    expect(decoded.preferred_quality).toBeNull();
+  });
+
+  it("falls back to full defaults for undecodable storage values", () => {
+    expect(decodeState({ __serde_tag: "mystery" })).toEqual(createDefaultSettings());
   });
 
   it("falls back to full defaults for garbage storage values", () => {

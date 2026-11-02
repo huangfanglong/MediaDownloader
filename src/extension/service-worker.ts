@@ -60,6 +60,7 @@ import {
   createDefaultSettings,
   applySettingsMutation,
   decodeState,
+  effectiveDefaultAction,
   encodeState,
   pruneDownloadHistory,
 } from "../settings/local.js";
@@ -921,7 +922,7 @@ export class MediaDownloaderService {
     const meta: TabMeta = {
       incognito: tab.incognito ?? false,
       tab_id: tabId,
-      default_action: this.effectiveDefaultAction(tab.url),
+      default_action: effectiveDefaultAction(this.settings, tab.url),
       smartnaming_rule: smartnamingRule,
       ...(typeof metadata?.title === "string" ? { title: metadata.title } : {}),
       ...(tab.url ? { url: new URL(tab.url) } : {}),
@@ -948,15 +949,6 @@ export class MediaDownloaderService {
     }
     for (const subtitle of item.subtitles ?? []) {
       if (subtitle.type === "http") subtitle.url.search = "";
-    }
-  }
-
-  private effectiveDefaultAction(pageUrl: string): TabMeta["default_action"] {
-    try {
-      const hostname = new URL(pageUrl).hostname;
-      return this.settings.default_action_per_hostname.get(hostname) ?? this.settings.default_action;
-    } catch {
-      return this.settings.default_action;
     }
   }
 

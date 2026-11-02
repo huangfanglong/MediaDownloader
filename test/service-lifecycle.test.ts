@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MediaDownloaderService } from "../src/extension/service-worker.js";
+import { MediaDownloaderService, PERSISTENT_KEY } from "../src/extension/service-worker.js";
 import { DownloadWorker } from "../src/extension/download-worker.js";
 import { itemFromHint } from "../src/extension/content-script.js";
 import { WorkerClient } from "../src/extension/worker-client.js";
@@ -7,6 +7,7 @@ import { Channel } from "../src/protocol/channels.js";
 import { MSG } from "../src/protocol/messages.js";
 import { REBUILD_MESSAGES } from "../src/protocol/rebuild-messages.js";
 import { decode, encode } from "../src/protocol/serde.js";
+import { createDefaultSettings, encodeState } from "../src/settings/local.js";
 import type { Envelope } from "../src/extension/gateways.js";
 import type { MediaItem } from "../src/core/types.js";
 import { createFakeOpfs, createFetch } from "./helpers/transfer-fakes.js";
@@ -120,6 +121,47 @@ describe("MV3 lifecycle hardening", () => {
     const stored = (await harness.gateway.storage.session.get("global_session_state")) as Record<string, unknown>;
     const serialised = JSON.stringify(stored);
     expect(serialised).toContain("media_hash_");
+    harness.service.stop();
+  });
+});
+
+describe("stored-state repair on boot", () => {
+  it("keeps detecting media when the stored state was written with a partial nested field", async () => {
+    const harness = createHarness({
+      masterUrl: "https://cdn.test/master.m3u8",
+      mediaPlaylistUrl: "https://cdn.test/1080/index.m3u8",
+      mediaPlaylist: fmp4MediaPlaylist,
+      segmentPrefix: "https://cdn.test/1080/",
+      segments: 1,
+      initBytes: "INIT",
+    });
+    await harness.gateway.storage.local.set({
+      [PERSISTENT_KEY]: encodeState({
+        ...createDefaultSettings(),
+        remote_behaviours: { advertize_premium: true },
+        default_action_per_hostname: new Map([["Site.TEST", "download_audio"]]),
+      } as never),
+    });
+    await harness.service.start();
+    harness.gateway.triggerSendHeaders({
+      requestId: "req-master",
+      url: "https://cdn.test/master.m3u8",
+      tabId: 7,
+      frameId: 0,
+      type: "xmlhttprequest",
+      timeStamp: 1_700_000_000_000,
+      requestHeaders: [],
+    });
+    await harness.gateway.triggerResponseStarted(
+      sniffDetails("https://cdn.test/master.m3u8", "application/vnd.apple.mpegurl", {
+        initiator: "https://site.test/watch",
+      }),
+    );
+    await flush();
+    // The flag lookup inside detection must not throw just because the stored table was partial.
+    expect(harness.service.getEngine().mediaForTab(7).size).toBe(1);
+    // The restored per-host preference must match the page host it was written for.
+    expect(harness.service.getSession().discovered.get(7)?.meta?.default_action).toBe("download_audio");
     harness.service.stop();
   });
 });

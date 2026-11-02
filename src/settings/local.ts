@@ -11,7 +11,7 @@
  */
 
 import type { DefaultAction } from "../core/types.js";
-import { defaultSmartnaming, type CompiledSmartnaming } from "../naming/rules.js";
+import { defaultSmartnaming, loadSmartnaming, type CompiledSmartnaming } from "../naming/rules.js";
 import {
   SETTINGS_MUTATION_KEYS,
   type AudioStrategy,
@@ -214,6 +214,39 @@ export function pruneDownloadHistory(state: PersistentSettings, now: number): bo
 }
 
 // ---------------------------------------------------------------------------
+// Host canonicalisation
+// ---------------------------------------------------------------------------
+
+/** Runtime mirror of the `DefaultAction` union: stored state and wire payloads are untrusted. */
+const DEFAULT_ACTION_VALUES: readonly DefaultAction[] = ["download", "download_as", "download_audio", "copy"];
+
+function isDefaultAction(value: unknown): value is DefaultAction {
+  return typeof value === "string" && (DEFAULT_ACTION_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Canonical key for a per-host preference.
+ *
+ * Lookups compare against `URL.hostname`, which is lowercase, punycoded and carries no port or
+ * trailing dot. A key stored in any other form could never match a page, so writes, restores and
+ * lookups all go through this one normaliser.
+ */
+export function normalizeHostname(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+  const candidate = /^[a-z][a-z0-9+.-]*:\/\//iu.test(trimmed)
+    ? trimmed
+    : `http://${trimmed.replace(/^\/+/u, "")}`;
+  try {
+    const hostname = new URL(candidate).hostname.replace(/\.+$/u, "");
+    return hostname.length === 0 ? undefined : hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // `mut-settings` mutations (channel 1; E22/§3.7). 19 keys proven — strict superset of the
 // brief's 18 (the shipped `else if` chain has 19 branches, pretty 23076-23142).
 // ---------------------------------------------------------------------------
@@ -364,7 +397,11 @@ export function applySetDefaultAction(
   state: PersistentSettings,
   payload: SetDefaultActionPayload,
 ): SettingsMutationResult {
-  const { hostname, action } = payload;
+  const { action } = payload;
+  const hostname = normalizeHostname(payload.hostname);
+  // A hostname that cannot be canonicalised, or an action outside the proven set, would be
+  // stored as a preference no page lookup could ever match: drop the command, do not half-apply.
+  if (hostname === undefined || !isDefaultAction(action)) return unchanged(state);
   const hadPerHost = state.default_action_per_hostname.has(hostname);
   const perHost = state.default_action_per_hostname.get(hostname);
   if (action === "download_audio") {
@@ -384,13 +421,14 @@ export function applySetDefaultAction(
 
 /**
  * Effective default action for a page URL: exact-hostname override wins, else the global
- * default (proven `Zy`, pretty 22484-22488).
+ * default (proven `Zy`, pretty 22484-22488). Both sides of the lookup are canonicalised by
+ * {@link normalizeHostname}, so a stored key and a page can never disagree on case or IDN form.
  */
 export function effectiveDefaultAction(
   state: PersistentSettings,
   url?: URL | string,
 ): DefaultAction {
-  const hostname = url instanceof URL ? url.hostname : url;
+  const hostname = url === undefined ? undefined : normalizeHostname(url instanceof URL ? url.hostname : url);
   if (hostname !== undefined) {
     const perHost = state.default_action_per_hostname.get(hostname);
     if (perHost !== undefined) return perHost;
@@ -408,19 +446,107 @@ export function encodeState(state: PersistentSettings): unknown {
 }
 
 /**
- * Decode a stored state and restore missing top-level fields from the defaults, mirroring the
- * shipped per-field zod fallback in `xb` (pretty 21036-21058). `jwt` (excluded from this
- * interface) simply stays undecoded if present in an original state.
+ * Restore one stored field against its default.
+ *
+ * A field whose stored value no longer has the shape the runtime expects falls back to its
+ * default, and plain objects are restored key by key (unknown keys are dropped). Stored state can
+ * come from an older version, a different build, or a partially failed write: it must never leak
+ * `undefined` into consumers that rely on the full field shape.
+ */
+function restoreField(value: unknown, template: unknown): unknown {
+  if (template instanceof Map) return value instanceof Map ? value : template;
+  if (template instanceof Set) return value instanceof Set ? value : template;
+  if (Array.isArray(template)) return Array.isArray(value) ? value : template;
+  if (template !== null && typeof template === "object") {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return template;
+    const source = value as Record<string, unknown>;
+    const templateRecord = template as Record<string, unknown>;
+    const restored: Record<string, unknown> = {};
+    for (const key of Object.keys(templateRecord)) {
+      restored[key] = restoreField(source[key], templateRecord[key]);
+    }
+    return restored;
+  }
+  if (typeof template === "number") {
+    return typeof value === "number" && Number.isFinite(value) ? value : template;
+  }
+  if (typeof template === "string") return typeof value === "string" ? value : template;
+  if (typeof template === "boolean") return typeof value === "boolean" ? value : template;
+  return template;
+}
+
+/** A stored field restorer that needs more than the generic shape check. */
+type FieldRestorer = (value: unknown, fallback: unknown) => unknown;
+
+/**
+ * Fields restored by hand: `null` is a real quality preference, the compiled naming rules are
+ * derived from the rules file, and the two container fields have element shapes a generic check
+ * cannot see (and consumers that would throw on a wrong one).
+ */
+const FIELD_RESTORERS: Partial<Record<keyof PersistentSettings, FieldRestorer>> = {
+  preferred_quality: (value, fallback) =>
+    value === null || (typeof value === "number" && Number.isFinite(value)) ? value : fallback,
+  smartnaming: (value) => {
+    // `compiled` is derived from `source`, so a state written without it (or with a stale copy)
+    // is rebuilt instead of discarding the user's rules file.
+    const source =
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as { source?: unknown }).source
+        : undefined;
+    const text = typeof source === "string" ? source : null;
+    return { source: text, compiled: loadSmartnaming(text) };
+  },
+  default_action_per_hostname: (value, fallback) => {
+    if (!(value instanceof Map)) return fallback;
+    const perHost = new Map<string, DefaultAction>();
+    for (const [rawHost, action] of value) {
+      const hostname = normalizeHostname(rawHost);
+      // An entry with an unusable host or action could never match a page lookup; drop it.
+      if (hostname !== undefined && isDefaultAction(action)) perHost.set(hostname, action);
+    }
+    return perHost;
+  },
+  remote_behaviours: (value, fallback) => {
+    const restored = restoreField(value, fallback) as RemoteBehaviours;
+    const websites = restored.websites;
+    // Feature gates call `websites.get(hash).has(domain)`; a map whose values are not hash sets
+    // would throw on the first detection instead of just falling back to the default table.
+    const usable =
+      websites instanceof Map &&
+      [...websites.entries()].every(
+        ([flag, domains]) =>
+          typeof flag === "string" && domains instanceof Set && [...domains].every((hash) => typeof hash === "string"),
+      );
+    return usable ? restored : { ...restored, websites: (fallback as RemoteBehaviours).websites };
+  },
+};
+
+/**
+ * Decode a stored state and restore it against the defaults.
+ *
+ * Missing top-level fields and fields whose stored value no longer matches the expected shape are
+ * repaired field by field, mirroring the shipped per-field zod fallback in `xb` (pretty
+ * 21036-21058): a stored state that predates a field, or was written only partially, must boot
+ * into a complete state instead of carrying half-valid values into every consumer. `jwt`
+ * (excluded from this interface) simply stays undecoded if present in an original state.
  */
 export function decodeState(wire: unknown): PersistentSettings {
-  const decoded = decode(wire);
+  let decoded: unknown;
+  try {
+    decoded = decode(wire);
+  } catch {
+    // Undecodable storage is treated like empty storage: defaults are better than a failed boot.
+    return createDefaultSettings();
+  }
   const defaults = createDefaultSettings();
-  if (decoded === null || typeof decoded !== "object") return defaults;
+  if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return defaults;
   const source = decoded as Record<string, unknown>;
   const result: Record<string, unknown> = { ...defaults };
-  for (const key of Object.keys(defaults)) {
+  for (const key of Object.keys(defaults) as Array<keyof PersistentSettings>) {
     const value = source[key];
-    if (value !== undefined) result[key] = value;
+    if (value === undefined) continue;
+    const restorer = FIELD_RESTORERS[key];
+    result[key] = restorer !== undefined ? restorer(value, defaults[key]) : restoreField(value, defaults[key]);
   }
   return result as unknown as PersistentSettings;
 }
