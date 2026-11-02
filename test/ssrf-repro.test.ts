@@ -11,7 +11,7 @@
  *      origin they were captured from.
  *   3. Same-origin segments still get captured headers (legitimate behavior preserved).
  *   4. Query-param carry is origin-scoped: cross-origin segments do NOT inherit the master URL's
- *      signed token query (A6 mitigation).
+ *      signed token query.
  *   5. Same-origin private-network hosts (e.g., http://192.168.1.10:8096 local media server) are
  *      allowed — the page itself runs on that origin and can legitimately fetch its own resources.
  */
@@ -79,7 +79,7 @@ const captured = new Headers({
   Cookie: "session=page-scope-only-never-replayed",
 });
 
-/** Query copied from the master whenever `carry_get_params` is on (6-Sol A6 behaviour). */
+/** Query copied from the master whenever `carry_get_params` is on for same-origin segments. */
 const CARRY = "?token=page-signed&sig=abc123";
 const SEGMENT_BYTES = new Uint8Array(2048).fill(7);
 
@@ -101,7 +101,7 @@ describe("header retention (pure)", () => {
 });
 
 describe("URL resolution with carry guard (pure)", () => {
-  it("buildSegmentRequests does NOT carry master query to cross-origin segments (A6 mitigation)", () => {
+  it("buildSegmentRequests does NOT carry master query to cross-origin segments", () => {
     const parsed = parsePlaylist(HOSTILE_PLAYLIST, new URL(MANIFEST_URL));
     if (parsed.kind !== "media") throw new Error(`expected media playlist, got ${parsed.kind}`);
     const descriptors = buildSegmentRequests(toTransferSegments(parsed.segments), {

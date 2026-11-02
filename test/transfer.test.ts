@@ -527,6 +527,22 @@ describe("buildSegmentRequests (E15/E16)", () => {
     ]);
   });
 
+  it("keeps a cross-origin segment's own query and replaces it only on same-origin segments", () => {
+    const descriptors = buildSegmentRequests(
+      [
+        { url: "seg-0.ts?own=1" },
+        { url: "https://other.example/seg-1.ts?own=2" },
+      ],
+      { masterUrl: master, carryGetParams: true },
+    );
+    expect(descriptors.map((descriptor) => descriptor.url)).toEqual([
+      // Same-origin: the master query wins, matching the shipped carry behaviour.
+      "https://cdn.example/path/seg-0.ts?token=abc",
+      // Cross-origin: untouched, so the segment's own signed query is preserved.
+      "https://other.example/seg-1.ts?own=2",
+    ]);
+  });
+
   it("does not copy the query when carryGetParams is false", () => {
     const descriptors = buildSegmentRequests([{ url: "seg-0.ts" }], {
       masterUrl: master,
