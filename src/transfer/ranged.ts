@@ -12,7 +12,7 @@
  */
 import { err, ok, type Result } from "../core/option.js";
 import { fetchBytes, type FetchLike } from "./fetch.js";
-import { abortedError, otherError, type RetryError } from "./retry.js";
+import { abortedError, otherError, tooLargeError, type RetryError } from "./retry.js";
 
 /** Largest accepted range from the live probe; 2 MiB worked, 4 MiB was rejected. */
 export const RANGE_CHUNK_BYTES = 2 * 1024 * 1024;
@@ -29,6 +29,11 @@ export interface RangedFetchOptions {
   signal?: AbortSignal;
   onBytes?: (fetched: number, total: number | undefined) => void;
   onChunk?: (chunk: Uint8Array) => void | Promise<void>;
+  /**
+   * Aggregate byte ceiling for the URL. Without `onChunk` it bounds what is retained in memory;
+   * with `onChunk` it is a total transfer cap (the consumer still receives every chunk).
+   */
+  maxBytes?: number;
 }
 
 /** True for googlevideo-style media URLs that only answer bounded byte ranges. */
@@ -70,6 +75,11 @@ export async function fetchRanged(
   const parts: Uint8Array[] = [];
   let offset = 0;
   let fetchedTotal: number | undefined = total;
+  // Every accepted range grows `parts`; keep the aggregate inside the caller's ceiling as well as
+  // the per-response one, so a server that keeps answering ranges cannot grow memory without
+  // bound (one bounded range is 2 MiB; the loop allows 20 000 of them).
+  const pastCeiling = (): boolean =>
+    options.maxBytes !== undefined && offset > options.maxBytes;
 
   for (let attempt = 0; attempt < MAX_RANGE_CHUNKS; attempt += 1) {
     if (options.signal?.aborted) {
@@ -81,7 +91,7 @@ export async function fetchRanged(
       fetchImpl,
       url.href,
       { headers, range: `bytes=${offset}-${end}` },
-      { signal: options.signal },
+      { signal: options.signal, ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}) },
     );
     if (result.tag === "Err") {
       // A 416 after at least one chunk means the caller's size was larger than the object.
@@ -95,11 +105,13 @@ export async function fetchRanged(
       if (options.onChunk !== undefined) await options.onChunk(bytes);
       else parts.push(bytes);
       offset = bytes.byteLength;
+      if (pastCeiling()) return err(tooLargeError(`Range download exceeds ${options.maxBytes} bytes`));
       break;
     }
     if (options.onChunk !== undefined) await options.onChunk(bytes);
     else parts.push(bytes);
     offset += bytes.byteLength;
+    if (pastCeiling()) return err(tooLargeError(`Range download exceeds ${options.maxBytes} bytes`));
     options.onBytes?.(offset, fetchedTotal);
     if (fetchedTotal === undefined && bytes.byteLength < chunkSize) {
       fetchedTotal = offset;

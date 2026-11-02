@@ -23,6 +23,7 @@ import {
   otherError,
   readError,
   timeoutError,
+  tooLargeError,
   type RetryError,
 } from "./retry.js";
 
@@ -420,7 +421,7 @@ export async function fetchBytes(
       if (value !== undefined) {
         total += value.length;
         if (options.maxBytes !== undefined && total > options.maxBytes) {
-          return err(otherError(`Response exceeds ${options.maxBytes} bytes`));
+          return err(tooLargeError(`Response exceeds ${options.maxBytes} bytes`));
         }
         if (options.onChunk !== undefined) await options.onChunk(value);
         else chunks.push(value);

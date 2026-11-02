@@ -25,6 +25,7 @@ export type RetryErrorKind =
   | "timeout"
   | "aborted"
   | "read"
+  | "too_large"
   | "other";
 
 export interface RetryError {
@@ -60,6 +61,17 @@ export const readError = (message?: string): RetryError => ({
   message,
 });
 
+/**
+ * The response body is larger than the caller's in-memory ceiling.
+ *
+ * Deliberately distinct from `other`: the size of a resource does not change between attempts, so
+ * retrying only re-reads the body up to the ceiling again. See `isTerminalRetryError`.
+ */
+export const tooLargeError = (message: string): RetryError => ({
+  kind: "too_large",
+  message,
+});
+
 export const otherError = (message: string): RetryError => ({
   kind: "other",
   message,
@@ -74,9 +86,16 @@ export const otherError = (message: string): RetryError => ({
  *  - An aborted attempt is the user cancelling (`a.aborted`) and must stop the loop.
  *  - A timeout returns `{timeout: !0}` from `Ki` without another iteration (E13); libav maps its
  *    timeout to return code 1003 and stops too (E11).
+ *  - A body over the caller's ceiling (`too_large`) is the same size on every attempt; retrying
+ *    would download up to the ceiling four more times and delay the failure the caller must show.
  */
 export function isTerminalRetryError(error: RetryError): boolean {
-  if (error.kind === "aborted" || error.kind === "timeout") return true;
+  if (
+    error.kind === "aborted" ||
+    error.kind === "timeout" ||
+    error.kind === "too_large"
+  )
+    return true;
   return (
     error.kind === "http" && (error.status === 404 || error.status === 416)
   );

@@ -5,6 +5,7 @@
  *  - `queue.ts`   — global download concurrency gate (service-side `In`, E09).
  *  - `retry.ts`   — attempt/backoff/timeout policy and the proven constants (E11-E14, E17).
  *  - `fetch.ts`   — one HTTP attempt, header sets and DNR session-rule model (E12, E28).
+ *  - `limits.ts`  — in-memory body ceilings for what the worker will buffer (segments, tracks).
  *  - `assemble.ts`— HLS segment descriptors, init/AES boundary, concatenation, progress gates
  *                   (E15-E17, E19).
  *  - `remux.ts`   — container/codec decision table and remux boundary (E21, E24-E25).
@@ -18,6 +19,7 @@
 export * from "./queue.js";
 export * from "./retry.js";
 export * from "./fetch.js";
+export * from "./limits.js";
 export * from "./assemble.js";
 export * from "./remux.js";
 export * from "./save.js";

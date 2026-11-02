@@ -19,6 +19,7 @@ import {
   httpError,
   otherError,
   timeoutError,
+  tooLargeError,
   type RetryError,
 } from "../src/transfer/retry.js";
 import {
@@ -92,12 +93,13 @@ describe("retry constants (proven numbers)", () => {
     expect(MANIFEST_RETRY_POLICY.maxAttempts).toBe(5);
   });
 
-  it("classifies terminal errors: 404/416, timeout, abort", () => {
+  it("classifies terminal errors: 404/416, timeout, abort, oversized body", () => {
     expect(isTerminalRetryError(httpError(404))).toBe(true);
     expect(isTerminalRetryError(httpError(416))).toBe(true);
     expect(isTerminalRetryError(httpError(500))).toBe(false);
     expect(isTerminalRetryError(timeoutError())).toBe(true);
     expect(isTerminalRetryError(abortedError())).toBe(true);
+    expect(isTerminalRetryError(tooLargeError("Response exceeds 1 bytes"))).toBe(true);
     expect(isTerminalRetryError(otherError("boom"))).toBe(false);
   });
 

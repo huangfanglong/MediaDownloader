@@ -37,6 +37,7 @@ import {
 import type { HlsInitSegment, HlsSegment as TransferSegment, SegmentDescriptor } from "../transfer/assemble.js";
 import type { HlsSegment as ParsedSegment } from "../manifests/hls.js";
 import { headersForPlan, fetchBytes, scopedHeadersFor, type FetchLike } from "../transfer/fetch.js";
+import { resolveTransferLimits, type TransferLimits } from "../transfer/limits.js";
 import {
   convertArgs,
   FfmpegInputTooLargeError,
@@ -82,6 +83,8 @@ export interface DownloadWorkerDeps {
   now?: () => number;
   /** ffmpeg.wasm runner for 1080p+/4K merges and MP4/MKV/WebM/MP3 outputs. */
   ffmpeg?: FfmpegRunnerLike;
+  /** In-memory body ceilings; production uses the defaults, tests may shrink them. */
+  limits?: Partial<TransferLimits>;
 }
 
 interface ActiveDownload {
@@ -114,10 +117,12 @@ export class DownloadWorker {
   /** In-progress page-relay transfers (chunks streamed from a content script). */
   private readonly relay = new Map<string, { staged: StagedFile; plan: DownloadPlan; bytes: number }>();
   private readonly now: () => number;
+  private readonly limits: TransferLimits;
 
   constructor(deps: DownloadWorkerDeps) {
     this.deps = deps;
     this.now = deps.now ?? (() => Date.now());
+    this.limits = resolveTransferLimits(deps.limits);
   }
 
   /** Announce readiness and start serving the worker channel. */
@@ -317,14 +322,22 @@ export class DownloadWorker {
     signal?: AbortSignal,
   ): Promise<Result<Uint8Array, string>> {
     if (isRangeBoundCdn(url)) {
-      const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, { signal });
+      const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, {
+        signal,
+        maxBytes: this.limits.maxTrackBytes,
+      });
       if (ranged.tag === "Err") {
         const status = ranged.error.status !== undefined ? ` ${ranged.error.status}` : "";
         return err(`${ranged.error.kind}${status}: ${ranged.error.message ?? "download failed"}`);
       }
       return ok(ranged.value.bytes);
     }
-    const fetched = await fetchBytes(this.deps.fetchImpl, url.href, { headers }, { signal });
+    const fetched = await fetchBytes(
+      this.deps.fetchImpl,
+      url.href,
+      { headers },
+      { signal, maxBytes: this.limits.maxTrackBytes },
+    );
     if (fetched.tag === "Err") {
       const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
       return err(`${fetched.error.kind}${status}: ${fetched.error.message ?? "download failed"}`);
@@ -1124,20 +1137,61 @@ export class DownloadWorker {
     let failed = 0;
     let settledSegments = 0;
     let nextWrite = 0;
+    /** Bytes of completed segments waiting for the ordered write head. */
+    let retainedBytes = 0;
+    /** Set when a segment cannot be buffered: the whole download stops instead of skipping it. */
+    let fatal: string | undefined;
+    let flushWaiters: Array<() => void> = [];
+    const wakeFlushWaiters = (): void => {
+      const waiters = flushWaiters;
+      flushWaiters = [];
+      for (const wake of waiters) wake();
+    };
     let writeChain: Promise<void> = Promise.resolve();
     const flushReady = async (): Promise<void> => {
       const ready: Uint8Array[] = [];
+      let released = 0;
       while (nextWrite < chunks.length && chunks[nextWrite] !== undefined) {
         const chunk = chunks[nextWrite];
         chunks[nextWrite] = undefined;
         nextWrite += 1;
-        if (chunk) ready.push(chunk);
+        if (chunk) {
+          ready.push(chunk);
+          released += chunk.byteLength;
+        }
       }
       for (const chunk of ready) await staged?.append(chunk);
+      if (released > 0) {
+        retainedBytes -= released;
+        wakeFlushWaiters();
+      }
     };
     const queueFlush = (): Promise<void> => {
       writeChain = writeChain.then(flushReady);
       return writeChain;
+    };
+    // Only the contiguous playlist prefix can be written to the staged file, so one slow early
+    // segment lets the other workers accumulate finished segments in `chunks`. Wait for a flush
+    // before fetching more, so retention is bounded by policy instead of by playlist length. The
+    // missing head is always being fetched by its own worker, so waiting here cannot deadlock.
+    const waitForFlush = (): Promise<void> =>
+      new Promise((resolve) => {
+        const wake = (): void => {
+          signal?.removeEventListener("abort", wake);
+          resolve();
+        };
+        flushWaiters.push(wake);
+        signal?.addEventListener("abort", wake, { once: true });
+      });
+    const waitForRetentionBudget = async (): Promise<void> => {
+      while (
+        staged !== undefined &&
+        retainedBytes > this.limits.maxRetainedSegmentBytes &&
+        fatal === undefined &&
+        !signal?.aborted
+      ) {
+        await waitForFlush();
+      }
     };
 
     // Segment workers finish out of order, so progress must count completed attempts instead of
@@ -1164,9 +1218,9 @@ export class DownloadWorker {
     const worker = async (): Promise<void> => {
       for (;;) {
         // Check for abort before fetching next segment
-        if (signal?.aborted) {
-          return;
-        }
+        if (signal?.aborted || fatal !== undefined) return;
+        await waitForRetentionBudget();
+        if (signal?.aborted || fatal !== undefined) return;
 
         const index = nextIndex();
         if (index === undefined) return;
@@ -1181,10 +1235,18 @@ export class DownloadWorker {
             this.deps.fetchImpl,
             descriptor.url,
             { headers: descriptor.requestHeaders, ...(descriptor.range ? { range: descriptor.range } : {}) },
-            { signal },
+            { signal, maxBytes: this.limits.maxSegmentBytes },
           );
         }, signal);
         if (response.tag === "Err") {
+          // An over-ceiling body is not a transient failure and must not be skipped like one: the
+          // saved file would be missing a segment while still reported as complete. Stop instead.
+          if (response.error.kind === "too_large") {
+            fatal =
+              `Segment ${index + 1} of ${annotatedDescriptors.length} exceeds the ` +
+              `${this.limits.maxSegmentBytes} byte in-memory limit; refusing to buffer it`;
+            throw new Error(fatal);
+          }
           failed += 1;
           if (index === 0) throw new Error("Required segment was invalid, aborting download.");
           chunks[index] = null;
@@ -1193,8 +1255,15 @@ export class DownloadWorker {
           continue;
         }
         chunks[index] = response.value.bytes;
+        retainedBytes += response.value.bytes.byteLength;
         fetchedBytes += response.value.bytes.byteLength;
-        if (staged !== undefined) await queueFlush();
+        if (staged !== undefined) {
+          await queueFlush();
+        } else if (fetchedBytes > this.limits.maxUnstagedHlsBytes) {
+          // No staging means every segment stays in RAM for the final concatenate/mux step.
+          fatal = `Playlist output exceeds the ${this.limits.maxUnstagedHlsBytes} byte in-memory limit`;
+          throw new Error(fatal);
+        }
         reportSegmentProgress();
       }
     };
@@ -1206,12 +1275,13 @@ export class DownloadWorker {
       await Promise.all(Array.from({ length: Math.max(1, concurrency) }, () => worker()));
       await writeChain;
     } catch (error) {
+      wakeFlushWaiters();
       if (staged !== undefined) await staged.abort().catch(() => undefined);
       // Check if error was due to abort
       if (signal?.aborted) {
         return err("user_abort");
       }
-      return err(String(error));
+      return err(fatal ?? String(error));
     }
 
     // Final abort check (detect late abort after loop completes)

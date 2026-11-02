@@ -49,7 +49,10 @@ describe("response and manifest limits (review 3.1)", () => {
     })) as never;
     const result = await fetchBytes(fetchImpl, "https://cdn.test/big.m3u8", {}, { maxBytes: 100 });
     expect(result.tag).toBe("Err");
-    if (result.tag === "Err") expect(result.error.message).toMatch(/exceeds/);
+    if (result.tag === "Err") {
+      expect(result.error.message).toMatch(/exceeds/);
+      expect(result.error.kind).toBe("too_large");
+    }
   });
 
   it("rejects absurdly large HLS manifests", () => {
