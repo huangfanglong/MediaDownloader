@@ -67,6 +67,8 @@ import type { PersistentSettings } from "../settings/local.js";
 import { isFlagEnabled, type Behaviours } from "../settings/flags.js";
 import {
   composeContextMenuItems,
+  contextMenuSignature,
+  MEDIA_MENU_PREFIX,
   type ContextMenuItem,
 } from "./context-menu.js";
 import { computeBadge, type BadgeBackgroundColor } from "./badge.js";
@@ -236,6 +238,10 @@ export class MediaDownloaderService {
   private lastBadgeText?: string;
   private lastBadgeBackground?: string;
   private lastBadgeTextColor?: string;
+  /** Last menu projection applied to the browser; undefined until this worker applies one. */
+  private appliedContextMenu: string | undefined;
+  /** Serialises menu rebuilds so a `removeAll`/`create` pair cannot interleave with another. */
+  private contextMenuTail: Promise<void> = Promise.resolve();
   private markReady!: () => void;
 
   constructor(options: ServiceWorkerOptions) {
@@ -293,6 +299,7 @@ export class MediaDownloaderService {
     this.subscribeTabs();
     this.subscribeMessages();
     this.subscribeDownloadNames();
+    this.subscribeContextMenuClicks();
     // On install/update every already-open tab still runs the PREVIOUS extension context's
     // content scripts. Force a fresh injection there so updates do not silently kill detection.
     this.disposers.push(
@@ -329,7 +336,6 @@ export class MediaDownloaderService {
       await this.restoreState();
       await this.headerReplay.clearStaleRules();
       await this.resolveCurrentTab();
-      await this.syncContextMenus();
       await this.publish();
       void this.tabHealing.heal();
       console.info("[media-downloader] service worker ready");
@@ -425,6 +431,7 @@ export class MediaDownloaderService {
       this.lastBadgeTextColor = textColor;
       await this.gateway.action.setBadgeTextColor({ color: textColor }).catch(() => undefined);
     }
+    await this.refreshContextMenu();
     this.refreshKeepAlive();
   }
 
@@ -651,6 +658,33 @@ export class MediaDownloaderService {
         suggest({ filename, conflictAction: "uniquify" });
       }),
     );
+  }
+
+  /**
+   * Context-menu clicks are registered at construction, together with the other listeners: a click
+   * may be the event that starts this worker, so handling it after boot's async work would miss it.
+   */
+  private subscribeContextMenuClicks(): void {
+    this.disposers.push(
+      this.gateway.contextMenus.onClicked((info, tab) => {
+        void this.handleContextMenuClick(info, tab);
+      }),
+    );
+  }
+
+  /** Resolve a clicked media entry (the menu id carries its hash) and start that download. */
+  private async handleContextMenuClick(
+    info: { menuItemId: string | number },
+    tab?: TabInfo,
+  ): Promise<void> {
+    await this.ready;
+    const menuItemId = String(info.menuItemId);
+    const tabId = tab?.id;
+    if (tabId === undefined || !menuItemId.startsWith(MEDIA_MENU_PREFIX)) return;
+    const media = this.engine.mediaForTab(tabId).get(menuItemId.slice(MEDIA_MENU_PREFIX.length));
+    const meta = this.session.discovered.get(tabId)?.meta;
+    if (!media || !meta) return;
+    await this.startDownload({ download_args: undefined as never, media: media as never, meta: meta as never });
   }
 
   /** A stable id shared by a manifest and its sibling direct track (Twitter amplify videos). */
@@ -1714,29 +1748,41 @@ export class MediaDownloaderService {
   // Context menus
   // -------------------------------------------------------------------------
 
-  private async syncContextMenus(): Promise<void> {
-    await this.gateway.contextMenus.removeAll().catch(() => undefined);
+  /** Menu items for the tab whose media the menu lists (none without an active tab). */
+  private contextMenuItems(): ContextMenuItem[] {
     const tabId = this.session.current_win_tab.tab_id;
-    if (tabId === undefined) return;
-    const items = composeContextMenuItems({
+    if (tabId === undefined) return [];
+    return composeContextMenuItems({
       media: this.engine.mediaForTab(tabId),
       meta: this.session.discovered.get(tabId)?.meta,
     });
+  }
+
+  /**
+   * Project the menu (a pure function of the active tab's discovered media) onto the browser.
+   * It is re-derived from every structural publish instead of being built once at boot, when the
+   * in-memory registry is necessarily still empty. Rebuilds are signature-gated and serialised so
+   * concurrent publishes cannot interleave `removeAll`/`create` calls.
+   */
+  private async refreshContextMenu(): Promise<void> {
+    if (contextMenuSignature(this.contextMenuItems()) === this.appliedContextMenu) return;
+    this.contextMenuTail = this.contextMenuTail
+      .then(() => this.applyContextMenu())
+      .catch((error: unknown) => {
+        // Menu APIs must never break state publishing; the next publish retries.
+        console.warn("[media-downloader] context menu refresh failed", error);
+      });
+    await this.contextMenuTail;
+  }
+
+  /** Apply the latest projection; re-reads state so a burst of publishes collapses to the newest. */
+  private async applyContextMenu(): Promise<void> {
+    const items = this.contextMenuItems();
+    const signature = contextMenuSignature(items);
+    if (signature === this.appliedContextMenu) return;
+    await this.gateway.contextMenus.removeAll().catch(() => undefined);
     for (const item of items) this.gateway.contextMenus.create(item as unknown as Record<string, unknown>);
-    this.gateway.contextMenus.onClicked((info, tab) => {
-      const menuItemId = String(info.menuItemId);
-      if (!menuItemId.startsWith("media:") || !tab) return;
-      const hash = menuItemId.slice("media:".length);
-      const media = tab.id !== undefined ? this.engine.mediaForTab(tab.id).get(hash) : undefined;
-      const meta = tab.id !== undefined ? this.session.discovered.get(tab.id)?.meta : undefined;
-      if (media && meta) {
-        void this.startDownload({
-          download_args: undefined as never,
-          media: media as never,
-          meta: meta as never,
-        });
-      }
-    });
+    this.appliedContextMenu = signature;
   }
 }
 

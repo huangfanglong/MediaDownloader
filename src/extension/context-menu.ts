@@ -58,6 +58,16 @@ export function composeContextMenuItems(input: ContextMenuInput): ContextMenuIte
   return items;
 }
 
+/**
+ * Stable fingerprint of a composed menu. The browser menu is only rebuilt when this changes, so a
+ * publish that does not alter what the user can see stays a no-op.
+ */
+export function contextMenuSignature(items: readonly ContextMenuItem[]): string {
+  return items
+    .map((item) => [item.id, item.title, item.enabled === false ? "0" : "1", item.parentId ?? ""].join("\u0000"))
+    .join("\u0001");
+}
+
 function menuTitle(media: MediaItem, meta: TabMeta | undefined, index: number): string {
   const extension = media.extension ?? media.demuxer ?? "media";
   if (!meta) return `Media ${index + 1} (${extension})`;

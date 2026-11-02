@@ -3,7 +3,13 @@ import { DownloadWorker } from "../../src/extension/download-worker.js";
 import { WorkerClient } from "../../src/extension/worker-client.js";
 import { Channel } from "../../src/protocol/channels.js";
 import { MSG } from "../../src/protocol/messages.js";
-import type { BroadcastChannelLike, BrowserGateway, DownloadRequest, Envelope } from "../../src/extension/gateways.js";
+import type {
+  BroadcastChannelLike,
+  BrowserGateway,
+  DownloadRequest,
+  Envelope,
+  TabInfo,
+} from "../../src/extension/gateways.js";
 import type { MediaItem, TabMeta } from "../../src/core/types.js";
 import { createFakeOpfs, createFetch } from "./transfer-fakes.js";
 
@@ -37,6 +43,19 @@ export interface FakeGateway extends BrowserGateway {
   notificationLog: Array<{ id: string; title: string; message: string }>;
   badgeTextLog: string[];
   menuItemLog: Array<Record<string, unknown>>;
+  /** Menu entries the browser would show right now (`removeAll` clears it, like Chrome). */
+  contextMenuItems(): Array<Record<string, unknown>>;
+  contextMenuRebuildCount(): number;
+  contextMenuClickHandlerCount(): number;
+  contextMenuDuplicateIds(): string[];
+  sessionWriteCount(): number;
+  triggerContextMenuClick(
+    info: { menuItemId: string | number },
+    tab?: TabInfo,
+  ): Promise<void>;
+  triggerTabActivated(tabId: number, windowId?: number): void;
+  triggerTabUpdated(tabId: number, info: { url?: string }): void;
+  triggerTabRemoved(tabId: number): void;
   contentSends: Envelope[];
   runtimeHandlerCount(): number;
   webRequestHandlerCount(): number;
@@ -56,6 +75,8 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
   >();
   let lastServiceResponse: unknown;
   const activatedHandlers = new Set<(info: { tabId: number; windowId: number }) => void>();
+  const tabRemovedHandlers = new Set<(tabId: number) => void>();
+  const tabUpdatedHandlers = new Set<(tabId: number, info: { url?: string }) => void>();
   let sendHeadersHandler: ((details: Record<string, unknown>) => void) | undefined;
   let responseStartedHandler: ((details: Record<string, unknown>) => void) | undefined;
   const downloadChanged = new Set<(delta: { id: number; state?: { current: string } }) => void>();
@@ -70,6 +91,12 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
   const dnrRemovals: number[] = [];
   const dnrSessionRules: Array<{ id: number }> = [];
   const menuItems: Array<Record<string, unknown>> = [];
+  const menuClickHandlers = new Set<
+    (info: { menuItemId: string | number }, tab?: TabInfo) => void
+  >();
+  const duplicateMenuIds: string[] = [];
+  let menuRebuilds = 0;
+  let sessionWrites = 0;
   const registeredDownloads = new Map<number, { filename: string }>();
   let nextDownloadId = 1;
 
@@ -106,8 +133,14 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
         windowId: 1,
       }),
       query: async () => [{ id: 7, url: tabUrl, title: "Test Page" }],
-      onRemoved: () => () => undefined,
-      onUpdated: () => () => undefined,
+      onRemoved: (handler) => {
+        tabRemovedHandlers.add(handler);
+        return () => tabRemovedHandlers.delete(handler);
+      },
+      onUpdated: (handler) => {
+        tabUpdatedHandlers.add(handler);
+        return () => tabUpdatedHandlers.delete(handler);
+      },
       onActivated: (handler) => {
         activatedHandlers.add(handler);
         return () => activatedHandlers.delete(handler);
@@ -158,6 +191,7 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
       session: {
         get: async (key) => (session.has(key) ? { [key]: session.get(key) } : {}),
         set: async (record) => {
+          sessionWrites += 1;
           for (const [key, value] of Object.entries(record)) session.set(key, value);
         },
         remove: async (key) => {
@@ -190,10 +224,18 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
     },
     contextMenus: {
       create: (options) => {
+        const id = String(options.id);
+        if (menuItems.some((item) => String(item.id) === id)) duplicateMenuIds.push(id);
         menuItems.push(options);
       },
-      removeAll: async () => undefined,
-      onClicked: () => () => undefined,
+      removeAll: async () => {
+        menuRebuilds += 1;
+        menuItems.length = 0;
+      },
+      onClicked: (handler) => {
+        menuClickHandlers.add(handler);
+        return () => menuClickHandlers.delete(handler);
+      },
     },
     workerBus: {
       openWorkerChannel: () => channelHub.endpoint("service"),
@@ -211,6 +253,20 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
     },
     triggerSendHeaders: (details) => {
       sendHeadersHandler?.(details);
+    },
+    triggerContextMenuClick: async (info, tab) => {
+      for (const handler of menuClickHandlers) handler({ menuItemId: info.menuItemId }, tab);
+      await flush();
+      await flush();
+    },
+    triggerTabActivated: (tabId, windowId = 1) => {
+      for (const handler of activatedHandlers) handler({ tabId, windowId });
+    },
+    triggerTabUpdated: (tabId, info) => {
+      for (const handler of tabUpdatedHandlers) handler(tabId, info);
+    },
+    triggerTabRemoved: (tabId) => {
+      for (const handler of tabRemovedHandlers) handler(tabId);
     },
     deliverToService: async (envelope) => {
       lastServiceResponse = undefined;
@@ -230,6 +286,11 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
     notificationLog: notifications,
     badgeTextLog: badgeTexts,
     menuItemLog: menuItems,
+    contextMenuItems: () => menuItems,
+    contextMenuRebuildCount: () => menuRebuilds,
+    contextMenuClickHandlerCount: () => menuClickHandlers.size,
+    contextMenuDuplicateIds: () => duplicateMenuIds,
+    sessionWriteCount: () => sessionWrites,
     contentSends,
     runtimeHandlerCount: () => runtimeHandlers.size,
     dnrAdds,
