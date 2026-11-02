@@ -188,6 +188,8 @@ export interface ServiceWorkerOptions {
   platform?: PlatformProfile;
   queue?: DownloadQueue;
   workerClient?: WorkerClient;
+  /** Overall transfer deadline in ms; overridable so tests can exercise the expiry path. */
+  transferDeadlineMs?: number;
 }
 
 const createSessionState = (): SessionState => ({
@@ -215,6 +217,7 @@ export class MediaDownloaderService {
   private readonly engine: DiscoveryEngine;
   private readonly queue: DownloadQueue;
   private readonly worker: WorkerClient;
+  private readonly transferDeadlineMs: number;
   private settings: PersistentSettings = createDefaultSettings();
   private session: SessionState = createSessionState();
   private readonly disposers: Array<() => void> = [];
@@ -269,6 +272,7 @@ export class MediaDownloaderService {
     this.now = options.now ?? (() => Date.now());
     this.downloadIdFactory = options.downloadIdFactory ?? (() => `download_${crypto.randomUUID()}`);
     this.opfsRoot = options.opfsRoot ?? openOpfsRoot;
+    this.transferDeadlineMs = options.transferDeadlineMs ?? TRANSFER_DEADLINE_MS;
     this.platform =
       options.platform ??
       detectPlatform({
@@ -1352,6 +1356,21 @@ export class MediaDownloaderService {
     });
     let failure: string | undefined;
     let deadline: ReturnType<typeof setTimeout> | undefined;
+    /**
+     * One timer for the whole transfer, whichever shape it takes. On expiry it aborts the
+     * per-download controller (which stops service-owned range fetches and their staging) and
+     * asks the worker to stop its own download.
+     */
+    const startDeadline = (): Promise<never> =>
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => {
+          console.warn("[media-downloader] transfer deadline exceeded; aborting");
+          this.transferAborts.get(plan.download_id)?.abort();
+          this.worker.cancel(plan.download_id);
+          this.worker.abort(plan.download_id);
+          reject(new Error("transfer timed out"));
+        }, this.transferDeadlineMs);
+      });
     try {
       if (
         plan.is_youtube &&
@@ -1359,24 +1378,19 @@ export class MediaDownloaderService {
         !/^(m3u8|mpd)_/u.test(plan.strategy) &&
         isRangeBoundCdn(plan.url)
       ) {
-        const ranged = await this.rangedDownloadThroughWorker(plan, signal);
+        const ranged = await Promise.race([
+          this.rangedDownloadThroughWorker(plan, signal),
+          startDeadline(),
+        ]);
         if (isErr(ranged)) {
           failure = ranged.error;
         } else {
           outcome = ranged.value;
         }
       } else {
-        const timeout = new Promise<never>((_, reject) => {
-          deadline = setTimeout(() => {
-            console.warn("[media-downloader] transfer deadline exceeded; aborting");
-            this.worker.cancel(plan.download_id);
-            this.worker.abort(plan.download_id);
-            reject(new Error("transfer timed out"));
-          }, TRANSFER_DEADLINE_MS);
-        });
         outcome = await Promise.race([
           this.worker.download(plan, (progress) => this.onProgress(plan.download_id, progress)),
-          timeout,
+          startDeadline(),
         ]);
       }
     } catch (error) {
@@ -1402,7 +1416,11 @@ export class MediaDownloaderService {
     });
 
     if (failure !== undefined && !userAborted()) {
+      // A deadline is the whole transfer's budget: restarting the same stalled transfer through
+      // the page context would only grant it another window. Other failures keep the relay retry.
+      const timedOut = failure === "transfer timed out";
       const retryThroughPage =
+        !timedOut &&
         meta.tab_id !== undefined &&
         (plan.is_youtube || /http (401|403|416)/u.test(failure));
       if (retryThroughPage) {
