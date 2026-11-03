@@ -68,6 +68,8 @@ export interface MediaStreamRequestData {
 export interface MediaStreamChunkData {
   request_id: string;
   data: string;
+  /** Complete media size when the page has verified it from the URL or response headers. */
+  total?: number;
 }
 
 /** Verdict the service returns for a relayed chunk; false stops the page fetch. */

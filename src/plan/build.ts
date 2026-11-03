@@ -21,6 +21,7 @@ import { err, ok, type Result } from "../core/option.js";
 import type { DownloadPlan, MediaItem, TabMeta } from "../core/types.js";
 import { renderBasename } from "../naming/render.js";
 import { normalizeSubdir } from "../naming/safe-path.js";
+import { declaredSize } from "../transfer/declared-size.js";
 import {
   VIDEO_DEMUXERS,
   chooseStrategy,
@@ -204,7 +205,12 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
           : libavDemuxer !== undefined && VIDEO_CONTAINERS.has(libavDemuxer)
             ? extensionForDemuxer(libavDemuxer, input.preferredAvMuxer)
             : input.preferredAvMuxer;
-    const sizeField = entry.size === undefined ? {} : { size: entry.size };
+    const videoSize = entry.size ?? declaredSize(video);
+    const audioSize = entry.av?.audio !== undefined && entry.av.audio !== false
+      ? declaredSize(entry.av.audio)
+      : undefined;
+    const sizeField = videoSize === undefined ? {} : { size: videoSize };
+    const audioSizeField = audioSize === undefined ? {} : { audio_content_length: audioSize };
     if (canJsFetch) {
       const audio = entry.av?.audio;
       if (audio !== undefined && audio !== false) {
@@ -218,6 +224,7 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
           muxer: jsFetchContainer,
           source_demuxer: sourceDemuxer,
           ...sizeField,
+          ...audioSizeField,
           ...(media.duration === undefined ? {} : { duration: media.duration }),
         });
       }
@@ -243,6 +250,7 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
       muxer: extension,
       source_demuxer: sourceDemuxer,
       ...sizeField,
+      ...audioSizeField,
     });
   }
 
@@ -252,7 +260,11 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
     const av = selected.entry.av;
     if (av === undefined) return err("youtube format is missing its av sources");
     const subtitles = selectSubtitleTrack(media.subtitles, input.subtitleLanguages);
-    const contentLength = selected.entry.size;
+    const contentLength =
+      av.video !== false
+        ? selected.entry.size ?? declaredSize(av.video)
+        : selected.entry.size ?? (av.audio !== false ? declaredSize(av.audio) : undefined);
+    const audioContentLength = av.audio !== false ? declaredSize(av.audio) : undefined;
     const durationField = media.duration === undefined ? {} : { duration: media.duration };
     const audioLanguageField =
       selected.entry.audio_language === undefined ? {} : { audio_language: selected.entry.audio_language };
@@ -273,6 +285,7 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
       });
     }
     if (input.audioOnly) {
+      const audioOnlySize = av.audio !== false ? declaredSize(av.audio) : contentLength;
       return ok<DownloadPlan>({
         ...base,
         will_use_jsfetch: false,
@@ -282,7 +295,7 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
         extension: "mp3",
         ...durationField,
         ...audioLanguageField,
-        ...contentLengthField,
+        ...(audioOnlySize === undefined ? {} : { content_length: audioOnlySize }),
       });
     }
     const container = extensionForDemuxer(selected.entry.demuxer, input.preferredAvMuxer);
@@ -298,7 +311,7 @@ export function buildPlan(input: BuildPlanInput): Result<DownloadPlan, string> {
         ...durationField,
         ...audioLanguageField,
         ...contentLengthField,
-        ...(contentLength === undefined ? {} : { audio_content_length: contentLength }),
+        ...(audioContentLength === undefined ? {} : { audio_content_length: audioContentLength }),
         ...(subtitles === undefined ? {} : { subtitles }),
       });
     }

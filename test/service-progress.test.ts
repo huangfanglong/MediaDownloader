@@ -132,6 +132,24 @@ describe("service-side progress rate limiting", () => {
     service.stop();
   });
 
+  it("accepts the first determinate update after unknown byte progress", async () => {
+    const nowRef = { value: 2_500_000 };
+    const { service, session, progress } = createService(nowRef);
+    session.downloading.set("download_known", downloadingEntry("download_known"));
+
+    progress("download_known", { status: "downloading", fetched_bytes_count: 1_000 });
+    nowRef.value += 100;
+    progress("download_known", {
+      status: "downloading",
+      fetched_bytes_count: 2_000,
+      percent: { is_known: true, value: 25 },
+    });
+
+    expect(session.downloading.get("download_known")?.percent).toBe(25);
+    await flush();
+    service.stop();
+  });
+
   it("throttles each download independently", async () => {
     const nowRef = { value: 3_000_000 };
     const { service, session, progress } = createService(nowRef);

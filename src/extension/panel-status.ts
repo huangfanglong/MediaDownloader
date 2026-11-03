@@ -14,7 +14,7 @@ export interface StatusPresentation {
   tone: StatusTone;
   label: string;
   detail?: string;
-  /** 0..100 for a determinate progress bar; absent for indeterminate/idle states. */
+  /** 0..100 for a determinate progress bar; absent when the total size is unknown. */
   percent?: number;
 }
 

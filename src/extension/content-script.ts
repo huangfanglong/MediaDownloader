@@ -308,7 +308,7 @@ export async function handleMediaStreamRequest(
     } catch {
       declared = undefined;
     }
-    /** Complete size declared by `Content-Range`, used when the URL itself carries no `clen`. */
+    /** Complete size declared by response metadata, used when the URL itself carries no `clen`. */
     let rangeTotal: number | undefined;
     for (let attempt = 0; attempt < 20000; attempt += 1) {
       const end = offset + RANGE_BYTES - 1;
@@ -368,12 +368,20 @@ export async function handleMediaStreamRequest(
       });
       if (verdict.tag === "Err") throw new Error(`range response rejected: ${verdict.reason}`);
       if (verdict.kind === "range" && verdict.total !== undefined) rangeTotal = verdict.total;
+      if (verdict.kind === "whole-object" && contentLength !== undefined && contentLength > 0) {
+        rangeTotal = contentLength;
+      }
+      const knownTotal = declared ?? rangeTotal;
       for (let inner = 0; inner < value.length; inner += MESSAGE_CHUNK_BYTES) {
         const slice = value.subarray(inner, Math.min(inner + MESSAGE_CHUNK_BYTES, value.length));
         const sent = await sendRelay({
           msg: {
             name: RELAY_MESSAGES.MediaStreamChunk,
-            data: { request_id: data.request_id, data: bytesToBase64(slice) },
+            data: {
+              request_id: data.request_id,
+              data: bytesToBase64(slice),
+              ...(knownTotal === undefined ? {} : { total: knownTotal }),
+            },
           },
           channel: Channel.FromInjectedToService,
         });

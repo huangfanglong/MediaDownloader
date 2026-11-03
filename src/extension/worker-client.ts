@@ -123,18 +123,25 @@ export class WorkerClient {
   }
 
   /** Page-context relay: the worker stages chunks forwarded by the service worker. */
-  async streamDownload(plan: DownloadPlan): Promise<TransferOutcome> {
+  async streamDownload(
+    plan: DownloadPlan,
+    onProgress?: (progress: DownloadProgress) => void,
+  ): Promise<TransferOutcome> {
     await this.ensureReady();
     const completion = new Promise<TransferOutcome>((resolve, reject) => {
-      this.pending.set(plan.download_id, { resolve, reject });
+      this.pending.set(plan.download_id, { resolve, reject, onProgress });
     });
     this.post(RELAY_MESSAGES.WorkerRelayStart, { download_args: encode(plan) });
     return completion;
   }
 
   /** Forward one relayed body chunk to the worker. */
-  sendRelayChunk(downloadId: string, chunk: Uint8Array): void {
-    this.post(RELAY_MESSAGES.WorkerRelayChunk, { download_id: downloadId, data: chunk });
+  sendRelayChunk(downloadId: string, chunk: Uint8Array, totalBytes?: number): void {
+    this.post(RELAY_MESSAGES.WorkerRelayChunk, {
+      download_id: downloadId,
+      data: chunk,
+      ...(totalBytes === undefined ? {} : { total_bytes: totalBytes }),
+    });
   }
 
   endRelay(downloadId: string): void {

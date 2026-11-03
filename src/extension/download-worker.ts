@@ -46,7 +46,7 @@ import {
   type FfmpegJob,
   type FfmpegRunnerLike,
 } from "../transfer/ffmpeg.js";
-import { fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
+import { declaredSize, fetchRanged, isRangeBoundCdn } from "../transfer/ranged.js";
 import { endingReasonToMessage } from "../transfer/save.js";
 import { muxFragmentedMp4ToSink } from "../transfer/mux-fmp4.js";
 import { normalizeMediaOutputExtension } from "../transfer/sniff.js";
@@ -90,6 +90,7 @@ export interface DownloadWorkerDeps {
 interface ActiveDownload {
   controller: AbortController;
   lastProgressAt: number;
+  lastProgressWasKnown?: boolean;
 }
 
 /** A finished staged file plus the metadata the transfer paths need. */
@@ -111,11 +112,18 @@ interface ConversionInput {
   cleanup: () => Promise<void>;
 }
 
+type TrackProgress = (fetchedBytes: number, totalBytes?: number) => void;
+
 export class DownloadWorker {
   private readonly deps: DownloadWorkerDeps;
   private readonly active = new Map<string, ActiveDownload>();
   /** In-progress page-relay transfers (chunks streamed from a content script). */
-  private readonly relay = new Map<string, { staged: StagedFile; plan: DownloadPlan; bytes: number }>();
+  private readonly relay = new Map<string, {
+    staged: StagedFile;
+    plan: DownloadPlan;
+    bytes: number;
+    totalBytes?: number;
+  }>();
   private readonly now: () => number;
   private readonly limits: TransferLimits;
 
@@ -242,17 +250,21 @@ export class DownloadWorker {
   }
 
   private async onRelayChunk(raw: unknown): Promise<void> {
-    const payload = raw as { download_id?: string; data?: unknown };
+    const payload = raw as { download_id?: string; data?: unknown; total_bytes?: unknown };
     if (payload.download_id === undefined) return;
     const entry = this.relay.get(payload.download_id);
     if (!entry) return;
     const chunk = payload.data instanceof Uint8Array ? payload.data : new Uint8Array(payload.data as ArrayBufferLike);
     await entry.staged.append(chunk);
     entry.bytes += chunk.byteLength;
+    if (typeof payload.total_bytes === "number" && Number.isFinite(payload.total_bytes) && payload.total_bytes > 0) {
+      entry.totalBytes = payload.total_bytes;
+    }
+    const percent = percentFromBytes(entry.bytes, entry.totalBytes, IN_PROGRESS_PERCENT_MAX);
     this.emitProgress(payload.download_id, {
       status: "downloading",
       fetched_bytes_count: entry.bytes,
-      percent: { is_known: false, value: 0 },
+      ...(percent === undefined ? {} : { percent: { is_known: true, value: percent } }),
     });
   }
 
@@ -319,10 +331,12 @@ export class DownloadWorker {
     url: URL,
     headers: Headers,
     signal?: AbortSignal,
+    onProgress?: TrackProgress,
   ): Promise<Result<Uint8Array, string>> {
     if (isRangeBoundCdn(url)) {
       const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, {
         signal,
+        onBytes: (fetched, total) => onProgress?.(fetched, total),
         maxBytes: this.limits.maxTrackBytes,
       });
       if (ranged.tag === "Err") {
@@ -335,7 +349,16 @@ export class DownloadWorker {
       this.deps.fetchImpl,
       url.href,
       { headers },
-      { signal, maxBytes: this.limits.maxTrackBytes },
+      {
+        signal,
+        maxBytes: this.limits.maxTrackBytes,
+        onTotalSize: (total) => {
+          onProgress?.(0, total);
+        },
+        onBytes: (fetchedBytes, total) => {
+          onProgress?.(fetchedBytes, total ?? declaredSize(url));
+        },
+      },
     );
     if (fetched.tag === "Err") {
       const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
@@ -369,8 +392,9 @@ export class DownloadWorker {
     let extension = sourceExtension;
     let staged: StagedFile | undefined;
     let total = 0;
-    let totalSize = plan.size !== undefined && Number.isFinite(plan.size) && plan.size > 0
-      ? plan.size
+    const plannedSize = plan.size ?? plan.content_length;
+    let totalSize = plannedSize !== undefined && Number.isFinite(plannedSize) && plannedSize > 0
+      ? plannedSize
       : undefined;
     const downloadingProgress = (fetchedBytes: number): DownloadProgress => {
       const percent = percentFromBytes(fetchedBytes, totalSize);
@@ -479,6 +503,7 @@ export class DownloadWorker {
     headers: Headers,
     signal: AbortSignal | undefined,
     nameBase: string,
+    onProgress?: TrackProgress,
   ): Promise<Result<StagedTransfer, string>> {
     const extension = extensionForUrl(url) ?? "bin";
     let staged: StagedFile;
@@ -488,20 +513,42 @@ export class DownloadWorker {
       return err(String(error));
     }
     let total = 0;
+    let totalSize: number | undefined;
     const onChunk = async (chunk: Uint8Array): Promise<void> => {
       await staged.append(chunk);
       total += chunk.byteLength;
     };
     try {
       if (isRangeBoundCdn(url)) {
-        const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, { signal, onChunk });
+        const ranged = await fetchRanged(this.deps.fetchImpl, url, headers, {
+          signal,
+          onChunk,
+          onBytes: (fetched, reportedTotal) => {
+            totalSize = reportedTotal;
+            onProgress?.(fetched, totalSize);
+          },
+        });
         if (ranged.tag === "Err") {
           await staged.abort();
           const status = ranged.error.status !== undefined ? ` ${ranged.error.status}` : "";
           return err(`ranged ${ranged.error.kind}${status}: ${ranged.error.message ?? "download failed"}`);
         }
       } else {
-        const fetched = await fetchBytes(this.deps.fetchImpl, url.href, { headers }, { signal, onChunk });
+        const fetched = await fetchBytes(
+          this.deps.fetchImpl,
+          url.href,
+          { headers },
+          {
+            signal,
+            onChunk: async (chunk) => {
+              await onChunk(chunk);
+              onProgress?.(total, totalSize);
+            },
+            onTotalSize: (reportedTotal) => {
+              totalSize = reportedTotal;
+            },
+          },
+        );
         if (fetched.tag === "Err") {
           await staged.abort();
           const status = fetched.error.status !== undefined ? ` ${fetched.error.status}` : "";
@@ -626,6 +673,29 @@ export class DownloadWorker {
     let conversionInput: ConversionInput | undefined;
 
     if (plan.url_audio) {
+      const fetchedSources = [0, 0];
+      const totalSources = [
+        plan.content_length ?? plan.size ?? declaredSize(plan.url),
+        plan.audio_content_length ?? declaredSize(plan.url_audio),
+      ];
+      const reportSourceProgress = (
+        sourceIndex: number,
+        activeSources: readonly number[] = [0, 1],
+      ): TrackProgress =>
+        (fetched, total) => {
+          fetchedSources[sourceIndex] = fetched;
+          if (total !== undefined) totalSources[sourceIndex] = total;
+          const fetchedBytes = activeSources.reduce((sum, index) => sum + fetchedSources[index]!, 0);
+          const totalBytes = activeSources.every((index) => totalSources[index] !== undefined)
+            ? activeSources.reduce((sum, index) => sum + totalSources[index]!, 0)
+            : undefined;
+          const percent = percentFromBytes(fetchedBytes, totalBytes, IN_PROGRESS_PERCENT_MAX);
+          this.emitProgress(plan.download_id, {
+            status: "downloading",
+            fetched_bytes_count: fetchedBytes,
+            ...(percent === undefined ? {} : { percent: { is_known: true, value: percent } }),
+          });
+        };
       const ffmpeg = this.deps.ffmpeg;
       if (!isHlsStrategy(plan.strategy)) {
         // Direct adaptive tracks (YouTube and similar): stream both tracks to OPFS, then merge
@@ -636,9 +706,9 @@ export class DownloadWorker {
           if (target === "mp3") return err("ffmpeg unavailable: audio extraction unsupported");
           // No FFmpeg: fetch both tracks and merge them into a staged file with the in-memory
           // fMP4 muxer (fragmented MP4 inputs only); the merged file is never buffered whole.
-          const videoBytes = await this.fetchSourceBytes(plan.url, headers, signal);
+          const videoBytes = await this.fetchSourceBytes(plan.url, headers, signal, reportSourceProgress(0));
           if (videoBytes.tag === "Err") return videoBytes;
-          const audioBytes = await this.fetchSourceBytes(plan.url_audio, headers, signal);
+          const audioBytes = await this.fetchSourceBytes(plan.url_audio, headers, signal, reportSourceProgress(1));
           if (audioBytes.tag === "Err") return audioBytes;
           const muxed = await this.muxStagedTracks(root, plan, videoBytes.value, audioBytes.value);
           if (muxed.tag === "Err") return muxed;
@@ -656,6 +726,7 @@ export class DownloadWorker {
             headers,
             signal,
             `${plan.download_id}-audio`,
+            reportSourceProgress(1, [1]),
           );
           if (audioStaged.tag === "Err") return audioStaged;
           try {
@@ -686,6 +757,7 @@ export class DownloadWorker {
             headers,
             signal,
             `${plan.download_id}-video`,
+            reportSourceProgress(0),
           );
           if (videoStaged.tag === "Err") return videoStaged;
           const audioStaged = await this.stageSourceTrack(
@@ -694,6 +766,7 @@ export class DownloadWorker {
             headers,
             signal,
             `${plan.download_id}-audio`,
+            reportSourceProgress(1),
           );
           if (audioStaged.tag === "Err") {
             await this.cleanupStagedTransfer(root, videoStaged.value);
@@ -1433,8 +1506,16 @@ export class DownloadWorker {
     const state = this.active.get(downloadId);
     if (state) {
       const now = this.now();
-      if (progress.status === "downloading" && now - state.lastProgressAt < PROGRESS_INTERVAL_MS) return;
+      const progressIsKnown = progress.percent?.is_known === true;
+      if (
+        progress.status === "downloading" &&
+        now - state.lastProgressAt < PROGRESS_INTERVAL_MS &&
+        !(progressIsKnown && state.lastProgressWasKnown !== true)
+      ) {
+        return;
+      }
       state.lastProgressAt = now;
+      if (progress.status === "downloading") state.lastProgressWasKnown = progressIsKnown;
     }
     this.post(
       MSG.worker.DownloadProgress,

@@ -386,6 +386,52 @@ describe("buildPlan — (c) MPD audio+video", () => {
 });
 
 describe("buildPlan — adaptive fMP4 pair (YouTube regression)", () => {
+  it("carries the declared byte size for each adaptive track into the plan", () => {
+    const base = httpMediaItem({ withAudio: true, byteRanges: true });
+    const media: MediaItem = {
+      ...base,
+      playlist: [
+        {
+          ...base.playlist![0]!,
+          size: undefined,
+          av: {
+            video: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=137&clen=4000"),
+            audio: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=140&clen=1000"),
+          },
+        },
+      ],
+    };
+
+    const plan = expectOk(buildPlan(baseInput(media)));
+
+    expect(plan.size).toBe(4000);
+    expect(plan.audio_content_length).toBe(1000);
+  });
+
+  it("uses the selected audio track size for an audio-only download", () => {
+    const base = httpMediaItem({ withAudio: true, byteRanges: true });
+    const media: MediaItem = {
+      ...base,
+      type: "youtube_format",
+      is_youtube: true,
+      playlist: [
+        {
+          ...base.playlist![0]!,
+          size: 4000,
+          av: {
+            video: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=137&clen=4000"),
+            audio: new URL("https://rr1---sn-x.googlevideo.com/videoplayback?itag=140&clen=1000"),
+          },
+        },
+      ],
+    };
+
+    const plan = expectOk(buildPlan(baseInput(media, { audioOnly: true })));
+
+    expect(plan.url.href).toContain("itag=140");
+    expect(plan.content_length).toBe(1000);
+  });
+
   it("routes a WebM video with AAC audio through MKV so both streams are copied", () => {
     const base = httpMediaItem({ withAudio: true, byteRanges: true });
     const media: typeof base = {

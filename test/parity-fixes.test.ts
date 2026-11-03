@@ -374,14 +374,16 @@ describe("direct CDN transfers (live YouTube regression)", () => {
   });
 
   it.each([
-    { label: "plan size", planSize: 4000, responseHeaders: undefined },
-    { label: "Content-Length", planSize: undefined, responseHeaders: new Headers({ "content-length": "4000" }) },
+    { label: "plan size", planSize: 4000, contentLength: undefined, responseHeaders: undefined },
+    { label: "plan content_length", planSize: undefined, contentLength: 4000, responseHeaders: undefined },
+    { label: "Content-Length", planSize: undefined, contentLength: undefined, responseHeaders: new Headers({ "content-length": "4000" }) },
     {
       label: "Content-Range total",
       planSize: undefined,
+      contentLength: undefined,
       responseHeaders: new Headers({ "content-length": "2000", "content-range": "bytes 0-1999/4000" }),
     },
-  ])("reports direct-download percentage from $label", async ({ planSize, responseHeaders }) => {
+  ])("reports direct-download percentage from $label", async ({ planSize, contentLength, responseHeaders }) => {
     const progress: Array<Record<string, unknown>> = [];
     const channel: BroadcastChannelLike = {
       ...noopChannel(),
@@ -414,6 +416,7 @@ describe("direct CDN transfers (live YouTube regression)", () => {
       ...planFor("http_audio_video_one_source"),
       url: new URL("https://cdn.test/progress.mp4"),
       ...(planSize !== undefined ? { size: planSize } : {}),
+      ...(contentLength !== undefined ? { content_length: contentLength } : {}),
     });
     expect(result.tag).toBe("Ok");
     expect(progress).toContainEqual({

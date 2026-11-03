@@ -403,6 +403,23 @@ describe("fetchBytes (E12)", () => {
     expect(result).toEqual(ok({ bytes: bytes(1, 2, 3), status: 200 }));
   });
 
+  it("reports byte counts while retaining the fetched body", async () => {
+    const response = {
+      ...chunkedBody([bytes(1, 2), bytes(3)]),
+      headers: new Headers({ "content-length": "3" }),
+    };
+    const progress: Array<[number, number | undefined]> = [];
+    const result = await fetchBytes(
+      fakeFetch(response),
+      "https://x/",
+      {},
+      { onBytes: (fetched, total) => progress.push([fetched, total]) },
+    );
+
+    expect(result).toEqual(ok({ bytes: bytes(1, 2, 3), status: 200, headers: response.headers }));
+    expect(progress).toEqual([[2, 3], [3, 3]]);
+  });
+
   it("passes chunks to a sink without concatenating them", async () => {
     const chunks: Uint8Array[] = [];
     const result = await fetchBytes(

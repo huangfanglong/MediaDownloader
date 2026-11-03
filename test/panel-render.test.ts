@@ -101,6 +101,29 @@ describe("panel DOM boundary", () => {
     vi.useRealTimers();
   });
 
+  it("shows a determinate track when the snapshot includes a percentage", async () => {
+    const panel = await bootPanel();
+    deliver(
+      panel,
+      snapshot({ downloading: [{ download_id: "download_known", status: "downloading", percent: 42 }] }),
+    );
+
+    const track = document.getElementById("status-track") as HTMLElement;
+    const fill = document.getElementById("status-fill") as HTMLElement;
+    expect(track.hidden).toBe(false);
+    expect(track.getAttribute("aria-valuenow")).toBe("42");
+    expect(fill.style.width).toBe("42%");
+    vi.useRealTimers();
+  });
+
+  it("keeps the progress track hidden while the transfer total is unknown", async () => {
+    const panel = await bootPanel();
+    deliver(panel, snapshot({ downloading: [{ download_id: "download_unknown", status: "downloading" }] }));
+
+    expect((document.getElementById("status-track") as HTMLElement).hidden).toBe(true);
+    vi.useRealTimers();
+  });
+
   it("stops measuring page quality after a bounded number of attempts", async () => {
     const panel = await bootPanel();
     panel.executeScript.mockClear();

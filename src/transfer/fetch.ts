@@ -327,6 +327,8 @@ export interface FetchBytesOptions {
   onChunk?: (chunk: Uint8Array) => void | Promise<void>;
   /** Full response size from Content-Range or Content-Length, before body streaming begins. */
   onTotalSize?: (totalBytes: number) => void;
+  /** Bytes accepted from the response body, reported after each chunk is read. */
+  onBytes?: (fetchedBytes: number, totalBytes?: number) => void;
 }
 
 /** A combined signal plus the cleanup that releases the listeners it attached to its parents. */
@@ -468,6 +470,7 @@ async function fetchBytesAttempt(
         }
         if (options.onChunk !== undefined) await options.onChunk(value);
         else chunks.push(value);
+        options.onBytes?.(total, totalBytes);
       }
     }
     completed = true;

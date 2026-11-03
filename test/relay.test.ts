@@ -52,8 +52,37 @@ describe("page-context relay (content script)", () => {
     expect(chunks).toHaveLength(1);
     const payload = chunks[0]?.msg.data as { data: string };
     expect(payload.data).toBe(bytesToBase64(body));
+    expect((chunks[0]?.msg.data as { total?: number }).total).toBeUndefined();
     expect(sent.at(-1)?.msg.name).toBe(RELAY_MESSAGES.MediaStreamEnd);
     expect((sent.at(-1)?.msg.data as { total: number }).total).toBe(1200);
+  });
+
+  it("includes the URL-declared total with relayed media chunks", async () => {
+    const body = new Uint8Array(1200).fill(7);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 206,
+        arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+      })),
+    );
+    const sent: Array<{ msg: { name: string; data: unknown } }> = [];
+    const runtime = {
+      sendMessage: async (message: { msg: { name: string; data: unknown } }) => {
+        sent.push(message);
+        return { accepted: true };
+      },
+      onMessage: { addListener: () => undefined, removeListener: () => undefined },
+    };
+
+    await handleMediaStreamRequest(runtime as never, {
+      request_id: "r-known-total",
+      url: "https://cdn.test/videoplayback?clen=1200",
+    });
+
+    const chunk = sent.find((message) => message.msg.name === RELAY_MESSAGES.MediaStreamChunk);
+    expect((chunk?.msg.data as { total?: number }).total).toBe(1200);
   });
 
   it("reports a short relay body instead of finishing the relay", async () => {

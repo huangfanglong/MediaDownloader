@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { muxFragmentedMp4, muxFragmentedMp4ToSink, readBoxes } from "../src/transfer/mux-fmp4.js";
 import { FfmpegInputTooLargeError } from "../src/transfer/ffmpeg.js";
 import { DownloadWorker } from "../src/extension/download-worker.js";
-import type { DownloadPlan } from "../src/core/types.js";
+import type { DownloadPlan, DownloadProgress } from "../src/core/types.js";
 import type { BroadcastChannelLike } from "../src/extension/gateways.js";
+import { encode } from "../src/protocol/serde.js";
 import { createFakeOpfs, createFetch, createRangedFetch } from "./helpers/transfer-fakes.js";
 import { createStagedFile } from "../src/extension/staging.js";
 
@@ -182,6 +183,197 @@ describe("fMP4 muxer staging sink", () => {
 });
 
 describe("worker direct two-source muxing", () => {
+  it("keeps the first determinate update when it arrives inside the throttle window", () => {
+    const progress: DownloadProgress[] = [];
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: (message) => {
+          const data = (message as { msg?: { name?: string; data?: { progress?: DownloadProgress } } }).msg;
+          if (data?.name === "download_progress" && data.data?.progress !== undefined) {
+            progress.push(data.data.progress);
+          }
+        },
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      },
+      fetchImpl: createFetch(new Map()),
+      openRoot: async () => createFakeOpfs().root,
+      now: () => 1_000,
+    });
+    const internal = worker as unknown as {
+      active: Map<string, { controller: AbortController; lastProgressAt: number }>;
+      emitProgress(downloadId: string, update: DownloadProgress): void;
+    };
+    internal.active.set("download_progress_transition", {
+      controller: new AbortController(),
+      lastProgressAt: 0,
+    });
+
+    internal.emitProgress("download_progress_transition", {
+      status: "downloading",
+      fetched_bytes_count: 1_000,
+    });
+    internal.emitProgress("download_progress_transition", {
+      status: "downloading",
+      fetched_bytes_count: 2_000,
+      percent: { is_known: true, value: 25 },
+    });
+    internal.emitProgress("download_progress_transition", {
+      status: "downloading",
+      fetched_bytes_count: 3_000,
+      percent: { is_known: true, value: 50 },
+    });
+
+    expect(progress).toHaveLength(2);
+    expect(progress[1]?.percent).toEqual({ is_known: true, value: 25 });
+  });
+
+  it("reports aggregate source progress before finalizing an adaptive download", async () => {
+    const video = fragmentedTrack(1, [0, 1000, 2000]);
+    const audio = fragmentedTrack(1, [0, 1024, 2048]);
+    const videoUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=137&clen=${video.byteLength}`;
+    const audioUrl = `https://rr1---sn-x.googlevideo.com/videoplayback?itag=140&clen=${audio.byteLength}`;
+    const progress: DownloadProgress[] = [];
+    const { root } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: (message) => {
+          const data = (message as { msg?: { name?: string; data?: { progress?: DownloadProgress } } }).msg;
+          if (data?.name === "download_progress" && data.data?.progress !== undefined) {
+            progress.push(data.data.progress);
+          }
+        },
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      },
+      fetchImpl: createRangedFetch(new Map([[videoUrl, video], [audioUrl, audio]])),
+      openRoot: async () => root,
+      ffmpeg: { run: async () => new Uint8Array(2_048) } as never,
+    });
+
+    const result = await worker.runPlan({
+      download_id: "download_two_source_progress",
+      headers: new Headers(),
+      good_basename: "two-source-progress",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "youtube_audio_video_two_sources",
+      url: new URL(videoUrl),
+      url_audio: new URL(audioUrl),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      is_youtube: true,
+      throttle: false,
+      cache: "default",
+      content_length: video.byteLength,
+      audio_content_length: audio.byteLength,
+    });
+
+    expect(result.tag).toBe("Ok");
+    expect(progress).toContainEqual({
+      status: "downloading",
+      fetched_bytes_count: video.byteLength + audio.byteLength,
+      percent: { is_known: true, value: 99 },
+    });
+    expect(progress.at(-1)?.status).toBe("finalizing");
+  });
+
+  it("preserves the fetched tracks when reporting progress without FFmpeg", async () => {
+    const video = fragmentedTrack(1, [0, 1000, 2000]);
+    const audio = fragmentedTrack(1, [0, 1024, 2048]);
+    const videoUrl = "https://cdn.test/adaptive-video.mp4";
+    const audioUrl = "https://cdn.test/adaptive-audio.mp4";
+    const progress: DownloadProgress[] = [];
+    const { root, files } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: (message) => {
+          const data = (message as { msg?: { name?: string; data?: { progress?: DownloadProgress } } }).msg;
+          if (data?.name === "download_progress" && data.data?.progress !== undefined) {
+            progress.push(data.data.progress);
+          }
+        },
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      },
+      fetchImpl: createFetch(new Map([[videoUrl, video], [audioUrl, audio]])),
+      openRoot: async () => root,
+    });
+
+    const result = await worker.runPlan({
+      download_id: "download_two_source_no_ffmpeg",
+      headers: new Headers(),
+      good_basename: "two-source-no-ffmpeg",
+      subdir: "",
+      save_as: false,
+      will_use_jsfetch: false,
+      strategy: "youtube_audio_video_two_sources",
+      url: new URL(videoUrl),
+      url_audio: new URL(audioUrl),
+      carry_get_params: false,
+      extension: "mp4",
+      muxer: "mp4",
+      is_youtube: true,
+      throttle: false,
+      cache: "default",
+      content_length: video.byteLength,
+      audio_content_length: audio.byteLength,
+    });
+
+    expect(result.tag).toBe("Ok");
+    const expected = await muxFragmentedMp4(video, audio);
+    expect(expected).toBeDefined();
+    expect(files.get("download_two_source_no_ffmpeg.mp4")?.reduce((sum, chunk) => sum + chunk.byteLength, 0)).toBe(
+      expected?.byteLength,
+    );
+    expect(progress.some((update) => update.percent?.is_known === true)).toBe(true);
+  });
+
+  it("reports a determinate percentage for relayed chunks with a known total", async () => {
+    const progress: DownloadProgress[] = [];
+    const { root } = createFakeOpfs();
+    const worker = new DownloadWorker({
+      channel: {
+        postMessage: (message) => {
+          const data = (message as { msg?: { name?: string; data?: { progress?: DownloadProgress } } }).msg;
+          if (data?.name === "download_progress" && data.data?.progress !== undefined) {
+            progress.push(data.data.progress);
+          }
+        },
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        close: () => undefined,
+      },
+      fetchImpl: createFetch(new Map()),
+      openRoot: async () => root,
+    });
+    const internal = worker as unknown as {
+      onRelayStart(raw: unknown): Promise<void>;
+      onRelayChunk(raw: unknown): Promise<void>;
+    };
+    const plan = {
+      download_id: "download_relay_progress",
+      extension: "mp4",
+    };
+    await internal.onRelayStart({ download_args: encode(plan) });
+    await internal.onRelayChunk({
+      download_id: plan.download_id,
+      data: new Uint8Array(1_000),
+      total_bytes: 2_000,
+    });
+
+    expect(progress.at(-1)).toEqual({
+      status: "downloading",
+      fetched_bytes_count: 1_000,
+      percent: { is_known: true, value: 50 },
+    });
+  });
+
   it("downloads the adaptive video and audio tracks and stages one muxed file", async () => {
     const video = fragmentedTrack(1, [0, 1000, 2000]);
     const audio = fragmentedTrack(1, [0, 1024, 2048]);

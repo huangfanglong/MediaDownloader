@@ -239,6 +239,8 @@ export class MediaDownloaderService {
   private readonly publisher: SessionPublisher;
   /** Last accepted progress update per download (the 2 Hz contract in core/types.ts). */
   private readonly lastProgressEmitAt = new Map<string, number>();
+  /** Whether the last accepted worker update carried a determinate percentage. */
+  private readonly lastProgressWasKnown = new Map<string, boolean>();
   /** Page-relay request id -> download id (review: protected CDNs). */
   private readonly relayRequests = new Map<string, { downloadId: string }>();
   /** Downloads the user cancelled; their relay teardown is not a transfer failure. */
@@ -624,14 +626,22 @@ export class MediaDownloaderService {
     let accepted = false;
     try {
       await this.ready;
-      const payload = envelope.msg.data as { request_id?: unknown; data?: unknown; error?: unknown } | undefined;
+      const payload = envelope.msg.data as {
+        request_id?: unknown;
+        data?: unknown;
+        total?: unknown;
+        error?: unknown;
+      } | undefined;
       const requestId = typeof payload?.request_id === "string" ? payload.request_id : undefined;
       if (requestId !== undefined) {
         const entry = this.relayRequests.get(requestId);
         if (entry !== undefined) {
           if (envelope.msg.name === RELAY_MESSAGES.MediaStreamChunk) {
             if (typeof payload?.data === "string") {
-              this.worker.sendRelayChunk(entry.downloadId, base64ToBytes(payload.data));
+              const total = typeof payload.total === "number" && Number.isFinite(payload.total) && payload.total > 0
+                ? payload.total
+                : undefined;
+              this.worker.sendRelayChunk(entry.downloadId, base64ToBytes(payload.data), total);
               accepted = true;
             }
           } else if (envelope.msg.name === RELAY_MESSAGES.MediaStreamEnd) {
@@ -1482,7 +1492,10 @@ export class MediaDownloaderService {
   private async relayDownload(plan: DownloadPlan, tabId: number): Promise<Result<TransferOutcome, string>> {
     const requestId = crypto.randomUUID();
     this.relayRequests.set(requestId, { downloadId: plan.download_id });
-    const completion = this.worker.streamDownload(plan);
+    const completion = this.worker.streamDownload(
+      plan,
+      (progress) => this.onProgress(plan.download_id, progress),
+    );
     completion.catch(() => undefined);
     const timer = setTimeout(() => {
       console.warn("[media-downloader] page relay timed out");
@@ -1686,8 +1699,16 @@ export class MediaDownloaderService {
       // Producers can emit at chunk rate (the browser-side ranged loop used to); the panel and the
       // session only need the documented 2 Hz, so drop anything that arrives early.
       const last = this.lastProgressEmitAt.get(downloadId);
-      if (last !== undefined && now - last < PROGRESS_INTERVAL_MS) return;
+      const known = progress.percent?.is_known === true;
+      if (
+        last !== undefined &&
+        now - last < PROGRESS_INTERVAL_MS &&
+        !(known && this.lastProgressWasKnown.get(downloadId) !== true)
+      ) {
+        return;
+      }
       this.lastProgressEmitAt.set(downloadId, now);
+      this.lastProgressWasKnown.set(downloadId, known);
     }
     applyDownloadProgress(entry, progress, now);
     this.publisher.progress();
@@ -1701,6 +1722,7 @@ export class MediaDownloaderService {
   ): Promise<void> {
     this.session.downloading.delete(plan.download_id);
     this.lastProgressEmitAt.delete(plan.download_id);
+    this.lastProgressWasKnown.delete(plan.download_id);
     this.activeMediaHashes.delete(media.hash);
     this.userCancelled.delete(plan.download_id);
     if (isErr(outcome)) {
