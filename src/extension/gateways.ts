@@ -133,6 +133,8 @@ export interface DownloadsGateway {
     conflictAction: "uniquify" | "overwrite" | "prompt";
   }) => void) => void): () => void;
   removeFile(id: number): Promise<void>;
+  /** Cancels an in-flight browser download (the panel's Cancel during the save phase). */
+  cancel(id: number): Promise<void>;
   erase(query: { id: number }): Promise<void>;
 }
 

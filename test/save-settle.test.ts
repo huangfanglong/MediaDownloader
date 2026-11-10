@@ -8,6 +8,7 @@
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MediaDownloaderService, type SessionState } from "../src/extension/service-worker.js";
+import { MSG, makeContentToServiceEnvelope } from "../src/protocol/messages.js";
 import {
   createHarness,
   doDownloadEnvelope,
@@ -37,6 +38,7 @@ function controlledDownloads() {
   >();
   const items = new Map<number, { id: number; state: string; error?: string; filename?: string }>();
   const requests: Array<{ url: string; filename: string }> = [];
+  const cancelled: number[] = [];
   let nextId = 100;
   const fake = {
     download: async (request: { url: string; filename: string }) => {
@@ -54,12 +56,16 @@ function controlledDownloads() {
       return () => handlers.delete(handler);
     },
     onDeterminingFilename: () => () => undefined,
+    cancel: async (id: number) => {
+      cancelled.push(id);
+    },
     removeFile: async () => undefined,
     erase: async () => undefined,
   };
   return {
     items,
     requests,
+    cancelled,
     emit(id: number, state: "complete" | "interrupted", error?: string) {
       const item = items.get(id);
       if (item) {
@@ -101,7 +107,85 @@ async function waitForSavedRequest(downloads: ReturnType<typeof controlledDownlo
   expect(downloads.requests[0]?.url).toBe("blob:save-test");
 }
 
+/** The plan id of the single in-flight download (entries live until the save settles). */
+function currentPlanId(harness: Awaited<ReturnType<typeof createHarness>>): string | undefined {
+  return [...harness.service.getSession().downloading.keys()][0];
+}
+
 describe("save settle semantics ", () => {
+  it("settles a user-cancelled browser save as a silent abort, not a failure", async () => {
+    const harness = createHarness(FIXTURE);
+    const { item, meta } = await discoverStandard(harness);
+    const downloads = controlledDownloads();
+    (harness.gateway as unknown as { downloads: unknown }).downloads = downloads.fake;
+
+    vi.useFakeTimers();
+    const delivery = harness.gateway.deliverToService(doDownloadEnvelope(item, meta));
+    await waitForSavedRequest(downloads);
+    const planId = currentPlanId(harness);
+    expect(planId).toBeDefined();
+
+    // The user discards the download in Chrome's UI mid-save.
+    downloads.emit(100, "interrupted", "USER_CANCELED");
+    for (let i = 0; i < 50 && harness.service.getSession().downloading.has(planId!); i++) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+
+    const session = harness.service.getSession();
+    expect(session.downloading.size).toBe(0);
+    expect(session.transient_history).toHaveLength(0);
+    expect(
+      [...session.notifications.values()].some((n) => n.type === "download_error"),
+    ).toBe(false);
+    expect(harness.opfs.removed.has("download_test.mp4")).toBe(true);
+
+    await delivery;
+    await vi.advanceTimersByTimeAsync(0);
+    vi.useRealTimers();
+    harness.service.stop();
+  }, 60_000);
+
+  it("stops the browser-level download when the panel cancels during the save phase", async () => {
+    const harness = createHarness(FIXTURE);
+    const { item, meta } = await discoverStandard(harness);
+    const downloads = controlledDownloads();
+    (harness.gateway as unknown as { downloads: unknown }).downloads = downloads.fake;
+
+    vi.useFakeTimers();
+    const delivery = harness.gateway.deliverToService(doDownloadEnvelope(item, meta));
+    await waitForSavedRequest(downloads);
+    const planId = currentPlanId(harness);
+    expect(planId).toBeDefined();
+
+    // The panel's Cancel button while the browser copy is running.
+    harness.gateway.deliverToService(
+      makeContentToServiceEnvelope(MSG.contentToService.AbortDownload, {
+        download_id: planId!,
+      }),
+    );
+    for (let i = 0; i < 50 && downloads.cancelled.length === 0; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    expect(downloads.cancelled).toEqual([100]);
+
+    // Chrome confirms the cancel via the interrupted delta.
+    downloads.emit(100, "interrupted", "USER_CANCELED");
+    for (let i = 0; i < 50 && harness.service.getSession().downloading.has(planId!); i++) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    const session = harness.service.getSession();
+    expect(session.transient_history).toHaveLength(0);
+    expect(
+      [...session.notifications.values()].some((n) => n.type === "download_error"),
+    ).toBe(false);
+    expect(harness.opfs.removed.has("download_test.mp4")).toBe(true);
+
+    await delivery;
+    await vi.advanceTimersByTimeAsync(0);
+    vi.useRealTimers();
+    harness.service.stop();
+  }, 60_000);
+
   it("records the browser's real download id in the history entry", async () => {
     const harness = createHarness(FIXTURE);
     const { item, meta } = await discoverStandard(harness);

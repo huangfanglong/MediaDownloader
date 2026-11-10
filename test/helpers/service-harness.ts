@@ -176,6 +176,7 @@ export function createFakeGateway(tabUrl: string, _fetchMap: Map<string, Uint8Ar
       },
       onDeterminingFilename: () => () => undefined,
       removeFile: async () => undefined,
+      cancel: async () => undefined,
       erase: async () => undefined,
     },
     storage: {

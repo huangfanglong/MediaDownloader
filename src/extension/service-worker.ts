@@ -22,7 +22,7 @@ import type {
   TabMeta,
   TransferOutcome,
 } from "../core/types.js";
-import { PROGRESS_INTERVAL_MS, httpFailureReason, otherFailureReason, userAbortReason } from "../core/types.js";
+import { PROGRESS_INTERVAL_MS, httpFailureReason, otherFailureReason, userAbortReason, type EndingReason } from "../core/types.js";
 import {
   IN_PROGRESS_PERCENT_MAX,
   clampPercent,
@@ -245,6 +245,8 @@ export class MediaDownloaderService {
   private readonly relayRequests = new Map<string, { downloadId: string }>();
   /** Downloads the user cancelled; their relay teardown is not a transfer failure. */
   private readonly userCancelled = new Set<string>();
+  /** Plans whose save is currently a browser-level download; the Cancel button stops it there. */
+  private readonly activeBrowserSaveIds = new Map<string, number>();
   /**
    * Cancels work the service itself drives for a download (the bounded-range path fetches and
    * stages here rather than in the download worker, which has its own abort message).
@@ -1299,6 +1301,11 @@ export class MediaDownloaderService {
       this.userCancelled.add(downloadId);
       // The page may currently be feeding the relay; close it so its next chunk is rejected.
       this.stopRelay(downloadId);
+      // A save already handed to the browser is stopped at the browser level.
+      const browserId = this.activeBrowserSaveIds.get(downloadId);
+      if (browserId !== undefined) {
+        void this.gateway.downloads.cancel(browserId).catch(() => undefined);
+      }
     }
     // A transfer the service drives itself (bounded ranges) has no worker entry to abort.
     this.transferAborts.get(downloadId)?.abort();
@@ -1497,7 +1504,10 @@ export class MediaDownloaderService {
       if (root) await removeStagedFile(root, outcome.internal_filename).catch(() => undefined);
     }
     this.worker.revokeBlobUrl(outcome.internal_bloburl);
-    if (isErr(saved)) return { tag: "Err", error: saved.error };
+    // A cancel is not a failure: the same silent ending the transfer phase produces.
+    if (isErr(saved) && saved.error.user_abort) return abortedOutcome();
+    if (isErr(saved)) return { tag: "Err", error: saved.error.message ?? "download failed" };
+    if (this.userCancelled.has(plan.download_id)) return abortedOutcome();
     return { tag: "Ok", value: { ...outcome, ...saved.value } };
   }
 
@@ -1654,7 +1664,7 @@ export class MediaDownloaderService {
   private async saveOutcome(
     plan: DownloadPlan,
     outcome: TransferOutcome,
-  ): Promise<Result<{ path: string; browser_download_id: number }, string>> {
+  ): Promise<Result<{ path: string; browser_download_id: number }, EndingReason>> {
     // The worker may have produced a different container than planned (e.g. raw MPEG-TS when no
     // remuxer is available). Save under the extension actually produced.
     const filenamePlan: DownloadPlan =
@@ -1667,12 +1677,15 @@ export class MediaDownloaderService {
       downloadId = await this.gateway.downloads.download(request);
     } catch (error) {
       this.pendingDownloadNames.discardUrl(request.url);
-      return { tag: "Err", error: String(error) };
+      return { tag: "Err", error: otherFailureReason(String(error)) };
     }
     this.pendingDownloadNames.addId(downloadId, request.filename);
+    // Registered while the save runs so the panel's Cancel can reach the browser-level copy.
+    this.activeBrowserSaveIds.set(plan.download_id, downloadId);
     const terminal = await this.waitForDownload(downloadId);
+    this.activeBrowserSaveIds.delete(plan.download_id);
     const mapped = mapDownloadTerminalState(terminal);
-    if (isErr(mapped)) return { tag: "Err", error: mapped.error.message ?? "download failed" };
+    if (isErr(mapped)) return { tag: "Err", error: mapped.error };
     return {
       tag: "Ok",
       value: { path: mapped.value.path, browser_download_id: downloadId },

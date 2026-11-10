@@ -192,6 +192,7 @@ const downloadsGateway = (): DownloadsGateway => {
       return () => api.downloads.onDeterminingFilename.removeListener(listener);
     },
     removeFile: (id) => api.downloads.removeFile(id),
+    cancel: (id) => api.downloads.cancel(id),
     erase: async (query) => {
       await api.downloads.erase(query);
     },
