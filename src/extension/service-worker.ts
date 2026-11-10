@@ -141,6 +141,7 @@ export interface NotificationRecord {
     | "tos"
     | "download_error"
     | "download_interrupted"
+    | "download_success"
     | "limit_youtube"
     | "no_youtube"
     | "youtube_403";
@@ -1816,6 +1817,14 @@ export class MediaDownloaderService {
       await this.publish();
       return;
     }
+    // The panel's notification list and status bar are the persistent record of the download's
+    // outcome: the desktop toast exists only when it is enabled and only at this moment, so the
+    // success must be recorded here the same way failures are.
+    this.addNotification({
+      type: "download_success",
+      timestamp: this.now(),
+      message: composeFilename(plan),
+    });
     if (this.settings.show_desktop_notifications && !meta.incognito) {
       await this.gateway.notifications
         .create(plan.download_id, {
