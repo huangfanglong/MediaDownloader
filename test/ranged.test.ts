@@ -47,7 +47,9 @@ describe("bounded-range download helper (googlevideo evidence)", () => {
     expect(result.tag).toBe("Ok");
     if (result.tag !== "Ok") return;
     expect(result.value.bytes.byteLength).toBe(size);
-    expect(result.value.bytes).toEqual(payload);
+    // A 3 MiB typed-array `toEqual` costs seconds in Vitest 4 (~3 ms/KB) and breaches the suite
+    // timeout under load; byte-compare instead.
+    expect(Buffer.from(result.value.bytes).equals(Buffer.from(payload))).toBe(true);
     expect(result.value.total_bytes).toBe(size);
     expect(progress.length).toBe(4);
     expect(RANGE_CHUNK_BYTES).toBe(2 * 1024 * 1024);
@@ -277,7 +279,10 @@ describe("worker ranged transfer (YouTube itag=18 path)", () => {
       merged.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    expect(merged).toEqual(payload);
+    expect(merged.byteLength).toBe(size);
+    // Byte-compare: Vitest 4 deep-equal on megabyte-scale arrays is the assertion's cost, not
+    // the transfer's.
+    expect(Buffer.from(merged).equals(Buffer.from(payload))).toBe(true);
   });
 
   it("does not stage a transfer whose object is shorter than the declared size", async () => {

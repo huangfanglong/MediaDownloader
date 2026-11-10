@@ -490,6 +490,10 @@ type FieldRestorer = (value: unknown, fallback: unknown) => unknown;
  * cannot see (and consumers that would throw on a wrong one).
  */
 const FIELD_RESTORERS: Partial<Record<keyof PersistentSettings, FieldRestorer>> = {
+  // Concurrency consumers (`setTotalCapacity`) reject anything below 1; a corrupted stored value
+  // must repair to the default instead of failing the boot that applies it.
+  max_concurrent_downloads: (value, fallback) =>
+    typeof value === "number" && Number.isFinite(value) && value >= 1 ? value : fallback,
   preferred_quality: (value, fallback) =>
     value === null || (typeof value === "number" && Number.isFinite(value)) ? value : fallback,
   smartnaming: (value) => {

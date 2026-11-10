@@ -387,6 +387,7 @@ export class MediaDownloaderService {
     >;
     if (stored[PERSISTENT_KEY] !== undefined) {
       this.settings = decodeState(stored[PERSISTENT_KEY]);
+      this.applyQueueCapacities();
     }
     const sessionStored = (await this.gateway.storage.session.get(SESSION_KEY).catch(() => ({}))) as Record<
       string,
@@ -1144,12 +1145,27 @@ export class MediaDownloaderService {
     if (!result.changed) return;
     this.settings = result.state;
     pruneDownloadHistory(this.settings, this.now());
-    this.queue.setTotalCapacity(this.settings.max_concurrent_downloads);
-    this.queue.setYoutubeCapacity(
-      this.settings.youtube_throttle ? 1 : this.settings.max_concurrent_downloads,
-    );
+    this.applyQueueCapacities();
     await this.persistSettings();
     await this.publish();
+  }
+
+  /**
+   * One place applies the concurrency settings to the queue — boot restore and panel mutations
+   * both route here, so neither can drift. The branch order keeps the queue's own invariants
+   * legal while shrinking or growing: grow the total before widening its youtube slice, and
+   * narrow the slice before shrinking the total.
+   */
+  private applyQueueCapacities(): void {
+    const capacity = this.settings.max_concurrent_downloads;
+    const youtube = this.settings.youtube_throttle ? 1 : capacity;
+    if (capacity >= this.queue.getStats().capacity) {
+      this.queue.setTotalCapacity(capacity);
+      this.queue.setYoutubeCapacity(youtube);
+    } else {
+      this.queue.setYoutubeCapacity(youtube);
+      this.queue.setTotalCapacity(capacity);
+    }
   }
 
   // -------------------------------------------------------------------------

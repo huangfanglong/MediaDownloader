@@ -81,7 +81,7 @@ function planBase(input: BuildPlanInput, downloadIdFactory: () => string): PlanB
   );
   return {
     download_id: downloadIdFactory(),
-    // Clone, never share: the execution step strips browser-managed headers from the plan (F2).
+    // Clone, never share: the execution step strips browser-managed headers from the plan.
     headers: new Headers(input.media.sent_headers),
     headers_origin: input.media.master_url?.origin ?? input.media.url?.origin ?? "",
     good_basename: rendered.basename,
