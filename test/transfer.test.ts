@@ -842,7 +842,7 @@ describe("failure policy and completion gates (E17/E19)", () => {
 });
 
 // ===========================================================================
-// save.ts — E28/E29/E32
+// save.ts
 // ===========================================================================
 
 const otherFailure = (message: string): EndingReason => ({
@@ -907,7 +907,7 @@ describe("filename and download request (E28)", () => {
   });
 });
 
-describe("terminal download state (E29)", () => {
+describe("terminal download state ", () => {
   it("maps complete with a filename to its path", () => {
     expect(
       mapDownloadTerminalState({
@@ -944,10 +944,7 @@ describe("terminal download state (E29)", () => {
     );
   });
 
-  it("keeps the not-found and in-progress sentinels", () => {
-    expect(mapDownloadTerminalState({ state: "in_progress" })).toEqual(
-      err(otherFailure("Download still in progress")),
-    );
+  it("maps snapshots to the browser's strings; `in_progress` is not settlement territory", () => {
     expect(downloadNotFoundReason()).toEqual(
       otherFailure(DOWNLOAD_ERROR_MESSAGES.notFound),
     );

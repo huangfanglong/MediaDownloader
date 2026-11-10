@@ -1671,23 +1671,52 @@ export class MediaDownloaderService {
         if (timer !== undefined) clearTimeout(timer);
         resolve(state);
       };
+      /** Settle only on a settled snapshot; a healthy copy keeps waiting . */
+      const settleWith = (item: DownloadItem | undefined, interruptReason?: string): void => {
+        if (item !== undefined && isSettledDownload(item)) finish(toTerminalState(item, interruptReason));
+      };
+      /** Search confirms the terminal transition the browser announced. */
       const detach = this.gateway.downloads.onChanged((delta) => {
         if (delta.id !== downloadId) return;
-        if (delta.state?.current === "complete" || delta.state?.current === "interrupted") {
-          void this.gateway.downloads.search({ id: downloadId }).then((items) => {
+        if (delta.state?.current !== "complete" && delta.state?.current !== "interrupted") return;
+        const interruptReason = delta.error?.current;
+        void this.gateway.downloads
+          .search({ id: downloadId })
+          .then((items) => settleWith(items[0], interruptReason))
+          .catch(() => undefined); // a lost confirming snapshot is not a state; the re-check decides
+      });
+      /**
+       * The browser owns the save's duration: a still-running item may sit `in_progress` (paused,
+       * slow copy, kept dialog) and must keep waiting, not fail. The re-check is liveness
+       * insurance only — it settles when the item terminally settles, reports an item the user
+       * removed, and re-arms on anything transient.
+       */
+      const recheck = (): void => {
+        void this.gateway.downloads
+          .search({ id: downloadId })
+          .then((items) => {
+            if (settled) return;
             const item = items[0];
-            finish(toTerminalState(item, delta.error?.current));
+            if (item === undefined) {
+              finish(toTerminalState(undefined)); // removed from the download manager
+              return;
+            }
+            if (!isSettledDownload(item)) {
+              timer = setTimeout(recheck, SAVE_RECHECK_MS);
+              return;
+            }
+            finish(toTerminalState(item));
+          })
+          .catch(() => {
+            if (settled) return;
+            timer = setTimeout(recheck, SAVE_RECHECK_MS); // a transient API failure is not a state
           });
-        }
-      });
-      timer = setTimeout(async () => {
-        const items = await this.gateway.downloads.search({ id: downloadId }).catch(() => [] as DownloadItem[]);
-        finish(toTerminalState(items[0]));
-      }, 30 * 60 * 1000);
-      void this.gateway.downloads.search({ id: downloadId }).then((items) => {
-        const item = items[0];
-        if (item && item.state !== "in_progress") finish(toTerminalState(item));
-      });
+      };
+      timer = setTimeout(recheck, SAVE_RECHECK_MS);
+      void this.gateway.downloads
+        .search({ id: downloadId })
+        .then((items) => settleWith(items[0]))
+        .catch(() => undefined); // a failed initial probe is not a state; the re-check decides
     });
   }
 
@@ -1857,7 +1886,10 @@ export class MediaDownloaderService {
   }
 }
 
-function toTerminalState(item: DownloadItem | undefined, interruptReason?: string): DownloadTerminalState {
+function toTerminalState(
+  item: (DownloadItem & { state: "complete" | "interrupted" }) | undefined,
+  interruptReason?: string,
+): DownloadTerminalState {
   if (!item) return { state: "interrupted" };
   return {
     state: item.state,
@@ -1865,6 +1897,11 @@ function toTerminalState(item: DownloadItem | undefined, interruptReason?: strin
     ...(item.error !== undefined ? { error: item.error } : {}),
     ...(interruptReason !== undefined ? { interruptReason } : {}),
   };
+}
+
+/** `in_progress` is movement, not settlement: waiters re-check instead of failing . */
+function isSettledDownload(item: DownloadItem): item is DownloadItem & { state: "complete" | "interrupted" } {
+  return item.state !== "in_progress";
 }
 
 /** Parse a browser-supplied URL; malformed strings are simply not remembered. */
@@ -1894,6 +1931,12 @@ const isRelayStreamMessage = (name: string | undefined): boolean =>
 
 /** Overall transfer deadline (direct + relay staging). */
 const TRANSFER_DEADLINE_MS = 30 * 60 * 1000;
+
+/**
+ * Liveness re-check for the save wait, not a deadline: a still-running browser download keeps
+ * waiting forever; the ticks only catch removed items and SW-event loss.
+ */
+const SAVE_RECHECK_MS = 30 * 60 * 1000;
 
 /** Compare badge colours by value: notification red arrives as a fresh array every publish. */
 function badgeBackgroundKey(color: BadgeBackgroundColor | undefined): string | undefined {

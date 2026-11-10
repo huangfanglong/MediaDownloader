@@ -10,7 +10,6 @@ import {
 
 /**
  * Extension feedback: badge priority/colours.
- * Evidence: analysis/evidence/01-messaging-runtime.md E29 (badge, `Ly` pretty 22466-22483).
  */
 
 describe("badge", () => {

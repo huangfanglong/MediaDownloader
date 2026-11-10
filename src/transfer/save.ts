@@ -1,18 +1,5 @@
 /**
  * Saving the assembled file and mapping terminal states / worker failures to ending reasons.
- *
- * Evidence: `analysis/evidence/04-download-transfer.md`
- *  - E28 — filename = `subdir + good_basename + "." + extension`; download options
- *    `{url: blobUrl, conflictAction:"uniquify", filename, saveAs}`; `onDeterminingFilename`
- *    re-asserts the same filename with `conflictAction:"uniquify"`
- *    (service__main.js.pretty.js lines 10051-10183).
- *  - E29 — terminal-state strings (lines 10072-10119):
- *    `Error downloading file, ID not found.`, `Download was interrupted.`,
- *    `Download interrupted.`, `Unknown download error`,
- *    `Download completed but file details not found.`, user cancel `"Download canceled by the user"`.
- *  - E32 — `Ws` maps an ending reason to UI text: `User abort` / `HTTP error. Status: <n>.` /
- *    `Incomplete percentage.` / `Error. <message>.` (lines 8883-8890).
- *  - E17/E19 — worker failure strings mapped by {@link mapWorkerErrorToReason}.
  */
 import { err, ok, type Result } from "../core/option.js";
 import {
@@ -93,10 +80,13 @@ export function buildDeterminingFilenameAnswer(
 // Terminal download state
 // ---------------------------------------------------------------------------
 
-export type DownloadStateName = "in_progress" | "interrupted" | "complete";
-
 export interface DownloadTerminalState {
-  state: DownloadStateName;
+  /**
+   * Settlement snapshot only (`in_progress` excluded): the save wait must never label a
+   * still-running browser download as a failure — it keeps waiting on `onChanged` + re-check
+   * ticks instead.
+   */
+  state: "complete" | "interrupted";
   /** `DownloadItem.filename`; present once the browser picked a path. */
   filename?: string;
   /** `DownloadItem.error` (browser-provided string). */
@@ -105,7 +95,7 @@ export interface DownloadTerminalState {
   interruptReason?: string;
 }
 
-/** Exact user-visible strings from `Jv` (E29). */
+/** Exact user-visible strings from `Jv` . */
 export const DOWNLOAD_ERROR_MESSAGES = {
   notFound: "Error downloading file, ID not found.",
   interrupted: "Download was interrupted.",
@@ -115,17 +105,17 @@ export const DOWNLOAD_ERROR_MESSAGES = {
   userCanceled: "Download canceled by the user",
 } as const;
 
-/** Reason for a `downloads.search` that returns no item (E29). */
+/** Reason for a `downloads.search` that returns no item . */
 export function downloadNotFoundReason(): EndingReason {
   return otherFailureReason(DOWNLOAD_ERROR_MESSAGES.notFound);
 }
 
 /**
- * Map a `downloads.search` / `onChanged` snapshot to the recovered result:
+ * Map a settled `downloads.search` / `onChanged` snapshot to the recovered result:
  *  - `complete` + filename ⇒ `Ok({path})`;
  *  - interrupted by the user (`interruptReason === "USER_CANCELED"`) ⇒ `Err(userAbort)`;
  *  - other errors keep the browser error string as an other-failure message.
- * `in_progress` is not a terminal state; callers wait for `onChanged` instead (E29).
+ * `in_progress` snapshots never reach here: settlement waits for `onChanged` / re-checks .
  */
 export function mapDownloadTerminalState(
   state: DownloadTerminalState,
@@ -136,13 +126,10 @@ export function mapDownloadTerminalState(
       otherFailureReason(DOWNLOAD_ERROR_MESSAGES.completedDetailsMissing),
     );
   }
-  if (state.state === "interrupted") {
-    if (state.interruptReason === "USER_CANCELED")
-      return err(userAbortReason());
-    if (state.error) return err(otherFailureReason(state.error));
-    return err(otherFailureReason(DOWNLOAD_ERROR_MESSAGES.interruptedOnChange));
-  }
-  return err(otherFailureReason("Download still in progress"));
+  if (state.interruptReason === "USER_CANCELED")
+    return err(userAbortReason());
+  if (state.error) return err(otherFailureReason(state.error));
+  return err(otherFailureReason(DOWNLOAD_ERROR_MESSAGES.interruptedOnChange));
 }
 
 // ---------------------------------------------------------------------------

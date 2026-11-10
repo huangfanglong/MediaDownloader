@@ -21,9 +21,9 @@ export const BADGE_TEXT_COLOR = "white";
 
 /** Counts that drive the badge. */
 export interface BadgeCounts {
-  /** `notifications.size + remote_notifications.size` (E29). */
+  /** `notifications.size + remote_notifications.size` . */
   notificationCount: number;
-  /** `downloading.size` — queued + running transfers (E29). */
+  /** `downloading.size` — queued + running transfers . */
   downloadingCount: number;
   /** Detected media items for the current tab (drives the red count badge). */
   mediaCount?: number;
