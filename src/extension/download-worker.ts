@@ -39,8 +39,10 @@ import { headersForPlan, fetchBytes, scopedHeadersFor, type FetchLike } from "..
 import { resolveTransferLimits, type TransferLimits } from "../transfer/limits.js";
 import {
   convertArgs,
+  defaultVendorBase,
   FfmpegInputTooLargeError,
   FfmpegOutputTooLargeError,
+  FfmpegRunner,
   mergeArgs,
   mp3Args,
   type FfmpegJob,
@@ -126,6 +128,14 @@ export class DownloadWorker {
   }>();
   private readonly now: () => number;
   private readonly limits: TransferLimits;
+  /**
+   * Plan whose ffmpeg job owns the runner right now. ffmpeg.wasm reports its advancement as
+   * log lines, which are the only liveness signal during a silent remux: forwarding them as
+   * that plan's progress re-arms the transfer's silence window (service side) and keeps the
+   * panel's finalizing state current.
+   */
+  private activeFfmpegPlanId: string | undefined;
+  private lastFfmpegReportAt = 0;
 
   constructor(deps: DownloadWorkerDeps) {
     this.deps = deps;
@@ -139,6 +149,21 @@ export class DownloadWorker {
     this.deps.channel.addEventListener("message", (event) => {
       void this.onMessage(event.data);
     });
+  }
+
+  /**
+   * FFmpeg log lines double as its progress report: it emits them only while the job actually
+   * advances, so each line is living progress for the plan currently remuxing. Throttled to the
+   * same cadence as transfer progress so a chatty stderr does not flood the message channel.
+   */
+  onFfmpegLog(line: string): void {
+    void line;
+    const planId = this.activeFfmpegPlanId;
+    if (planId === undefined) return;
+    const now = this.now();
+    if (now - this.lastFfmpegReportAt < PROGRESS_INTERVAL_MS) return;
+    this.lastFfmpegReportAt = now;
+    this.emitProgress(planId, { status: "finalizing" });
   }
 
   private async onMessage(raw: unknown): Promise<void> {
@@ -607,8 +632,27 @@ export class DownloadWorker {
     } as TransferOutcome;
   }
 
-  /** Run an ffmpeg job whose output streams into OPFS, falling back to a memory run. */
+  /**
+   * Run an ffmpeg job whose output streams into OPFS, falling back to a memory run. The plan id
+   * marks the job's ownership window: while it runs, runner log lines are progress for that plan.
+   */
   private async runFfmpegStaged(
+    job: FfmpegJob,
+    root: OpfsRoot,
+    filename: string,
+    extension: string,
+    planId: string,
+  ): Promise<Result<StagedTransfer, string>> {
+    this.activeFfmpegPlanId = planId;
+    try {
+      return await this.runStagedJob(job, root, filename, extension);
+    } finally {
+      if (this.activeFfmpegPlanId === planId) this.activeFfmpegPlanId = undefined;
+    }
+  }
+
+  /** Body of a staged ffmpeg run; caller owns the active-plan marker. */
+  private async runStagedJob(
     job: FfmpegJob,
     root: OpfsRoot,
     filename: string,
@@ -743,6 +787,7 @@ export class DownloadWorker {
               root,
               `${plan.download_id}.mp3`,
               "mp3",
+              plan.download_id,
             );
             if (extracted.tag === "Err") return extracted;
             console.info("[media-downloader] ffmpeg extracted mp3", extracted.value.totalBytes, "bytes");
@@ -809,6 +854,7 @@ export class DownloadWorker {
                 root,
                 `${plan.download_id}.${container}`,
                 container,
+                plan.download_id,
               );
             };
             this.emitProgress(plan.download_id, { status: "finalizing" });
@@ -929,6 +975,7 @@ export class DownloadWorker {
             root,
             `${plan.download_id}.${container}`,
             container,
+            plan.download_id,
           );
           if (merged.tag === "Err") return merged;
           console.info("[media-downloader] ffmpeg merged HLS tracks", merged.value.totalBytes, "bytes", container);
@@ -999,6 +1046,7 @@ export class DownloadWorker {
             root,
             `${plan.download_id}.mp4`,
             "mp4",
+            plan.download_id,
           );
           if (remuxed.tag === "Err") throw new Error(remuxed.error);
           if (remuxed.value.totalBytes < MIN_OUTPUT_BYTES) throw new Error("FFmpeg produced an empty MP4");
@@ -1077,6 +1125,7 @@ export class DownloadWorker {
               root,
               `${plan.download_id}.${requestedFormat}`,
               requestedFormat,
+              plan.download_id,
             );
             if (converted.tag === "Err") return converted;
             console.info("[media-downloader] ffmpeg converted output", converted.value.totalBytes, "bytes", requestedFormat);
@@ -1113,6 +1162,7 @@ export class DownloadWorker {
               root,
               `${plan.download_id}.${requestedFormat}`,
               requestedFormat,
+              plan.download_id,
             );
             if (converted.tag === "Err") return converted;
             console.info("[media-downloader] ffmpeg converted output", converted.value.totalBytes, "bytes", requestedFormat);
@@ -1590,10 +1640,9 @@ function ivFromHex(hex: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Boot the worker in its real environment. Kept as a named function so the module has no
- * import-time side effects during tests.
- */
+/** Boot the worker in its real environment. Kept as a named function so the module has no
+ * import-time side effects during tests. The ffmpeg runner is constructed here with its log
+ * stream forwarded into the worker's progress reporting (see `onFfmpegLog`). */
 export function bootDownloadWorker(
   channel: BroadcastChannelLike,
   options: { ffmpeg?: FfmpegRunnerLike } = {},
@@ -1602,11 +1651,14 @@ export function bootDownloadWorker(
   void openOpfsRoot()
     .then((root) => (root ? purgeStaging(root) : 0))
     .catch(() => undefined);
+  const runner: FfmpegRunnerLike =
+    options.ffmpeg ??
+    new FfmpegRunner(defaultVendorBase(), (line) => worker.onFfmpegLog(line));
   const worker = new DownloadWorker({
     channel,
     fetchImpl: (input, init) => fetch(input, init as RequestInit) as never,
     openRoot: openOpfsRoot,
-    ...(options.ffmpeg !== undefined ? { ffmpeg: options.ffmpeg } : {}),
+    ffmpeg: runner,
   });
   worker.start();
   return worker;

@@ -3,8 +3,5 @@
  */
 import { bootDownloadWorker } from "./download-worker.js";
 import { WORKER_SERVICE_CHANNEL } from "../protocol/channels.js";
-import { FfmpegRunner } from "../transfer/ffmpeg.js";
 
-bootDownloadWorker(new BroadcastChannel(WORKER_SERVICE_CHANNEL), {
-  ffmpeg: new FfmpegRunner(),
-});
+bootDownloadWorker(new BroadcastChannel(WORKER_SERVICE_CHANNEL));

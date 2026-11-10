@@ -252,6 +252,8 @@ export class MediaDownloaderService {
    * stages here rather than in the download worker, which has its own abort message).
    */
   private readonly transferAborts = new Map<string, AbortController>();
+  /** Re-arms the transfer's silence window; driven by raw progress reports (onProgress). */
+  private readonly transferTouches = new Map<string, () => void>();
   /** Keeps the MV3 worker alive while transfers run (review 4.2). */
   private keepAliveTimer?: ReturnType<typeof setInterval>;
   /** URLs the browser actually requested per tab (for safe manifest auto-enrichment). */
@@ -1402,21 +1404,31 @@ export class MediaDownloaderService {
     });
     let failure: string | undefined;
     let deadline: ReturnType<typeof setTimeout> | undefined;
+    let failRace: ((error: Error) => void) | undefined;
     /**
-     * One timer for the whole transfer, whichever shape it takes. On expiry it aborts the
-     * per-download controller (which stops service-owned range fetches and their staging) and
-     * asks the worker to stop its own download.
+     * The transfer budget is silence, not wall-clock: every progress report re-arms the window.
+     * A hung fetch or a dead worker reports nothing and gets torn down; a slow-but-healthy
+     * download (huge rendition, slow CDN, long remux) keeps running as long as it keeps
+     * reporting. The per-download controller stops service-owned range fetches and their
+     * staging; the worker is asked to stop its own download.
      */
+    const armSilenceWindow = (): void => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      deadline = setTimeout(() => {
+        deadline = undefined;
+        console.warn("[media-downloader] transfer stopped: no progress; aborting");
+        this.transferAborts.get(plan.download_id)?.abort();
+        this.worker.cancel(plan.download_id);
+        this.worker.abort(plan.download_id);
+        failRace?.(new Error("transfer timed out"));
+      }, this.transferDeadlineMs);
+    };
     const startDeadline = (): Promise<never> =>
       new Promise<never>((_, reject) => {
-        deadline = setTimeout(() => {
-          console.warn("[media-downloader] transfer deadline exceeded; aborting");
-          this.transferAborts.get(plan.download_id)?.abort();
-          this.worker.cancel(plan.download_id);
-          this.worker.abort(plan.download_id);
-          reject(new Error("transfer timed out"));
-        }, this.transferDeadlineMs);
+        failRace = reject;
       });
+    armSilenceWindow();
+    this.transferTouches.set(plan.download_id, armSilenceWindow);
     try {
       if (
         plan.is_youtube &&
@@ -1443,6 +1455,7 @@ export class MediaDownloaderService {
       failure = extractWorkerError(error);
     } finally {
       if (deadline !== undefined) clearTimeout(deadline);
+      this.transferTouches.delete(plan.download_id);
       await this.headerReplay.remove(ruleIds);
     }
 
@@ -1462,8 +1475,8 @@ export class MediaDownloaderService {
     });
 
     if (failure !== undefined && !userAborted()) {
-      // A deadline is the whole transfer's budget: restarting the same stalled transfer through
-      // the page context would only grant it another window. Other failures keep the relay retry.
+      // A silence teardown means the transfer reported nothing at all: rerunning it through the
+      // page context would just wait the same window out again. Other failures keep the retry.
       const timedOut = failure === "transfer timed out";
       const retryThroughPage =
         !timedOut &&
@@ -1753,6 +1766,8 @@ export class MediaDownloaderService {
   }
 
   private onProgress(downloadId: string, progress: DownloadProgress): void {
+    // Raw reports are the liveness channel: every arrival re-arms that transfer's silence window.
+    this.transferTouches.get(downloadId)?.();
     const entry = this.session.downloading.get(downloadId);
     if (!entry) return;
     const now = this.now();
