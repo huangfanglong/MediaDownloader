@@ -262,7 +262,6 @@ export interface TransferOutcome {
   /** Blob URL handed to chrome.downloads. */
   internal_bloburl?: string;
   browser_download_id?: number;
-  browser_downloads_duration_ms?: number;
   path?: string;
 }
 

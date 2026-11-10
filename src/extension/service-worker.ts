@@ -1498,7 +1498,7 @@ export class MediaDownloaderService {
     }
     this.worker.revokeBlobUrl(outcome.internal_bloburl);
     if (isErr(saved)) return { tag: "Err", error: saved.error };
-    return { tag: "Ok", value: { ...outcome, path: saved.value.path } };
+    return { tag: "Ok", value: { ...outcome, ...saved.value } };
   }
 
   /**
@@ -1654,7 +1654,7 @@ export class MediaDownloaderService {
   private async saveOutcome(
     plan: DownloadPlan,
     outcome: TransferOutcome,
-  ): Promise<Result<{ path: string }, string>> {
+  ): Promise<Result<{ path: string; browser_download_id: number }, string>> {
     // The worker may have produced a different container than planned (e.g. raw MPEG-TS when no
     // remuxer is available). Save under the extension actually produced.
     const filenamePlan: DownloadPlan =
@@ -1673,7 +1673,10 @@ export class MediaDownloaderService {
     const terminal = await this.waitForDownload(downloadId);
     const mapped = mapDownloadTerminalState(terminal);
     if (isErr(mapped)) return { tag: "Err", error: mapped.error.message ?? "download failed" };
-    return { tag: "Ok", value: mapped.value };
+    return {
+      tag: "Ok",
+      value: { path: mapped.value.path, browser_download_id: downloadId },
+    };
   }
 
   private waitForDownload(downloadId: number): Promise<DownloadTerminalState> {

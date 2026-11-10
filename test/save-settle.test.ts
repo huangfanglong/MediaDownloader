@@ -102,6 +102,29 @@ async function waitForSavedRequest(downloads: ReturnType<typeof controlledDownlo
 }
 
 describe("save settle semantics ", () => {
+  it("records the browser's real download id in the history entry", async () => {
+    const harness = createHarness(FIXTURE);
+    const { item, meta } = await discoverStandard(harness);
+    const downloads = controlledDownloads();
+    (harness.gateway as unknown as { downloads: unknown }).downloads = downloads.fake;
+
+    vi.useFakeTimers();
+    const delivery = harness.gateway.deliverToService(doDownloadEnvelope(item, meta));
+    await waitForSavedRequest(downloads);
+    downloads.emit(100, "complete");
+    for (let i = 0; i < 50 && harness.service.getSession().transient_history.length === 0; i++) {
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    const record = harness.service.getSession().transient_history[0];
+    expect(record?.path).toContain("Test Page");
+    expect(record?.browser_download_id).toBe(100);
+
+    await delivery;
+    await vi.advanceTimersByTimeAsync(0);
+    vi.useRealTimers();
+    harness.service.stop();
+  }, 60_000);
+
   it("keeps waiting (and its artifacts) while the browser item is in_progress, then records the real outcome", async () => {
     const harness = createHarness(FIXTURE);
     const { item, meta } = await discoverStandard(harness);

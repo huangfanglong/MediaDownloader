@@ -6,14 +6,7 @@
  */
 import { createChromeGateway } from "./chrome-gateway.js";
 import { MediaDownloaderService } from "./service-worker.js";
-import type { FetchLike } from "../transfer/fetch.js";
-
-const fetchImpl: FetchLike = async (url, init) =>
-  (await fetch(url, {
-    ...(init?.headers !== undefined ? { headers: init.headers } : {}),
-    ...(init?.signal !== undefined ? { signal: init.signal } : {}),
-    ...(init?.cache !== undefined ? { cache: init.cache } : {}),
-  })) as never;
+import { fetchAdapter as fetchImpl } from "./fetch-adapter.js";
 
 const gateway = createChromeGateway();
 console.info("[media-downloader] booting version", chrome.runtime.getManifest().version);
