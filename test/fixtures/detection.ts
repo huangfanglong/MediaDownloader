@@ -152,19 +152,15 @@ export const FIXTURE_AUDIO_CODEC_ROWS: readonly CodecDemuxerRowFixture[] = [
   { source: "vorbis", flags: "i", demuxer: "ogg", codec: "Vorbis" },
 ];
 
-/** D25 (`PS`, 11 entries; original byte 237,954). */
+/**
+ * D25 (`PS`, 11 entries; original byte 237,954). Deliberate deviation from byte-parity: the
+ * original table listed hosts without shipped page adapters, which suppressed sniffing while
+ * leaving those hosts with no discovery path. The shipped set keeps only adapter-covered hosts;
+ * see the invariant comment on `BLOCKED_INITIATOR_HOSTS` and `test/adapter-coverage.test.ts`.
+ */
 export const FIXTURE_BLOCKED_INITIATOR_HOSTS = [
   "youtube.com",
   "instagram.com",
-  "ok.ru",
-  "vk.com",
-  "vk.ru",
-  "vkvideo.ru",
-  "canva.com",
-  "iq.com",
-  "vimeo.com",
-  "kick.com",
-  "javrank.com",
 ] as const;
 
 // ---------------------------------------------------------------------------

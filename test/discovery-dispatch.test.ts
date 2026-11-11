@@ -41,7 +41,7 @@ describe("engine: response acceptance truth table", () => {
 
   it("rejects initiators on the site-adapter block list (D9 step 5 / D25)", () => {
     const engine = makeEngine();
-    for (const hostname of ["www.youtube.com", "player.vimeo.com", "intl-api.iq.com"]) {
+    for (const hostname of ["www.youtube.com", "www.instagram.com"]) {
       expect(engine.onResponseStarted(makeResponseStartedEvent({ initiator: `https://${hostname}/watch` }))).toBeNull();
     }
   });

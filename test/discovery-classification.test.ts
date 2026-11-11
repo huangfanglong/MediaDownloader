@@ -84,7 +84,7 @@ describe("classification tables are verbatim recoveries", () => {
     expect(AUDIO_CODEC_DEMUXER_ROWS).toHaveLength(4);
   });
 
-  it("exposes the 11-entry blocked-initiator set (D25)", () => {
+  it("exposes the adapter-covered blocked-initiator set (D25, trimmed from the 11-entry original)", () => {
     expect([...BLOCKED_INITIATOR_HOSTS]).toEqual([...FIXTURE_BLOCKED_INITIATOR_HOSTS]);
   });
 
@@ -190,10 +190,11 @@ describe("segment path rejection (D9 step 3)", () => {
   });
 });
 
-describe("blocked initiator hosts (D25)", () => {
+describe("blocked initiator hosts (D25, adapter-covered subset)", () => {
   it.each([
-    ["www.youtube.com", true], ["youtube.com", true], ["player.vimeo.com", true], ["vimeo.com", true],
-    ["sub.vkvideo.ru", true], ["intl-api.iq.com", true], ["notvimeo.com", false],
+    ["www.youtube.com", true], ["youtube.com", true], ["www.instagram.com", true],
+    ["player.vimeo.com", false], ["vimeo.com", false], ["sub.vkvideo.ru", false],
+    ["intl-api.iq.com", false], ["notvimeo.com", false],
     ["vimeo.com.evil.example", false], ["example.com", false],
   ])("isBlockedInitiatorHost(%j) -> %j", (hostname, expected) => {
     expect(isBlockedInitiatorHost(hostname)).toBe(expected);

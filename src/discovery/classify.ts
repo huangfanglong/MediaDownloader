@@ -303,19 +303,17 @@ export const SEGMENT_PATH_PATTERN = /\.ts$|\.m4s$|\.m2ts$|(?:_part\d+|_init_[A-Z
 /**
  * Initiator hosts handled by site adapters; `webRequest` sniffing is suppressed for them
  * (original `PS`, pretty 11317-11329, byte 237,954; D25). Matched on the last two host labels.
+ *
+ * Invariant: every entry must be covered by a shipped page adapter, because suppression removes
+ * the only discovery path a host has when no page hook exists for it. The original table listed
+ * 11 hosts, but page adapters ship only for youtube, instagram and bilibili — the other 9 entries
+ * suppressed sniffing with nothing to replace it, so they are trimmed here. This is a deliberate
+ * deviation from byte-parity with `PS`. bilibili stays unsuppressed (its adapter does not own
+ * every response on that site).
  */
 export const BLOCKED_INITIATOR_HOSTS = [
   "youtube.com",
   "instagram.com",
-  "ok.ru",
-  "vk.com",
-  "vk.ru",
-  "vkvideo.ru",
-  "canva.com",
-  "iq.com",
-  "vimeo.com",
-  "kick.com",
-  "javrank.com",
 ] as const;
 
 const BLOCKED_INITIATOR_HOST_SET: ReadonlySet<string> = new Set(
