@@ -301,6 +301,19 @@ export const HLS_FRAGMENT_PATH_PATTERN = /(?:_part\d+|_init_[A-Za-z0-9_-]+)\.(?:
 export const SEGMENT_PATH_PATTERN = /\.ts$|\.m4s$|\.m2ts$|(?:_part\d+|_init_[A-Za-z0-9_-]+)\.(?:mp4|m4s|ts)$/i;
 
 /**
+ * JSON media manifests (DASH-in-JSON class) are speculative candidates: a `.json` XHR with a json
+ * content type. The body decides whether the candidate survives (see the manifest layer).
+ */
+export const JSON_MANIFEST_URL_PATTERN = /\.json$/i;
+
+/** Content-type test for JSON payloads (base mime without parameters). */
+export function isJsonContentType(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  const mime = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+  return mime.endsWith("/json") || mime.endsWith("+json");
+}
+
+/**
  * Initiator hosts handled by site adapters; `webRequest` sniffing is suppressed for them
  * (original `PS`, pretty 11317-11329, byte 237,954; D25). Matched on the last two host labels.
  *

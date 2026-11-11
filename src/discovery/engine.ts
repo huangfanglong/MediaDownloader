@@ -38,10 +38,12 @@ import { cyrb53 } from "../protocol/channels.js";
 import { canonicalHlsManifestUrl } from "../manifests/hls.js";
 import {
   isBlockedInitiatorHost,
+  isJsonContentType,
   mimeToDemuxer,
   resolveMediaDescriptor,
   SEGMENT_PATH_PATTERN,
   tryUrl,
+  JSON_MANIFEST_URL_PATTERN,
 } from "./classify.js";
 
 // ---------------------------------------------------------------------------
@@ -92,6 +94,25 @@ export const HLS_MASTER_API_PATTERN = /\/api\/playlist\/master\//;
 /** DASH signal patterns (D10; pretty 11624-11625). */
 export const DASH_CONTENT_TYPE_PATTERN = /dash/i;
 export const DASH_URL_PATTERN = /\.mpd/i;
+
+/**
+ * Negative cache for speculative JSON-manifest candidates: once a URL's body proved not to be a
+ * media manifest, detection skips it for this TTL (mirrors the send-headers TTL so periodic
+ * JSON-polling pages do not loop enrichment fetches).
+ */
+export const NOT_A_MANIFEST_TTL_MS = 600 * 1e3;
+/** Negative-cache bound; hostile pages cannot grow the engine state without limit. */
+export const NOT_A_MANIFEST_URL_CAP = 200;
+
+/**
+ * Fragment-stream gate: many rapid direct media-MIME XHRs from one initiator are MSE plumbing,
+ * not standalone files a user can download. Once this many arrive within the window, the earlier
+ * rows are retracted and further ones are rejected until the window expires (playback pause).
+ */
+export const FRAGMENT_STREAM_WINDOW_MS = 10_000;
+export const FRAGMENT_STREAM_MIN_ITEMS = 3;
+/** Per-initiator fragment-stream state bound. */
+export const FRAGMENT_STREAM_STATE_CAP = 500;
 
 /** MPD→M3U8 conversion match (D10; pretty 9492). */
 export const MPD_EXTENSION_PATTERN = /\.mpd/i;
@@ -192,6 +213,13 @@ interface TabRegistry {
   fifo: boolean;
 }
 
+/** Per-initiator fragment-stream bookkeeping for the burst gate. */
+interface FragmentStreamState {
+  events: Array<{ at: number; hash: string }>;
+  streaming: boolean;
+  lastActivity: number;
+}
+
 const EMPTY_MEDIA_MAP: ReadonlyMap<string, MediaItem> = new Map();
 
 /** Build a `Headers` object from chrome-style header pairs; invalid pairs are skipped (D8). */
@@ -231,6 +259,10 @@ export class DiscoveryEngine {
   private readonly sendHeaders = new Map<string, SendHeadersRecord>();
   /** Initiator URLs already claimed by a DASH playlist (D16); value = timestamp for TTL pruning. */
   private readonly initiatorSeen = new Map<string, number>();
+  /** Manifest URLs whose body proved not to be a media manifest (speculative-candidate verdict). */
+  private readonly notManifestUrls = new Map<string, number>();
+  /** Per-initiator fragment-stream bookkeeping (burst gate for direct media-MIME XHRs). */
+  private readonly fragmentStreams = new Map<string, FragmentStreamState>();
   private lastPruneTimestamp = 0;
   private readonly tabs = new Map<number, TabRegistry>();
 
@@ -330,6 +362,19 @@ export class DiscoveryEngine {
         const dash = this.createDashCandidate(event, initiator, mediaUrl);
         if (dash) return dash;
       }
+
+      // JSON media manifests (DASH-in-JSON class): a `.json` XHR with a json content type is a
+      // speculative manifest candidate. The manifest layer resolves it by parsing the body and
+      // removes it (with a negative-URL cache) when the body proves not to be a manifest.
+      if (
+        event.type === "xmlhttprequest" &&
+        isJsonContentType(contentType) &&
+        mediaUrl &&
+        JSON_MANIFEST_URL_PATTERN.test(mediaUrl.pathname) &&
+        !this.isNotedNotAManifest(mediaUrl)
+      ) {
+        return this.createJsonManifestCandidate(event, initiator, mediaUrl);
+      }
     }
 
     // D10 tail: direct media-file branch.
@@ -400,6 +445,57 @@ export class DiscoveryEngine {
     return item;
   }
 
+  /**
+   * Speculative candidate for a JSON media manifest (`master.json` class). It rides the HLS
+   * pipeline: the manifest layer fetches the body, maps it onto the media-playlist shape, and
+   * either enriches this item or removes it when the JSON is not a media manifest.
+   */
+  private createJsonManifestCandidate(
+    event: ResponseStartedEvent,
+    initiator: URL | undefined,
+    mediaUrl: URL,
+  ): MediaItem {
+    const item: MediaItem = {
+      type: "m3u8",
+      hash: directMediaHash(mediaUrl), // provisional; replaced when manifestText is attached (D27)
+      is_youtube: false,
+      sent_headers: this.replayHeaders(event.requestId),
+      initiator,
+      url: mediaUrl,
+      demuxer: "mp4",
+      duration: "unknown",
+      has_drm: false,
+      cache: "default",
+      discovery_timestamp_ms: this.deps.now(),
+    };
+    this.register(item, event.tabId);
+    return item;
+  }
+
+  /** Mark a manifest URL as proven not to be a media manifest; detection skips it for a TTL. */
+  noteNotAManifest(url: URL): void {
+    const now = this.deps.now();
+    for (const [href, at] of this.notManifestUrls) {
+      if (now - at > NOT_A_MANIFEST_TTL_MS) this.notManifestUrls.delete(href);
+    }
+    while (this.notManifestUrls.size >= NOT_A_MANIFEST_URL_CAP) {
+      const oldest = this.notManifestUrls.keys().next();
+      if (oldest.done) break;
+      this.notManifestUrls.delete(oldest.value);
+    }
+    this.notManifestUrls.set(url.href, now);
+  }
+
+  private isNotedNotAManifest(url: URL): boolean {
+    const at = this.notManifestUrls.get(url.href);
+    if (at === undefined) return false;
+    if (this.deps.now() - at > NOT_A_MANIFEST_TTL_MS) {
+      this.notManifestUrls.delete(url.href);
+      return false;
+    }
+    return true;
+  }
+
   /** `OS` (D17): accept/reject decision for a direct media response, then build the item (D14). */
   private createDirectItem(
     event: ResponseStartedEvent,
@@ -428,6 +524,12 @@ export class DiscoveryEngine {
           return null; // small-file noise filter (D17)
         }
       }
+    }
+
+    // Fragment-stream gate: many rapid direct media-MIME XHRs from one initiator are MSE
+    // plumbing, not standalone files a user can download; the burst retracts the earlier rows.
+    if (event.type === "xmlhttprequest" && mimeDemuxer !== undefined && initiator !== undefined) {
+      if (this.isFragmentStreamItem(event, initiator, mediaUrl)) return null;
     }
 
     // D16: a DASH playlist already accepted for this initiator claims its remaining responses
@@ -569,6 +671,40 @@ export class DiscoveryEngine {
   /** `Eu` (D15): replay the request headers recorded for `requestId`; empty when unknown. */
   replayHeaders(requestId: string): Headers {
     return headersFromPairs(this.sendHeaders.get(requestId)?.headers);
+  }
+
+  /**
+   * Burst gate for direct media-MIME XHRs: when the initiator streams this many rapid ones, the
+   * earlier rows are removed (they were fragments, not files) and further ones are rejected while
+   * the stream keeps flowing. The state expires with the window, so a paused player's next burst
+   * starts clean.
+   */
+  private isFragmentStreamItem(event: ResponseStartedEvent, initiator: URL, mediaUrl: URL): boolean {
+    const now = this.deps.now();
+    const state =
+      this.fragmentStreams.get(initiator.href) ?? { events: [], streaming: false, lastActivity: 0 };
+    // The stream is over only once the window since its last activity has expired.
+    if (state.streaming && now - state.lastActivity > FRAGMENT_STREAM_WINDOW_MS) {
+      state.streaming = false;
+      state.events = [];
+    }
+    state.events = state.events.filter((entry) => entry.at > now - FRAGMENT_STREAM_WINDOW_MS);
+    if (state.streaming || state.events.length + 1 >= FRAGMENT_STREAM_MIN_ITEMS) {
+      for (const prior of state.events) this.removeMedia(event.tabId, prior.hash);
+      state.events = [];
+      state.streaming = true;
+      state.lastActivity = now;
+      this.fragmentStreams.set(initiator.href, state);
+      return true;
+    }
+    state.events.push({ at: now, hash: directMediaHash(mediaUrl) });
+    state.lastActivity = now;
+    this.fragmentStreams.set(initiator.href, state);
+    if (this.fragmentStreams.size > FRAGMENT_STREAM_STATE_CAP) {
+      const oldest = this.fragmentStreams.keys().next();
+      if (!oldest.done) this.fragmentStreams.delete(oldest.value);
+    }
+    return false;
   }
 
   private flag(flag: BehaviourFlag, host: string): boolean {

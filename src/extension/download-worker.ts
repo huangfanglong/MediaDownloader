@@ -25,6 +25,7 @@ import {
 import { IN_PROGRESS_PERCENT_MAX, percentFromBytes, percentFromRatio } from "../core/progress.js";
 import { err, ok, type Result } from "../core/option.js";
 import { MAX_HLS_MANIFEST_BYTES, parsePlaylist } from "../manifests/hls.js";
+import { looksLikeJsonText, parseJsonMediaManifest } from "../manifests/json-manifest.js";
 import {
   MIN_OUTPUT_BYTES,
   buildSegmentRequests,
@@ -1245,6 +1246,12 @@ export class DownloadWorker {
       return err(playlistResult.error);
     }
     let parsed = parsePlaylist(playlistResult.value, plan.url);
+    if (parsed.kind === "invalid" && looksLikeJsonText(playlistResult.value)) {
+      // DASH-in-JSON manifests (the `master.json` class) ride the HLS pipeline: map the JSON onto
+      // the media-playlist shape the segment machinery consumes.
+      const json = parseJsonMediaManifest(playlistResult.value, plan.url);
+      if (json.tag === "Ok") parsed = json.value.playlist;
+    }
     if (parsed.kind === "invalid") return err(parsed.reason);
 
     // Master playlists are normally resolved before planning; resolve defensively anyway.
@@ -1257,6 +1264,12 @@ export class DownloadWorker {
       if (parsed.kind === "invalid") return err(parsed.reason);
     }
     if (parsed.kind !== "media") return err("playlist is not downloadable");
+
+    // JSON manifests mark DRM structurally (no EXT-X-KEY), so the key scan below cannot catch
+    // them; refuse before any transfer, exactly like the key-based boundary.
+    if (parsed.hasDrm) {
+      return err("Encrypted media is not supported by this rebuild (no decrypter implemented)");
+    }
 
     const segments = parsed.segments;
     if (segments.length === 0) return err("not a valid m3u8");

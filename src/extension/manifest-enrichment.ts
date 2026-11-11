@@ -1,7 +1,9 @@
 import type { MediaItem, PlaylistEntry, SubtitleTrack } from "../core/types.js";
 import type { DiscoveryEngine } from "../discovery/engine.js";
+import { mimeToDemuxer } from "../discovery/classify.js";
 import { parsePlaylist } from "../manifests/hls.js";
 import { parseMpd } from "../manifests/dash.js";
+import { looksLikeJsonText, parseJsonMediaManifest, type JsonMediaManifest } from "../manifests/json-manifest.js";
 import { probeMpegTsVideoSize } from "../manifests/ts-probe.js";
 import { fetchBytes, headersForPlan, scopedHeadersFor, type FetchBytesResult, type FetchLike } from "../transfer/fetch.js";
 import { isSafeManifestUrl } from "../transfer/url-safety.js";
@@ -81,7 +83,20 @@ export class ManifestEnrichment {
     if (!endedAtApprovedUrl(fetched.value, manifestUrl, true)) return;
     const text = new TextDecoder().decode(fetched.value.bytes);
     const parsed = parsePlaylist(text, manifestUrl);
-    if (parsed.kind === "invalid" || parsed.kind === "subtitle") return;
+    if (parsed.kind === "invalid") {
+      if (!looksLikeJsonText(text)) return;
+      const json = parseJsonMediaManifest(text, manifestUrl);
+      if (json.tag === "Err") {
+        // A JSON body with no media segment lists: the speculative candidate was wrong —
+        // retract it and remember the URL so later responses do not re-create it.
+        this.engine.removeMedia(tabId, item.hash);
+        this.engine.noteNotAManifest(manifestUrl);
+        return;
+      }
+      this.attachJsonManifest(tabId, item, manifestUrl, text, json.value);
+      return;
+    }
+    if (parsed.kind === "subtitle") return;
 
     if (parsed.kind === "media") {
       const quality = await this.probeHlsMediaQuality(parsed.segments[0], item);
@@ -140,6 +155,44 @@ export class ManifestEnrichment {
       has_drm: probe.hasDrm,
       manifestText: text,
       ...(subtitles.length > 0 ? { subtitles } : {}),
+    });
+  }
+
+  /**
+   * Attach a parsed JSON media manifest (DASH-in-JSON class) to its speculative candidate. The
+   * entry points back at the manifest URL: the transfer fetches and maps the body itself, exactly
+   * like the HLS media-playlist path. DRM is reported structurally so the plan layer refuses.
+   */
+  private attachJsonManifest(
+    tabId: number,
+    item: MediaItem,
+    manifestUrl: URL,
+    text: string,
+    parsed: JsonMediaManifest,
+  ): void {
+    const { playlist, track } = parsed;
+    const entry: PlaylistEntry = {
+      demuxer: mimeToDemuxer(track.mimeType) ?? "mp4",
+      quality: {
+        ...(track.width !== undefined || track.height !== undefined
+          ? {
+              size: {
+                height: track.height ?? 0,
+                ...(track.width !== undefined ? { width: track.width } : {}),
+              },
+            }
+          : {}),
+        ...(track.bitrate !== undefined ? { bitrate: track.bitrate } : {}),
+      },
+      av: { video: manifestUrl, audio: false },
+    };
+    const extension = playlist.segments.some((segment) => segment.map !== undefined) ? "mp4" : undefined;
+    this.engine.attachPlaylist(tabId, item.hash, [entry], {
+      type: "m3u8",
+      ...(playlist.duration !== "unknown" ? { duration: playlist.duration } : {}),
+      ...(extension !== undefined ? { extension } : {}),
+      has_drm: playlist.hasDrm,
+      manifestText: text,
     });
   }
 
