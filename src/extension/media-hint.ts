@@ -117,7 +117,11 @@ export function classifyHintUrl(raw: string, baseUrl: string): { url: string; ki
   const href = resolved.href;
   if (IGNORED_PATH.test(resolved.pathname) && !HLS_PATH.test(resolved.pathname)) return undefined;
 
-  if (HLS_PATH.test(resolved.pathname) || HLS_PATH.test(resolved.search)) {
+  // YouTube's HLS manifest endpoint serves live/TV-embed manifests without an .m3u8 suffix;
+  // the page-hook resource scan recognizes the same URL family, so a standalone manifest hint
+  // for it must classify the same way.
+  const googleVideoHlsManifest = /manifest\.googlevideo\.com\/api\/manifest\/hls/iu.test(href);
+  if (HLS_PATH.test(resolved.pathname) || HLS_PATH.test(resolved.search) || googleVideoHlsManifest) {
     const canonical = new URL(resolved.href);
     for (const param of HLS_REFRESH_PARAMS) canonical.searchParams.delete(param);
     return { url: canonical.href, kind: "hls" };

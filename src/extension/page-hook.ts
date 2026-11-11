@@ -830,13 +830,20 @@ export async function collectHintsForPage(
   fetchImpl: typeof fetch = fetch,
 ): Promise<PageMediaHint[]> {
   if (youtubeHostname(pageUrl)) {
-    const innerTube = await cachedYouTubeHints(pageUrl, fetchImpl);
-    if (innerTube.length === 0) return [];
-    // A page player may use HLS without putting hlsManifestUrl in the InnerTube response;
-    // the resource timeline still knows the manifest, so keep it as the alternate source.
+    // A page player may use HLS without putting hlsManifestUrl in the InnerTube response; the
+    // resource timeline still knows the manifest. It is the alternate source when the adapter
+    // reports formats, and the last resort when the adapter yields nothing: network sniffing
+    // is initiator-suppressed on YouTube, so an early empty return here would discard the only
+    // manifest the page ever fetched.
     const hlsResource = resourceEntries
       .map((entry) => (typeof entry === "string" ? entry : entry.url))
       .find((url) => /(?:^|\.)m3u8(?:$|[?#])/iu.test(url) || /manifest\.googlevideo\.com\/api\/manifest\/hls/iu.test(url));
+    const innerTube = await cachedYouTubeHints(pageUrl, fetchImpl);
+    if (innerTube.length === 0) {
+      return hlsResource === undefined
+        ? []
+        : withTitle([{ url: hlsResource, kind: "hls", source: "resource-entry" }], document);
+    }
     const withAlternate =
       hlsResource === undefined
         ? innerTube

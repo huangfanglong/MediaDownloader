@@ -182,6 +182,72 @@ describe("YouTube InnerTube adapter (SABR-era fix)", () => {
   });
 });
 
+describe("YouTube: salvage of the resource-timeline manifest when the adapter yields nothing", () => {
+  const failingFetch = (async () => {
+    throw new Error("network down");
+  }) as unknown as typeof fetch;
+
+  function freshDocument(): void {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+    // The adapter reads page player-response globals; a lingering one from an earlier test
+    // would falsify the "adapter yields nothing" premise.
+    delete (globalThis as Record<string, unknown>).ytInitialPlayerResponse;
+  }
+
+  it("returns the timeline .m3u8 manifest when the InnerTube adapter yields nothing", async () => {
+    freshDocument();
+    document.title = "Salvage Manifest";
+    const manifest = "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1/id/slvg111/index.m3u8";
+    const hints = await collectHintsForPage("https://www.youtube.com/watch?v=slvg111", document, [manifest], failingFetch);
+    expect(hints).toHaveLength(1);
+    expect(hints[0]?.kind).toBe("hls");
+    expect(hints[0]?.url).toBe(manifest);
+    expect(hints[0]?.source).toBe("resource-entry");
+    expect(hints[0]?.title).toBe("Salvage Manifest");
+  });
+
+  it("matches the manifest.googlevideo.com hls path without an .m3u8 suffix", async () => {
+    freshDocument();
+    const manifest = "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/id/slvg222/ip/1.2.3.4";
+    const hints = await collectHintsForPage("https://www.youtube.com/watch?v=slvg222", document, [manifest], failingFetch);
+    expect(hints).toHaveLength(1);
+    expect(hints[0]?.kind).toBe("hls");
+    expect(hints[0]?.url).toBe(manifest);
+  });
+
+  it("returns no hints when the adapter yields nothing and the timeline has no manifest", async () => {
+    freshDocument();
+    const hints = await collectHintsForPage(
+      "https://www.youtube.com/watch?v=slvg333",
+      document,
+      ["https://www.youtube.com/watch?v=slvg333", "https://rr2.googlevideo.com/videoplayback?id=1&itag=137"],
+      failingFetch,
+    );
+    expect(hints).toEqual([]);
+  });
+
+  it("maps the salvaged .m3u8 manifest hint onto an m3u8 media item", async () => {
+    freshDocument();
+    const manifest = "https://manifest.googlevideo.com/api/manifest/hls_variant/expire/1/id/slvg444/index.m3u8";
+    const hints = await collectHintsForPage("https://www.youtube.com/watch?v=slvg444", document, [manifest], failingFetch);
+    if (hints[0] === undefined) throw new Error("salvage hint missing");
+    const item = itemFromHint(hints[0], "https://www.youtube.com/watch?v=slvg444");
+    expect(item?.type).toBe("m3u8");
+    expect(item?.master_url?.href).toBe(manifest);
+  });
+
+  it("maps the salvaged googlevideo manifest hint onto an m3u8 media item", async () => {
+    freshDocument();
+    const manifest = "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1/id/slvg555/ip/1.2.3.4";
+    const hints = await collectHintsForPage("https://www.youtube.com/watch?v=slvg555", document, [manifest], failingFetch);
+    if (hints[0] === undefined) throw new Error("salvage hint missing");
+    const item = itemFromHint(hints[0], "https://www.youtube.com/watch?v=slvg555");
+    expect(item?.type).toBe("m3u8");
+    expect(item?.master_url?.href).toBe(manifest);
+  });
+});
+
 describe("adaptive audio+video pair (YouTube visionOS formats)", () => {
   it("returns one hint carrying the paired audio track", async () => {
     const fetchMock = (async () => ({
